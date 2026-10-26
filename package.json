@@ -1,0 +1,63 @@
+{
+  "name": "agentic",
+  "version": "0.0.1",
+  "description": "",
+  "author": "",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "overrides": {
+    "multer": "2.5.0"
+  },
+  "scripts": {
+    "build": "nest build && tsc-alias -p tsconfig.build.json",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"*.{ts,json,md}\" \".github/**/*.{yml,yaml}\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"*.{ts,json,md}\" \".github/**/*.{yml,yaml}\"",
+    "start": "nest start --env-file .env",
+    "start:dev": "nest start --watch --env-file .env",
+    "start:debug": "nest start --debug --watch --env-file .env",
+    "start:prod": "node dist/main",
+    "lint": "oxlint src/ test/",
+    "typecheck": "tsc --noEmit --incremental false -p tsconfig.json",
+    "test": "NODE_ENV=test vitest run",
+    "test:watch": "NODE_ENV=test vitest",
+    "test:cov": "NODE_ENV=test vitest run --coverage",
+    "test:debug": "NODE_ENV=test vitest --inspect-brk --no-file-parallelism",
+    "test:e2e": "NODE_ENV=test vitest run --config ./vitest.config.e2e.ts"
+  },
+  "dependencies": {
+    "@nestjs/common": "^12.0.1",
+    "@nestjs/config": "^12.0.1",
+    "@nestjs/core": "^12.0.1",
+    "@nestjs/observe": "^0.3.17",
+    "@nestjs/platform-express": "^12.0.1",
+    "@nestjs/swagger": "^12.0.4",
+    "@nestjs/terminus": "^12.1.0",
+    "@nestjs/throttler": "^6.7.1",
+    "@scalar/nestjs-api-reference": "^1.2.31",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.15.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^12.0.0",
+    "@nestjs/schematics": "^12.0.0",
+    "@nestjs/testing": "^12.0.1",
+    "@types/express": "^5.0.0",
+    "@types/node": "^24.0.0",
+    "@types/supertest": "^7.0.0",
+    "@vitest/coverage-v8": "^4.1.2",
+    "oxlint": "^1.58.0",
+    "prettier": "^3.4.2",
+    "supertest": "^7.0.0",
+    "tsc-alias": "^1.9.9",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.2"
+  }
+}
