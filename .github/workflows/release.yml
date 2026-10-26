@@ -18,7 +18,7 @@ env:
 jobs:
   verify:
     name: Verify release source
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Validate immutable semantic version tag
@@ -54,7 +54,7 @@ jobs:
   publish:
     name: Publish signed multi-platform image
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: production
     permissions:
