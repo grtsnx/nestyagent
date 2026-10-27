@@ -327,6 +327,239 @@ The same call with no options names the tool `Summarizer`:
 const summarizeText = this.openai.asTool(summarizer);
 ```
 
+### Check the request
+
+`inputGuardrails` are optional. Leave them out when the request does not need a check. An input guardrail runs only when its agent is the first agent in the chain, so put it on the triage agent when a specialist takes over. `runInParallel` is optional. Leave it out to run the check alongside the agent. Pass `false` when the agent must wait until the check finishes.
+
+```typescript
+const mathCheck = this.openai.inputGuardrail(
+  'Math homework',
+  async ({ input }) => {
+    const text = typeof input === 'string' ? input : '';
+    const isMathHomework = text.includes('solve');
+    return {
+      tripwireTriggered: isMathHomework,
+      outputInfo: { isMathHomework },
+    };
+  },
+  { runInParallel: false },
+);
+
+const support = this.openai.createAgent(
+  'Customer support',
+  'Help customers with support questions.',
+  { inputGuardrails: [mathCheck] },
+);
+
+const triage = this.openai.createTriageAgent(
+  'Support triage',
+  'Route each request to the right specialist.',
+  [support],
+  'Routes support requests.',
+  { inputGuardrails: [mathCheck] },
+);
+```
+
+The same check with no third argument runs alongside the agent:
+
+```typescript
+const mathCheck = this.openai.inputGuardrail('Math homework', async () => ({
+  tripwireTriggered: false,
+  outputInfo: null,
+}));
+```
+
+A sandbox agent accepts the same optional list. It runs when that sandbox agent is the first agent.
+
+```typescript
+const sandboxAgent = this.sandbox.createSandboxAgent(
+  'Workspace agent',
+  'Use the computer for files and commands.',
+  { inputGuardrails: [mathCheck] },
+);
+```
+
+When an input check blocks, the SDK throws. `guardrailTripwire` is optional. It returns `input`, `output`, `tool-input`, or `tool-output`, and returns undefined for any other error.
+
+```typescript
+try {
+  await this.openai.runAgent('Can you solve 2x + 3 = 11 for me?', support);
+} catch (error) {
+  const blocked = this.openai.guardrailTripwire(error);
+  if (blocked) return blocked;
+  throw error;
+}
+```
+
+### Check with another agent
+
+`agentInputGuardrail` is optional. The check is an agent with its own instructions and schema. `tripwire` is required and returns true when that output should stop the request. `runInParallel` stays optional.
+
+```typescript
+import { z } from 'zod';
+
+const homeworkSchema = z.object({
+  isMathHomework: z.boolean(),
+  reasoning: z.string(),
+});
+
+const homeworkCheck = this.openai.createAgent(
+  'Homework check',
+  'Detect whether the user is asking for math homework help.',
+  { schema: homeworkSchema },
+);
+
+const mathGuard = this.openai.agentInputGuardrail(
+  'Math homework',
+  homeworkCheck,
+  (output) =>
+    typeof output === 'object' &&
+    output !== null &&
+    'isMathHomework' in output &&
+    output.isMathHomework === true,
+  { runInParallel: false },
+);
+
+const support = this.openai.createAgent(
+  'Customer support',
+  'Help customers with support questions.',
+  { inputGuardrails: [mathGuard] },
+);
+```
+
+### Check the reply
+
+`outputGuardrails` are optional. They run on the agent that writes the final reply. After a handoff, that is the specialist. When a manager calls `asTool`, the manager still writes the reply.
+
+```typescript
+const replyCheck = this.openai.outputGuardrail(
+  'No secrets',
+  async ({ agentOutput }) => ({
+    tripwireTriggered: String(agentOutput).includes('sk-'),
+    outputInfo: { checked: true },
+  }),
+);
+
+const support = this.openai.createAgent(
+  'Customer support',
+  'Help customers with support questions.',
+  { outputGuardrails: [replyCheck] },
+);
+```
+
+When an output check blocks, the SDK throws `OutputGuardrailTripwireTriggered`.
+
+### Check a tool
+
+`toolInputGuardrail` and `toolOutputGuardrail` are optional. Pass them on the tool that does the work. `needsApproval` is also optional. Set it when a person should pause the tool before it runs. Leave both out for a harmless tool.
+
+```typescript
+import { tool } from '@openai/agents';
+import { z } from 'zod';
+
+const orderCheck = this.openai.toolInputGuardrail(
+  'Order id',
+  async ({ toolCall }) => {
+    const args = JSON.parse(toolCall.arguments) as { orderId?: number };
+    if (args.orderId && args.orderId > 0) return this.openai.allowTool();
+    return this.openai.rejectTool('Order id is required.');
+  },
+);
+
+const cancelOrder = tool({
+  name: 'cancel_order',
+  description: 'Cancel a customer order.',
+  parameters: z.object({ orderId: z.number() }),
+  needsApproval: true,
+  inputGuardrails: [orderCheck],
+  async execute({ orderId }) {
+    return `Cancelled order ${orderId}`;
+  },
+});
+
+const support = this.openai.createAgent(
+  'Support agent',
+  'Handle support requests and ask for approval when needed.',
+  { tools: [cancelOrder] },
+);
+```
+
+`needsApproval` on `asTool` pauses a specialist tool the same way. Leave it out when that specialist can run on its own. Pass `true` to pause every call, or a function when only some calls should pause.
+
+```typescript
+const summarizeText = this.openai.asTool(summarizer, {
+  toolName: 'summarize_text',
+  needsApproval: true,
+});
+
+const largeOrder = tool({
+  name: 'cancel_order',
+  description: 'Cancel a customer order.',
+  parameters: z.object({ orderId: z.number() }),
+  needsApproval: async (_context, { orderId }) => orderId > 1000,
+  async execute({ orderId }) {
+    return `Cancelled order ${orderId}`;
+  },
+});
+```
+
+`stopTool` is optional. Return it from a tool guardrail when the run should stop instead of sending a message back to the model.
+
+```typescript
+const stopCheck = this.openai.toolInputGuardrail(
+  'Stop unsafe calls',
+  async () => this.openai.stopTool(),
+);
+```
+
+### Resume an approval
+
+`approve` and `reject` are optional. Call one when `result.interruptions` has a pause, then pass the state to `resumeAgent`. Leave `interruptions` out to decide every pause. Pass `interruptions` to decide one of them. `alwaysApprove`, `alwaysReject`, and `message` are optional. `websocket` and `stream` on `runAgent` and `resumeAgent` are optional. `outputGuardrailBlockedMessage` is optional and replaces the text left behind when an output check blocks a tool result.
+
+```typescript
+let result = await this.openai.runAgent('Cancel order 123.', support);
+
+if (result.interruptions?.length) {
+  const state = this.openai.approve(result);
+  result = await this.openai.resumeAgent(support, state);
+}
+```
+
+A streamed run uses the same pause. Wait until `completed` settles, then approve and resume.
+
+```typescript
+const streamed = await this.openai.runAgent('Cancel order 123.', support, {
+  stream: true,
+  outputGuardrailBlockedMessage: 'The reply was held back.',
+});
+
+await streamed.completed;
+
+if (streamed.interruptions?.length) {
+  const state = this.openai.approve(streamed);
+  await this.openai.resumeAgent(support, state);
+}
+```
+
+Reject the same pause with an optional message:
+
+```typescript
+const state = this.openai.reject(result, {
+  message: 'A person declined this cancellation.',
+});
+
+result = await this.openai.resumeAgent(support, state);
+```
+
+`saveRun` is optional. Store the string when the person will decide later, then `loadRun` with the same agent.
+
+```typescript
+const saved = this.openai.saveRun(result);
+const state = await this.openai.loadRun(support, saved);
+this.openai.approve({ state });
+const resumed = await this.openai.resumeAgent(support, state);
+```
+
 ### Tool, schema, and handoff description together
 
 ```typescript
@@ -549,7 +782,7 @@ const notesAgent = this.sandbox.createSandboxAgent(
 await this.sandbox.runSandboxOnce('Summarize the notes.', notesAgent);
 ```
 
-A normal agent can call the sandbox agent as a tool. Pass `workspace` to keep the same files. Without `workspace`, each call opens a fresh workspace from the same options as `openSandbox`. `asTool` returns a promise.
+A normal agent can call the sandbox agent as a tool. Pass `workspace` to keep the same files. Without `workspace`, each call opens a fresh workspace from the same options as `openSandbox`. `asTool` returns a promise. `needsApproval` is optional. Pass `true` to pause every call, or a function when only some calls should pause.
 
 ```typescript
 const sandboxAgent = this.sandbox.createSandboxAgent(

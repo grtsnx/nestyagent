@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
-import { run, Session } from '@openai/agents';
+import { InputGuardrail, OutputGuardrail, run, Session } from '@openai/agents';
 import OpenAI, { APIError } from 'openai';
 import {
   Capabilities,
@@ -56,6 +56,8 @@ type CreateSandboxAgentOptions = {
   skills?: SkillsArgs;
   memory?: boolean | MemoryArgs;
   handoffDescription?: string;
+  inputGuardrails?: InputGuardrail[];
+  outputGuardrails?: OutputGuardrail[];
 };
 
 export type SandboxWorkspace = SandboxSession;
@@ -135,7 +137,7 @@ export class SandboxService {
   ) {}
 
   // Create a sandbox agent. Leave model out to use the default model.
-  // manifest, skills, memory, and handoffDescription are optional.
+  // manifest, skills, memory, handoffDescription, and guardrails are optional.
   createSandboxAgent(
     name: string,
     instructions: string,
@@ -149,6 +151,12 @@ export class SandboxService {
       ...(options?.manifest && { defaultManifest: options.manifest }),
       ...(options?.handoffDescription && {
         handoffDescription: options.handoffDescription,
+      }),
+      ...(options?.inputGuardrails && {
+        inputGuardrails: options.inputGuardrails,
+      }),
+      ...(options?.outputGuardrails && {
+        outputGuardrails: options.outputGuardrails,
       }),
     });
   }
@@ -262,17 +270,24 @@ export class SandboxService {
 
   //1. Call the sandbox agent as a tool. Pass a workspace to keep its files.
   //2. Leave workspace out for a fresh workspace on each call, built from the same options as openSandbox.
+  //3. needsApproval is optional. Pass true to always pause, or a function that pauses some calls.
   async asTool(
     agent: SandboxAgent,
     options?: FreshSandboxOptions & {
       toolName?: string;
       toolDescription?: string;
       workspace?: SandboxWorkspace;
+      needsApproval?: NonNullable<
+        Parameters<OpenaiService['asTool']>[1]
+      >['needsApproval'];
     },
   ) {
     return this.openaiService.asTool(agent, {
       toolName: options?.toolName,
       toolDescription: options?.toolDescription,
+      ...(options?.needsApproval !== undefined && {
+        needsApproval: options.needsApproval,
+      }),
       runConfig: {
         sandbox: options?.workspace
           ? { session: options.workspace }

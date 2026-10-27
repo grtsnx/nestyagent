@@ -1,9 +1,9 @@
 import { Module } from '@nestjs/common';
-import { WebhookModule } from '@/modules/webhook/webhook.module.js';
 import { OpenaiModule } from './openai/openai.module.js';
+import { SandboxModule } from './sandbox/sandbox.module.js';
 
 @Module({
-  imports: [OpenaiModule, WebhookModule],
-  exports: [OpenaiModule, WebhookModule],
+  imports: [OpenaiModule, SandboxModule],
+  exports: [OpenaiModule, SandboxModule],
 })
 export class LibModule {}
