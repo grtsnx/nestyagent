@@ -94,7 +94,10 @@ const DEFAULT_HOSTED_MODEL = 'gpt-6-astra';
 // How long to wait for an executor to connect before giving up.
 const CONNECT_TIMEOUT_MS = 120_000;
 const PROVIDER_TIMEOUT_MS = 120_000;
-const WORKER_POLL_MS = 1_000;
+// The worker also wakes as soon as this process stores a webhook, so polling only covers other replicas.
+const WORKER_POLL_MS = 5_000;
+// Finished webhooks are kept this long to drop OpenAI's repeat deliveries, then deleted.
+const WEBHOOK_RETENTION_MS = 7 * 24 * 60 * 60_000;
 const WEBHOOK_LEASE_MS = 5 * 60_000;
 // The only variables the executor inherits from this app, besides CODEX_API_KEY.
 const EXECUTOR_ENV_KEYS = ['PATH', 'HOME', 'USER', 'LANG', 'TMPDIR', 'SHELL'];
@@ -436,6 +439,11 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
               machineId: null,
             },
           })
+          // Once the row says deleted, nothing asks about this id again, so forget it.
+          // With no row yet, keep it: the create still checks whether its executor stopped.
+          .then(({ count }) => {
+            if (count) this.stoppedExecutors.delete(id);
+          })
           .catch(() =>
             this.logger.warn(
               'Exited local executor still needs database reconciliation.',
@@ -566,15 +574,26 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
       (typeof headerId === 'string' ? headerId : undefined) ??
       createHash('sha256').update(rawBody).digest('hex');
     try {
-      await this.db().hostedWebhook.create({
-        data: { id, type: event.type, resourceId: event.data.id },
+      await this.db().$transaction(async (tx) => {
+        await tx.hostedWebhook.create({
+          data: { id, type: event.type, resourceId: event.data.id },
+        });
+        // Kept apart from the inbox, so pruning old webhooks never forgets an expiry.
+        if (event.type === 'agent.environment.expired')
+          await tx.expiredEnvironment.upsert({
+            where: { environmentId: event.data.id },
+            create: { environmentId: event.data.id },
+            update: {},
+          });
       });
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
     }
+    // Start now instead of waiting for the next poll. Failures are retried by the poll.
+    void this.processHostedWebhooks().catch(() => undefined);
   }
 
-  // Leases survive crashes. The environment advisory lock serializes provider calls across replicas.
+  // Leases survive crashes. The environment execution lock serializes provider calls across replicas.
   async processHostedWebhooks(): Promise<void> {
     if (this.workerTask) return await this.workerTask;
     if (this.shutdown.signal.aborted) return;
@@ -587,6 +606,12 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async drainHostedWebhooks() {
+    await this.db().hostedWebhook.deleteMany({
+      where: {
+        status: 'completed',
+        updatedAt: { lt: new Date(Date.now() - WEBHOOK_RETENTION_MS) },
+      },
+    });
     const due = {
       OR: [
         { status: 'pending' as const, availableAt: { lte: new Date() } },
@@ -850,15 +875,9 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
   // Expiry is permanent. Session failures must be checked against the current session state.
   private async hasExpiredEnvironment(environmentId: string) {
     return (
-      (
-        await this.db().hostedWebhook.findMany({
-          where: {
-            type: 'agent.environment.expired',
-            resourceId: environmentId,
-          },
-          take: 1,
-        })
-      ).length > 0
+      (await this.db().expiredEnvironment.findUnique({
+        where: { environmentId },
+      })) !== null
     );
   }
 
@@ -1271,6 +1290,7 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
 
   //1. One place picks the client, so open, save, resume, runSandboxOnce, and asTool always agree.
   //2. client wins, then a hosted computer, then Docker, then Unix.
+  //3. Production has no default. The app container usually cannot reach Docker, and Unix is off there.
   private async sandboxClient(
     options?: OpenSandboxOptions,
   ): Promise<SandboxClient> {
@@ -1283,9 +1303,14 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
       return await this.providerClient(options.computer, options);
     }
     const clientOptions = this.clientOptions(options);
-    const computer =
-      options?.computer ??
-      (this.configService.get('NODE_ENV') === 'production' ? 'docker' : 'unix');
+    if (
+      !options?.computer &&
+      this.configService.get('NODE_ENV') === 'production'
+    )
+      throw new Error(
+        "Choose a computer in production: pass computer (for example 'modal' or 'docker') or client.",
+      );
+    const computer = options?.computer ?? 'unix';
     if (computer === 'docker') {
       return new DockerSandboxClient({
         image: options?.image ?? DOCKER_IMAGE,

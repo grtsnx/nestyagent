@@ -244,6 +244,32 @@ History reads default to 200 items and 256,000 serialized bytes. When older item
 
 Give each chat its own id, like the customer's chat id, and store it. Pass that id again tomorrow and the chat carries on. With no id, `createSession()` makes a new random one, which you can read with `await chat.getSessionId()`.
 
+### Let OpenAI remember the chat
+
+`previousResponseId` asks OpenAI to keep the earlier turns. Pass `nextResponseId` from the last answer, and send only the new message. Leave `session` out, because OpenAI already has those turns. A paused tool has no id yet. Finish that run, then use the id from the finished answer.
+
+```typescript
+const first = await this.openai.runAgent('Where is my order?', orderHelper);
+
+const second = await this.openai.runAgent(
+  'It was a birthday cake.',
+  orderHelper,
+  { previousResponseId: this.openai.nextResponseId(first) },
+);
+```
+
+`reply` puts that same id on `turn.responseId`.
+
+```typescript
+const first = await this.openai.reply('Where is my order?', orderHelper);
+
+const second = await this.openai.reply(
+  'It was a birthday cake.',
+  first.helper,
+  { previousResponseId: first.responseId },
+);
+```
+
 ### Pick the model
 
 **One model for everyone.** `createRunner` sets a fallback model. A helper without its own `model` uses it. Call it once when the app starts, because it changes every later run.
@@ -378,7 +404,7 @@ Send every message to `frontDesk` instead when each one should be sorted again.
 
 ### One customer, start to finish
 
-`reply` runs one message. Pass the same `session` so the chat is remembered. `fallback` is optional. `turn.helper` is who should take the next message. `turn.output` is the answer.
+`reply` runs one message. Pass the same `session` so the chat is remembered. `fallback` is optional. `turn.helper` is who should take the next message. `turn.output` is the answer. When OpenAI keeps the earlier turns, `turn.responseId` is the id to pass next. See [Let OpenAI remember the chat](#let-openai-remember-the-chat).
 
 When a tool pauses, `turn.waiting` is true and `turn.output` is empty. `finish(turn, 'approve')` or `finish(turn, 'reject')` continues that same run. `message` on a rejection is optional.
 

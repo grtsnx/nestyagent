@@ -4,6 +4,7 @@ import {
   type AgentInputItem,
   getHandoff,
   handoff,
+  RunContext,
   InputGuardrailTripwireTriggered,
   OutputGuardrailTripwireTriggered,
   Runner,
@@ -66,6 +67,24 @@ describe('OpenaiService orchestration', () => {
 
     expect(service().nextAgent({}, triage)).toBe(triage);
     expect(service().nextAgent({ lastAgent: undefined }, triage)).toBe(triage);
+  });
+
+  it('returns the response id that continues the chat on OpenAI', () => {
+    expect(
+      service().nextResponseId({
+        lastResponseId: 'resp_1',
+        interruptions: [],
+      }),
+    ).toBe('resp_1');
+  });
+
+  it('returns no response id while a tool is paused', () => {
+    expect(
+      service().nextResponseId({
+        lastResponseId: 'resp_1',
+        interruptions: [{}],
+      }),
+    ).toBeUndefined();
   });
 
   it('passes a handoff with its own settings to the triage agent', () => {
@@ -341,6 +360,7 @@ describe('OpenaiService orchestration', () => {
       ({
         finalOutput: 'Your cake is ready tomorrow.',
         lastAgent: orderHelper,
+        lastResponseId: 'resp_cake',
         interruptions: [],
       }) as never;
 
@@ -351,6 +371,7 @@ describe('OpenaiService orchestration', () => {
     expect(turn.waiting).toBe(false);
     expect(turn.output).toBe('Your cake is ready tomorrow.');
     expect(turn.helper).toBe(orderHelper);
+    expect(turn.responseId).toBe('resp_cake');
     expect(turn.agent).toBe(frontDesk);
   });
 
@@ -365,6 +386,7 @@ describe('OpenaiService orchestration', () => {
       ({
         finalOutput: undefined,
         lastAgent: orderHelper,
+        lastResponseId: 'resp_paused',
         interruptions: [{}],
         state,
       }) as never;
@@ -382,6 +404,7 @@ describe('OpenaiService orchestration', () => {
 
     expect(waiting.waiting).toBe(true);
     expect(waiting.output).toBeUndefined();
+    expect(waiting.responseId).toBeUndefined();
 
     const done = await openai.finish(waiting, 'approve');
 
@@ -490,6 +513,46 @@ describe('OpenaiService storage and limits', () => {
     expect(await session.getItems()).toEqual([
       { role: 'user', content: 'new' },
     ]);
+  });
+
+  it('leaves a paused run on the response id stored in its state', async () => {
+    const openai = service();
+    const agent = new Agent({ name: 'Helper' });
+    const state = new RunState(new RunContext(), 'Cancel it.', agent, 10);
+    state._previousResponseId = 'resp_current';
+    const run = vi.spyOn(Runner.prototype, 'run').mockResolvedValue({
+      state,
+      interruptions: [],
+    } as never);
+    try {
+      await openai.resumeAgent(agent, state, {
+        previousResponseId: 'resp_old',
+      });
+      expect(run.mock.calls[0]?.[2]?.previousResponseId).toBeUndefined();
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it('continues from the last OpenAI response instead of replaying the chat', async () => {
+    const openai = service();
+    const agent = new Agent({ name: 'Helper' });
+    const run = vi.spyOn(Runner.prototype, 'run').mockResolvedValue({
+      state: { toString: () => 'done' },
+      interruptions: [],
+    } as never);
+    try {
+      await openai.runAgent('It was a birthday cake.', agent, {
+        previousResponseId: 'resp_1',
+      });
+      expect(run).toHaveBeenCalledWith(
+        agent,
+        'It was a birthday cake.',
+        expect.objectContaining({ previousResponseId: 'resp_1' }),
+      );
+    } finally {
+      run.mockRestore();
+    }
   });
 
   it('preserves cancellation and turn limits through reply', async () => {

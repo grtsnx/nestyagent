@@ -60,6 +60,7 @@ type ResumeOptions = {
   websocket?: boolean;
   signal?: AbortSignal;
   maxTurns?: number;
+  previousResponseId?: string;
   outputGuardrailBlockedMessage?:
     string | OutputGuardrailBlockedMessageFormatter;
 };
@@ -127,6 +128,7 @@ type ChatTurn = {
   helper: AnyAgent;
   agent: AnyAgent;
   waiting: boolean;
+  responseId?: string;
   result: RunResult<any, AnyAgent>;
   options?: RunAgentOptions;
 };
@@ -149,43 +151,64 @@ export class DatabaseSession implements Session {
     return this.chatId;
   }
 
-  // Oldest first. With limit, only the newest items, still oldest first.
+  //1. getItems(limit) returns exactly the newest limit items, oldest first. The SDK relies on that.
+  //2. getItems() is the model's context: whole turns, newest first, within maxItems and maxBytes.
+  //3. Limits are soft for the current turn. It is always sent whole, so a chat never gets stuck.
   async getItems(limit?: number) {
+    if (limit !== undefined) {
+      if (!Number.isSafeInteger(limit) || limit < 0)
+        throw new Error('History limit must be a nonnegative integer.');
+      if (limit === 0) return [];
+      return (await this.newest(limit)).reverse();
+    }
     const maxItems = this.limits.maxItems ?? 200;
-    const count = limit ?? maxItems;
-    if (!Number.isSafeInteger(count) || count < 0)
-      throw new Error('History limit must be a nonnegative integer.');
-    if (count === 0) return [];
+    const maxBytes = this.limits.maxBytes ?? 256_000;
+    const window = await this.newest(maxItems + 1);
+    const truncated = window.length > maxItems;
+    const items = window.slice(0, maxItems).reverse();
+    if (truncated && !items.some(isUserMessage)) {
+      // The current turn alone is longer than maxItems. Send all of it.
+      return await this.currentTurn(items);
+    }
+    // A cut may only fall where a user message starts a turn, so tool calls keep their results.
+    const starts = items.flatMap((item, index) =>
+      isUserMessage(item) || (index === 0 && !truncated) ? [index] : [],
+    );
+    let bytes = 0;
+    const suffixBytes = items
+      .map((item) => Buffer.byteLength(JSON.stringify(item)))
+      .reverse()
+      .map((size) => (bytes += size))
+      .reverse();
+    const start =
+      starts.find((index) => suffixBytes[index] <= maxBytes) ?? starts.at(-1);
+    return start === undefined ? items : items.slice(start);
+  }
+
+  private async newest(take: number) {
     const rows = await this.prisma.db.chatItem.findMany({
       where: { chatId: this.chatId },
       orderBy: { id: 'desc' },
-      take: count + 1,
+      take,
       select: { item: true },
     });
-    const truncated = rows.length > count;
-    let items = rows
-      .slice(0, count)
-      .reverse()
-      .map((row) => row.item as unknown as AgentInputItem);
-    if (truncated && limit === undefined) {
-      const start = items.findIndex(
-        (item) => 'role' in item && item.role === 'user',
-      );
-      if (start < 0)
-        throw new Error(
-          'The current turn exceeds the history limit. Compact it or increase maxItems.',
-        );
-      items = items.slice(start);
-    }
-    if (
-      Buffer.byteLength(JSON.stringify(items)) >
-      (this.limits.maxBytes ?? 256_000)
-    ) {
-      throw new Error(
-        'Chat history exceeds maxBytes. Compact it before continuing.',
-      );
-    }
-    return items;
+    return rows.map((row) => row.item as unknown as AgentInputItem);
+  }
+
+  // Every item from the newest user message on. Without any user message, the window as it is.
+  private async currentTurn(window: AgentInputItem[]) {
+    const start = await this.prisma.db.chatItem.findFirst({
+      where: { chatId: this.chatId, item: { path: ['role'], equals: 'user' } },
+      orderBy: { id: 'desc' },
+      select: { id: true },
+    });
+    if (!start) return window;
+    const rows = await this.prisma.db.chatItem.findMany({
+      where: { chatId: this.chatId, id: { gte: start.id } },
+      orderBy: { id: 'asc' },
+      select: { item: true },
+    });
+    return rows.map((row) => row.item as unknown as AgentInputItem);
   }
 
   // The SDK retries the same operation ID when a history write has an uncertain outcome.
@@ -533,6 +556,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   //8. signal is optional. Abort it to stop the run, for example when the caller disconnects.
   //9. maxTurns is optional. It stops a run that loops longer than that many model turns.
   //10. When a tool pauses, the result carries interruptions. approve or reject, then resumeAgent.
+  //11. previousResponseId is optional. OpenAI keeps the earlier turns, so send only the new message.
   runAgent<TAgent extends AnyAgent, TContext = unknown>(
     prompt: string | AgentInputItem[],
     agent: TAgent,
@@ -557,9 +581,20 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
     return result.lastAgent ?? fallback;
   }
 
+  //1. Optional. Pass this id as previousResponseId on the next message.
+  //2. It is empty while a tool is paused. Finish that run before starting another message.
+  nextResponseId(result: {
+    lastResponseId?: string;
+    interruptions?: { length: number };
+  }) {
+    if ((result.interruptions?.length ?? 0) > 0) return undefined;
+    return result.lastResponseId || undefined;
+  }
+
   //1. One customer message. session is optional and keeps the chat.
   //2. fallback is optional. It is who answers next when nobody took over.
-  //3. waiting is true when a tool paused. output is empty until finish.
+  //3. waiting is true when a tool paused. output and responseId are empty until finish.
+  //4. responseId is previousResponseId for the next message when OpenAI keeps the chat.
   async reply<TContext>(
     prompt: string,
     agent: AnyAgent,
@@ -601,6 +636,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
       helper: this.nextAgent(result, fallback),
       agent,
       waiting,
+      responseId: this.nextResponseId(result),
       result,
       options,
     };
@@ -629,6 +665,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
 
   // Continue a paused run from the state approve or reject returned.
   // websocket, stream, signal, maxTurns, and outputGuardrailBlockedMessage are optional.
+  // previousResponseId stays on the saved state for this run.
   resumeAgent<TAgent extends AnyAgent>(
     agent: TAgent,
     state: PausedRun['state'],
@@ -710,6 +747,23 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
       },
     });
     return state;
+  }
+
+  //1. Close a saved approval nobody will answer. Every waiting tool call is rejected and the run finishes.
+  //2. The model hears "no", so the chat can take its next message. A pause is resolved, never skipped.
+  async cancelRun(
+    agent: AnyAgent,
+    id: string,
+    options?: RunAccess & { message?: string },
+  ) {
+    const state = await this.loadRun(agent, id, options);
+    this.reject(
+      { state },
+      {
+        message: options?.message ?? 'Not approved. The request was cancelled.',
+      },
+    );
+    return await this.resumeAgent(agent, state);
   }
 
   // An interrupted external action may have succeeded. Only the application can reconcile it.
@@ -852,6 +906,9 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
           maxTurns: policy.maxTurns,
           outputGuardrailBlockedMessage: policy.outputGuardrailBlockedMessage,
           sandbox: policy.sandbox,
+          ...(input instanceof RunState || !policy.previousResponseId
+            ? {}
+            : { previousResponseId: policy.previousResponseId }),
         };
         const result = policy.stream
           ? await runner.run(agent, input, { ...runOptions, stream: true })
@@ -960,6 +1017,10 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   }
 }
 
+function isUserMessage(item: AgentInputItem) {
+  return 'role' in item && item.role === 'user';
+}
+
 // Normalize object key order so JSONB round-trips preserve operation identity.
 function historyDigest(value: unknown): string {
   const normalize = (entry: unknown): unknown => {
@@ -967,7 +1028,8 @@ function historyDigest(value: unknown): string {
     if (entry && typeof entry === 'object')
       return Object.fromEntries(
         Object.entries(entry)
-          .sort(([a], [b]) => a.localeCompare(b))
+          // Code-unit order, so every server sorts the same way whatever its language settings.
+          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
           .map(([key, child]) => [key, normalize(child)]),
       );
     return entry;

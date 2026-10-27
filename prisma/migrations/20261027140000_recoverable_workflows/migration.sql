@@ -1,3 +1,12 @@
+-- New enum values must be committed before they can be used, so they run first, on their own.
+-- IF NOT EXISTS makes a retry after a failed attempt safe.
+ALTER TYPE "PausedRunStatus" ADD VALUE IF NOT EXISTS 'running';
+ALTER TYPE "PausedRunStatus" ADD VALUE IF NOT EXISTS 'completed';
+ALTER TYPE "PausedRunStatus" ADD VALUE IF NOT EXISTS 'recovery_required';
+
+-- Everything else applies fully or not at all.
+BEGIN;
+
 -- CreateEnum
 CREATE TYPE "RemoteMachineStatus" AS ENUM ('pending', 'creating', 'ready', 'reconciliation', 'deleted');
 
@@ -6,18 +15,6 @@ CREATE TYPE "RemoteMachineDesiredState" AS ENUM ('active', 'deleted');
 
 -- CreateEnum
 CREATE TYPE "HostedWebhookStatus" AS ENUM ('pending', 'processing', 'completed', 'reconciliation');
-
--- AlterEnum
--- This migration adds more than one value to an enum.
--- With PostgreSQL versions 11 and earlier, this is not possible
--- in a single migration. This can be worked around by creating
--- multiple migrations, each migration adding only one value to
--- the enum.
-
-
-ALTER TYPE "PausedRunStatus" ADD VALUE 'running';
-ALTER TYPE "PausedRunStatus" ADD VALUE 'completed';
-ALTER TYPE "PausedRunStatus" ADD VALUE 'recovery_required';
 
 -- AlterTable
 ALTER TABLE "paused_runs" ADD COLUMN     "agent_name" TEXT,
@@ -75,3 +72,5 @@ UPDATE "remote_machines"
 SET "status" = CASE WHEN "machine_id" IS NULL THEN 'reconciliation'::"RemoteMachineStatus" ELSE 'ready'::"RemoteMachineStatus" END,
     "provider" = CASE WHEN "machine_id" IS NULL THEN NULL ELSE split_part("machine_id", ':', 1) END;
 UPDATE "paused_runs" SET "status" = 'recovery_required' WHERE "status" = 'taken';
+
+COMMIT;

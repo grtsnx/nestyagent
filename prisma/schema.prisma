@@ -135,3 +135,21 @@ model HostedWebhook {
   @@index([type, resourceId])
   @@map("hosted_webhooks")
 }
+
+// A lock held by one worker. The owner renews expiresAt; a crashed owner's lock frees itself.
+model ExecutionLock {
+  key       String   @id
+  owner     String   @db.Uuid
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+
+  @@index([owner])
+  @@map("execution_locks")
+}
+
+// An environment OpenAI reported as expired. Expiry is permanent, so a late event never revives it.
+model ExpiredEnvironment {
+  environmentId String   @id @map("environment_id")
+  expiredAt     DateTime @default(now()) @map("expired_at") @db.Timestamptz(3)
+
+  @@map("expired_environments")
+}
