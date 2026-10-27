@@ -17,9 +17,15 @@ import {
   s3Mount,
   SandboxGroupInit,
   SandboxUserInit,
+  type GitRepo,
+  normalizeRelativePath,
 } from '@openai/agents/sandbox';
+import { spawn } from 'node:child_process';
+import { mkdir, mkdtemp, realpath, rm, stat } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 type GitHost = 'github' | 'gitlab' | 'bitbucket';
+type GitCredentials = { token?: string; username?: string; host?: GitHost };
 
 type RepoLink = {
   url: string;
@@ -128,6 +134,13 @@ type CreateManifestOptions = {
 // outputDirs are empty folders. mounts attach storage, including a Git host or Google Drive.
 // entries and environment are optional. users and groups are sandbox accounts.
 export function createManifest(options?: CreateManifestOptions) {
+  return buildManifest(options);
+}
+
+function buildManifest(
+  options?: CreateManifestOptions,
+  credentials?: Map<string, GitCredentials>,
+) {
   const files = Object.fromEntries(
     Object.entries(options?.files ?? {}).map(([path, content]) => [
       workspacePath(path),
@@ -152,9 +165,14 @@ export function createManifest(options?: CreateManifestOptions) {
   const mounts = Object.fromEntries(
     Object.entries(options?.mounts ?? {}).map(([path, spec]) => [
       workspacePath(path),
-      mountEntry(spec),
+      mountEntry(spec, normalizeRelativePath(workspacePath(path)), credentials),
     ]),
   );
+  const repo = options?.repo && repoEntry(options.repo, credentials);
+  // Explicit entries override the repo/mount shortcuts, including their auth.
+  for (const path of Object.keys(options?.entries ?? {})) {
+    credentials?.delete(normalizeRelativePath(path));
+  }
 
   return new Manifest({
     entries: {
@@ -163,7 +181,7 @@ export function createManifest(options?: CreateManifestOptions) {
       ...copiedDirs,
       ...outputDirs,
       ...mounts,
-      ...(options?.repo && repoEntry(options.repo)),
+      ...repo,
       ...options?.entries,
     },
     ...(options?.environment && { environment: options.environment }),
@@ -172,8 +190,211 @@ export function createManifest(options?: CreateManifestOptions) {
   });
 }
 
+// Keep these temporary sources until the SDK has materialized the workspace.
+// dispose() is idempotent; prepare again before creating another fresh workspace.
+export async function prepareManifest(options?: CreateManifestOptions) {
+  const credentials = new Map<string, GitCredentials>();
+  const manifest = buildManifest(options, credentials);
+  const gitEntries = [...manifest.iterEntries()].filter(
+    (item): item is typeof item & { entry: GitRepo } =>
+      item.entry.type === 'git_repo',
+  );
+  if (gitEntries.length === 0) return { manifest, dispose: async () => {} };
+
+  // SDK local sources must be within cwd. Hosted clients reject extraPathGrants,
+  // so keep disposable sources here instead of exposing host paths to sandboxes.
+  const temporary = await mkdtemp(
+    join(await realpath(process.cwd()), '.msagents-git-'),
+  );
+  const dispose = () => rm(temporary, { recursive: true, force: true });
+  const home = join(temporary, 'home');
+  try {
+    await mkdir(home);
+    for (const [index, { logicalPath, entry }] of gitEntries.entries()) {
+      const auth = credentials.get(logicalPath);
+      const repository = entry.repo.includes('://')
+        ? entry.repo
+        : `https://${entry.host ?? defaultGitHost(auth?.host ?? 'github')}/${entry.repo.replace(/\.git$/, '')}.git`;
+      if (
+        entry.repo.startsWith('git@') ||
+        new URL(repository).protocol !== 'https:'
+      ) {
+        throw new Error('prepareManifest requires HTTPS Git repository URLs.');
+      }
+      const url = new URL(repository);
+      if (url.username || url.password || url.search || url.hash) {
+        throw new Error(
+          'Use the token option instead of credentials in a Git URL.',
+        );
+      }
+      const destination = join(temporary, `repo-${index}`);
+      const environment = gitEnvironment(home, url.toString(), auth);
+      await cloneRepository(
+        url.toString(),
+        destination,
+        entry.ref,
+        environment,
+        home,
+      );
+      let source = destination;
+      if (entry.subpath) {
+        source = await realpath(resolve(destination, entry.subpath));
+        const subpath = relative(destination, source);
+        if (
+          isAbsolute(subpath) ||
+          subpath === '..' ||
+          subpath.startsWith(`..${sep}`)
+        ) {
+          throw new Error(
+            'Git repository subpath must stay inside the repository.',
+          );
+        }
+      }
+      const sourceInfo = await stat(source);
+      const {
+        type: _type,
+        repo: _repo,
+        host: _host,
+        ref: _ref,
+        subpath: _subpath,
+        ...metadata
+      } = entry;
+      const prepared = sourceInfo.isDirectory()
+        ? localDir({ ...metadata, src: source })
+        : localFile({ ...metadata, src: source });
+      // Replace the normalized entry in place, including entries nested in dirs.
+      Object.keys(entry).forEach(
+        (key) => delete (entry as Record<string, unknown>)[key],
+      );
+      Object.assign(entry, prepared);
+    }
+    return { manifest, dispose };
+  } catch (error) {
+    await dispose();
+    throw error;
+  }
+}
+
+function gitEnvironment(
+  home: string,
+  repository: string,
+  auth?: GitCredentials,
+) {
+  const settings: Array<[string, string]> = [
+    ['credential.helper', ''],
+    ['http.followRedirects', 'false'],
+    ['core.hooksPath', join(home, 'disabled-hooks')],
+  ];
+  if (auth?.token) {
+    const basic = Buffer.from(
+      `${gitUsername(auth.host ?? gitHost(repository), auth.username)}:${auth.token}`,
+    ).toString('base64');
+    settings.push([
+      `http.${repository}.extraHeader`,
+      `Authorization: Basic ${basic}`,
+    ]);
+  }
+  // An allowlist excludes ambient credentials, Git config, tracing, askpass,
+  // SSH agents, proxies, and inherited home-directory credential files.
+  const environment: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    ...(process.env.SystemRoot && { SystemRoot: process.env.SystemRoot }),
+    HOME: home,
+    USERPROFILE: home,
+    XDG_CONFIG_HOME: home,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_SYSTEM: process.platform === 'win32' ? 'NUL' : '/dev/null',
+    GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null',
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_COUNT: String(settings.length),
+  };
+  settings.forEach(([key, value], index) => {
+    environment[`GIT_CONFIG_KEY_${index}`] = key;
+    environment[`GIT_CONFIG_VALUE_${index}`] = value;
+  });
+  return environment;
+}
+
+async function cloneRepository(
+  repository: string,
+  destination: string,
+  ref: string | undefined,
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+) {
+  if (ref && /^[0-9a-fA-F]{7,40}$/.test(ref)) {
+    try {
+      await runGit(['init', destination], env, cwd);
+      await runGit(
+        ['-C', destination, 'remote', 'add', 'origin', repository],
+        env,
+        cwd,
+      );
+      await runGit(
+        [
+          '-C',
+          destination,
+          'fetch',
+          '--depth',
+          '1',
+          '--no-tags',
+          '--',
+          'origin',
+          ref,
+        ],
+        env,
+        cwd,
+      );
+      await runGit(
+        ['-C', destination, 'checkout', '--detach', 'FETCH_HEAD'],
+        env,
+        cwd,
+      );
+      return;
+    } catch {
+      // A branch can also have a hexadecimal name, matching the SDK fallback.
+      await rm(destination, { recursive: true, force: true });
+    }
+  }
+  await runGit(
+    [
+      'clone',
+      '--depth',
+      '1',
+      '--no-tags',
+      ...(ref ? ['--branch', ref] : []),
+      '--',
+      repository,
+      destination,
+    ],
+    env,
+    cwd,
+  );
+}
+
+function runGit(args: string[], env: NodeJS.ProcessEnv, cwd: string) {
+  return new Promise<void>((resolve, reject) => {
+    const failure = () =>
+      reject(new Error('Git repository preparation failed.'));
+    const child = spawn('git', args, {
+      env,
+      cwd,
+      stdio: 'ignore',
+      timeout: 300_000,
+      killSignal: 'SIGKILL',
+    });
+    // Do not attach stderr, argv, or the original error: they may contain secrets.
+    child.once('error', failure);
+    child.once('close', (code) => (code === 0 ? resolve() : failure()));
+  });
+}
+
 // A mount is ephemeral, so a snapshot keeps the workspace files and skips the remote storage.
-function mountEntry(spec: MountSpec) {
+function mountEntry(
+  spec: MountSpec,
+  path: string,
+  credentials?: Map<string, GitCredentials>,
+) {
   switch (spec.provider) {
     case 's3':
       return attached(
@@ -270,7 +491,14 @@ function mountEntry(spec: MountSpec) {
     case 'bitbucket': {
       const parsed = parseRepoLink(spec.url);
       return gitRepo({
-        repo: withGitCredentials(parsed.repo, spec, spec.provider),
+        repo: withGitCredentials(
+          parsed.repo,
+          spec,
+          path,
+          credentials,
+          spec.provider,
+        ),
+        host: defaultGitHost(spec.provider),
         ...((spec.ref ?? parsed.ref) ? { ref: spec.ref ?? parsed.ref } : {}),
       });
     }
@@ -300,56 +528,44 @@ function attached<T extends object>(entry: T, readOnly?: boolean) {
 }
 
 // Turn a Git host link into a cloned folder. path and ref override the folder name and branch.
-function repoEntry(repo: string | RepoLink) {
+function repoEntry(
+  repo: string | RepoLink,
+  credentials?: Map<string, GitCredentials>,
+) {
   const link = typeof repo === 'string' ? { url: repo } : repo;
   const parsed = parseRepoLink(link.url);
+  const path = link.path ? workspacePath(link.path) : parsed.path;
 
   return {
-    [link.path ? workspacePath(link.path) : parsed.path]: gitRepo({
-      repo: withGitCredentials(parsed.repo, link),
+    [path]: gitRepo({
+      repo: withGitCredentials(
+        parsed.repo,
+        link,
+        normalizeRelativePath(path),
+        credentials,
+      ),
       ...((link.ref ?? parsed.ref) ? { ref: link.ref ?? parsed.ref } : {}),
     }),
   };
 }
 
-//1. Keep a private-repo token out of the clone URL, so it never lands in saved state, snapshots, .git/config, or errors.
-//2. The SDK clones on this machine with this process's environment, so a git header scoped to this one URL reaches the clone.
-//3. GitHub uses x-access-token, GitLab uses oauth2, and Bitbucket uses x-token-auth unless username is set.
+// Tokens stay in the preparation call's memory, never in a Manifest or process.env.
 function withGitCredentials(
   repo: string,
   auth: { token?: string; username?: string },
+  path: string,
+  credentials?: Map<string, GitCredentials>,
   host?: GitHost,
 ) {
+  credentials?.delete(path);
   if (!auth.token) return repo;
-  if (repo.startsWith('git@')) {
-    throw new Error('A private token needs an https repo URL.');
+  if (!credentials) {
+    throw new Error(
+      'Private Git tokens require await prepareManifest(options).',
+    );
   }
-
-  const kind = host ?? gitHost(repo);
-  const href = repo.includes('://')
-    ? repo
-    : `https://${defaultGitHost(kind)}/${repo}.git`;
-  const url = new URL(href);
-  url.username = '';
-  url.password = '';
-  const clean = url.toString();
-  const basic = Buffer.from(
-    `${gitUsername(kind, auth.username)}:${auth.token}`,
-  ).toString('base64');
-  setGitConfig(`http.${clean}.extraHeader`, `Authorization: Basic ${basic}`);
-  return clean;
-}
-
-// Add or replace one git setting for this process. Git reads GIT_CONFIG_COUNT, GIT_CONFIG_KEY_n, and GIT_CONFIG_VALUE_n.
-function setGitConfig(key: string, value: string) {
-  const count = Number(process.env.GIT_CONFIG_COUNT ?? 0);
-  let index = count;
-  for (let i = 0; i < count; i++) {
-    if (process.env[`GIT_CONFIG_KEY_${i}`] === key) index = i;
-  }
-  process.env[`GIT_CONFIG_KEY_${index}`] = key;
-  process.env[`GIT_CONFIG_VALUE_${index}`] = value;
-  if (index === count) process.env.GIT_CONFIG_COUNT = String(count + 1);
+  credentials.set(path, { ...auth, host });
+  return repo;
 }
 
 function gitHost(repo: string): GitHost {

@@ -27,9 +27,9 @@ export class WebhookController {
 
   // OpenAI calls this when a self-hosted session needs a machine, and when that session fails.
   @ApiOperation({
-    summary: 'Create or delete a self-hosted machine',
+    summary: 'Queue self-hosted environment lifecycle work',
     description:
-      'Verifies the OpenAI webhook signature. An environment connection creates the remote machine. A failed session deletes it.',
+      'Verifies the OpenAI webhook signature and persists supported events before acknowledging them. A background worker provisions machines and retries cleanup.',
   })
   @ApiConsumes('application/json')
   @ApiHeader({ name: 'webhook-id', required: true })

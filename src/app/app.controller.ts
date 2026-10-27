@@ -7,6 +7,7 @@ import {
 import { AppService } from './app.service.js';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { SkipThrottle } from '@nestjs/throttler';
+import { PrismaService } from '@/lib/prisma/prisma.service.js';
 
 @Controller({ version: ['1', '2'] })
 @ApiTags('Server')
@@ -15,6 +16,7 @@ export class AppController {
     private readonly appService: AppService,
     private readonly health: HealthCheckService,
     private readonly memory: MemoryHealthIndicator,
+    private readonly prisma: PrismaService,
   ) {}
 
   @ApiOperation({ summary: 'ping server' })
@@ -36,6 +38,7 @@ export class AppController {
   @HealthCheck({ swaggerDocumentation: false })
   async ready() {
     const result = await this.health.check([
+      () => this.prisma.health(),
       () => this.memory.checkHeap('memory_heap', 500 * 1024 * 1024),
       () => this.memory.checkRSS('memory_rss', 1_500_000_000),
     ]);

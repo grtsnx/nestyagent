@@ -1,6 +1,6 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { ConflictException, Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import OpenAI from 'openai';
 import { z } from 'zod';
 import {
@@ -21,6 +21,7 @@ import {
   RunState,
   RunToolApprovalItem,
   Session,
+  SessionHistoryTransactionArgs,
   setDefaultOpenAIKey,
   StreamedRunResult,
   TextOutput,
@@ -29,6 +30,7 @@ import {
   ToolInputGuardrailTripwireTriggered,
   ToolOutputGuardrailTripwireTriggered,
 } from '@openai/agents';
+import type { SandboxRunConfig } from '@openai/agents/sandbox';
 import type { Prisma } from '@/generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 
@@ -46,6 +48,10 @@ export type AgentGuardrails = {
 };
 
 type ResumeOptions = {
+  session?: Session;
+  sandbox?: SandboxRunConfig;
+  ownerId?: string;
+  agentVersion?: string;
   websocket?: boolean;
   signal?: AbortSignal;
   maxTurns?: number;
@@ -53,10 +59,20 @@ type ResumeOptions = {
     string | OutputGuardrailBlockedMessageFormatter;
 };
 
-type RunAgentOptions<TContext> = ResumeOptions & {
+export type RunAgentOptions<TContext = unknown> = ResumeOptions & {
   context?: TContext;
   session?: Session;
 };
+
+type SavedRunIdentity = { id: string; version: number };
+type RunMetadata = { options: RunAgentOptions; agentName?: string; saved?: SavedRunIdentity };
+type RunAccess = { ownerId?: string; agentVersion?: string };
+const storedOptionsSchema = z.object({
+  websocket: z.boolean().optional(),
+  maxTurns: z.number().int().positive().optional(),
+  outputGuardrailBlockedMessage: z.string().optional(),
+  historyLimits: z.object({ maxItems: z.number().int().positive().optional(), maxBytes: z.number().int().positive().optional() }).optional(),
+});
 
 type Streamed = { stream: true };
 type NotStreamed = { stream?: false };
@@ -98,18 +114,21 @@ type ChatTurn = {
   agent: AnyAgent;
   waiting: boolean;
   result: RunResult<any, AnyAgent>;
+  options?: RunAgentOptions;
 };
 
 type ReplyOptions<TContext> = RunAgentOptions<TContext> & {
   fallback?: AnyAgent;
 };
 
-//1. A chat history kept in Postgres. It survives a restart and is shared by every copy of the app.
-//2. Every write is one statement, so two messages at once cannot lose or mix up items.
+export type HistoryLimits = { maxItems?: number; maxBytes?: number };
+
+// Persistent history. OpenaiService coordinates full turns across workers.
 export class DatabaseSession implements Session {
   constructor(
     private readonly prisma: PrismaService,
     readonly chatId: string,
+    readonly limits: HistoryLimits = {},
   ) {}
 
   async getSessionId() {
@@ -118,14 +137,57 @@ export class DatabaseSession implements Session {
 
   // Oldest first. With limit, only the newest items, still oldest first.
   async getItems(limit?: number) {
+    const maxItems = this.limits.maxItems ?? 200;
+    const count = limit ?? maxItems;
+    if (!Number.isSafeInteger(count) || count < 0) throw new Error('History limit must be a nonnegative integer.');
+    if (count === 0) return [];
     const rows = await this.prisma.db.chatItem.findMany({
       where: { chatId: this.chatId },
-      orderBy: { id: limit === undefined ? 'asc' : 'desc' },
-      ...(limit !== undefined && { take: limit }),
+      orderBy: { id: 'desc' },
+      take: count + 1,
       select: { item: true },
     });
-    const items = rows.map((row) => row.item as unknown as AgentInputItem);
-    return limit === undefined ? items : items.reverse();
+    const truncated = rows.length > count;
+    let items = rows.slice(0, count).reverse().map((row) => row.item as unknown as AgentInputItem);
+    if (truncated && limit === undefined) {
+      const start = items.findIndex((item) => 'role' in item && item.role === 'user');
+      if (start < 0) throw new Error('The current turn exceeds the history limit. Compact it or increase maxItems.');
+      items = items.slice(start);
+    }
+    if (Buffer.byteLength(JSON.stringify(items)) > (this.limits.maxBytes ?? 256_000)) {
+      throw new Error('Chat history exceeds maxBytes. Compact it before continuing.');
+    }
+    return items;
+  }
+
+  // The SDK retries the same operation ID when a history write has an uncertain outcome.
+  async applyHistoryTransaction({ operationId, transaction }: SessionHistoryTransactionArgs) {
+    if (!operationId.trim()) throw new Error('A history operation ID is required.');
+    const digest = historyDigest(transaction);
+    await this.prisma.db.$transaction(async (tx) => {
+      // Updating the parent locks this chat until the short database transaction commits.
+      await tx.chat.upsert({ where: { id: this.chatId }, create: { id: this.chatId }, update: { updatedAt: new Date() } });
+      const previous = await tx.chatHistoryOperation.findUnique({ where: { chatId_operationId: { chatId: this.chatId, operationId } } });
+      if (previous) {
+        if (previous.digest !== digest) throw new ConflictException('History operation ID was reused with different data.');
+        return;
+      }
+      let items: AgentInputItem[];
+      if (transaction.type === 'append_items') {
+        items = transaction.items;
+      } else {
+        const suffix = transaction.expectedSuffix.length
+          ? await tx.chatItem.findMany({ where: { chatId: this.chatId }, orderBy: { id: 'desc' }, take: transaction.expectedSuffix.length })
+          : [];
+        if (historyDigest(suffix.slice().reverse().map((row) => row.item)) !== historyDigest(transaction.expectedSuffix)) {
+          throw new ConflictException('Chat history changed before its suffix could be replaced.');
+        }
+        await tx.chatItem.deleteMany({ where: { chatId: this.chatId, id: { in: suffix.map((row) => row.id) } } });
+        items = transaction.replacement;
+      }
+      if (items.length) await tx.chatItem.createMany({ data: items.map((item) => ({ chatId: this.chatId, item: item as unknown as Prisma.InputJsonValue })) });
+      await tx.chatHistoryOperation.create({ data: { chatId: this.chatId, operationId, digest } });
+    });
   }
 
   // One transaction: the chat row is made or touched, and every item is added, or none are.
@@ -149,7 +211,9 @@ export class DatabaseSession implements Session {
 
   // Removes and returns the newest item. SKIP LOCKED lets two pops at once take different items.
   async popItem() {
-    const rows = await this.prisma.db.$queryRaw<{ item: AgentInputItem }[]>`
+    return await this.prisma.db.$transaction(async (tx) => {
+    await tx.chat.updateMany({ where: { id: this.chatId }, data: { updatedAt: new Date() } });
+    const rows = await tx.$queryRaw<{ item: AgentInputItem }[]>`
       DELETE FROM chat_items
       WHERE id = (
         SELECT id FROM chat_items
@@ -160,6 +224,7 @@ export class DatabaseSession implements Session {
       )
       RETURNING item`;
     return rows[0]?.item;
+    });
   }
 
   // Deleting the chat row deletes its items too.
@@ -182,6 +247,7 @@ export class OpenaiService implements OnModuleInit {
   private runnerModel?: string;
   private socketRunner?: Runner;
   private apiClient?: OpenAI;
+  private readonly runMetadata = new WeakMap<object, RunMetadata>();
 
   constructor(
     private readonly configService: ConfigService,
@@ -210,8 +276,8 @@ export class OpenaiService implements OnModuleInit {
 
   //1. The history for one chat, kept in Postgres. Pass the same session on every later message.
   //2. Store chatId with your user. Pass it back later, even after a restart, to continue the chat.
-  createSession(chatId: string = randomUUID()) {
-    return new DatabaseSession(this.prisma, chatId);
+  createSession(chatId: string = randomUUID(), limits?: HistoryLimits) {
+    return new DatabaseSession(this.prisma, chatId, limits);
   }
 
   // Create a new agent. Leave model out to use the runner model.
@@ -388,17 +454,17 @@ export class OpenaiService implements OnModuleInit {
   //9. maxTurns is optional. It stops a run that loops longer than that many model turns.
   //10. When a tool pauses, the result carries interruptions. approve or reject, then resumeAgent.
   runAgent<TAgent extends AnyAgent, TContext = unknown>(
-    prompt: string,
+    prompt: string | AgentInputItem[],
     agent: TAgent,
     options: RunAgentOptions<TContext> & Streamed,
   ): Promise<StreamedRunResult<TContext, TAgent>>;
   runAgent<TAgent extends AnyAgent, TContext = unknown>(
-    prompt: string,
+    prompt: string | AgentInputItem[],
     agent: TAgent,
     options?: RunAgentOptions<TContext> & NotStreamed,
   ): Promise<RunResult<TContext, TAgent>>;
   async runAgent(
-    prompt: string,
+    prompt: string | AgentInputItem[],
     agent: AnyAgent,
     options?: RunAgentOptions<unknown> & { stream?: boolean },
   ) {
@@ -419,15 +485,9 @@ export class OpenaiService implements OnModuleInit {
     agent: AnyAgent,
     options?: ReplyOptions<TContext>,
   ): Promise<ChatTurn> {
-    const result = await this.runAgent(prompt, agent, {
-      ...(options?.context !== undefined && { context: options.context }),
-      ...(options?.session && { session: options.session }),
-      ...(options?.websocket && { websocket: options.websocket }),
-      ...(options?.outputGuardrailBlockedMessage !== undefined && {
-        outputGuardrailBlockedMessage: options.outputGuardrailBlockedMessage,
-      }),
-    });
-    return this.chatTurn(agent, options?.fallback ?? agent, result);
+    const { fallback, ...runOptions } = options ?? {};
+    const result = await this.runAgent(prompt, agent, runOptions);
+    return this.chatTurn(agent, fallback ?? agent, result, runOptions);
   }
 
   //1. Finish a paused reply. Pass approve or reject.
@@ -445,14 +505,15 @@ export class OpenaiService implements OnModuleInit {
             }),
           })
         : this.approve(turn.result);
-    const result = await this.resumeAgent(turn.agent, state);
-    return this.chatTurn(turn.agent, turn.helper, result);
+    const result = await this.resumeAgent(turn.agent, state, turn.options);
+    return this.chatTurn(turn.agent, turn.helper, result, turn.options);
   }
 
   private chatTurn(
     agent: AnyAgent,
     fallback: AnyAgent,
     result: RunResult<any, AnyAgent>,
+    options?: RunAgentOptions,
   ): ChatTurn {
     const waiting = (result.interruptions?.length ?? 0) > 0;
     return {
@@ -461,6 +522,7 @@ export class OpenaiService implements OnModuleInit {
       agent,
       waiting,
       result,
+      options,
     };
   }
 
@@ -505,36 +567,72 @@ export class OpenaiService implements OnModuleInit {
     return await this.executeRun(agent, state, options);
   }
 
-  //1. Optional. Store a paused run in Postgres when a person will decide later. Returns its id.
-  //2. The run survives a restart. Keep the id with the request that needs the decision.
-  async saveRun(result: PausedRun) {
+  // Persist the checkpoint and portable run policy. Secrets in SDK context are the caller's responsibility.
+  async saveRun(result: PausedRun, options?: RunAgentOptions) {
+    const metadata = this.runMetadata.get(result.state);
+    if (metadata?.saved) return metadata.saved.id;
+    const policy = { ...metadata?.options, ...options };
+    const session = policy.session;
+    if (session && !(session instanceof DatabaseSession)) {
+      throw new Error('Saved runs require DatabaseSession so the session can be restored after a restart.');
+    }
     const row = await this.prisma.db.pausedRun.create({
-      data: { state: result.state.toString() },
-      select: { id: true },
+      data: {
+        state: result.state.toString(),
+        chatId: session?.chatId,
+        agentName: metadata?.agentName,
+        agentVersion: policy.agentVersion,
+        ownerId: policy.ownerId,
+        runOptions: {
+          ...(policy.websocket !== undefined && { websocket: policy.websocket }),
+          ...(policy.maxTurns !== undefined && { maxTurns: policy.maxTurns }),
+          ...(typeof policy.outputGuardrailBlockedMessage === 'string' && { outputGuardrailBlockedMessage: policy.outputGuardrailBlockedMessage }),
+          ...(session && { historyLimits: session.limits }),
+        },
+      },
     });
+    this.runMetadata.set(result.state, { options: policy, agentName: metadata?.agentName, saved: { id: row.id, version: row.version } });
     return row.id;
   }
 
-  //1. Load a paused run by the id from saveRun. Pass the same agent that started the run.
-  //2. A run can be taken once. A second load throws, so a double click cannot run a tool twice.
-  //3. If the state does not fit the agent, the transaction rolls back and the run stays waiting.
-  async loadRun(agent: AnyAgent, id: string) {
-    // Ids are UUIDs. Anything else cannot exist, and Postgres would reject it with a type error.
-    if (!z.uuid().safeParse(id).success) throw new Error(RUN_GONE);
-    return await this.prisma.db.$transaction(async (tx) => {
-      const taken = await tx.pausedRun.updateMany({
-        where: { id, status: 'waiting' },
-        data: { status: 'taken' },
-      });
-      if (taken.count !== 1) {
-        throw new Error(RUN_GONE);
-      }
-      const run = await tx.pausedRun.findUniqueOrThrow({
-        where: { id },
-        select: { state: true },
-      });
-      return await RunState.fromString(agent, run.state);
+  // Reading never consumes a checkpoint. Execution claims its version under a database lock.
+  async loadRun(agent: AnyAgent, id: string, access: RunAccess = {}) {
+    const row = await this.readRun(agent, id, access);
+    if (row.status !== 'waiting') {
+      if (row.status === 'completed') throw new Error(RUN_GONE);
+      throw new ConflictException('This run needs reconciliation before retry. Inspect external effects and call recoverRun.');
+    }
+    const state = await RunState.fromString(agent, row.state);
+    const { historyLimits, ...policy } = storedOptionsSchema.parse(row.runOptions ?? {});
+    this.runMetadata.set(state, {
+      agentName: agent.name,
+      saved: { id, version: row.version },
+      options: { ...policy, ...access, ...(row.chatId && { session: this.createSession(row.chatId, historyLimits) }) },
     });
+    return state;
+  }
+
+  // An interrupted external action may have succeeded. Only the application can reconcile it.
+  async recoverRun(agent: AnyAgent, id: string, options: RunAccess & { note: string }) {
+    if (!options.note.trim()) throw new Error('A reconciliation note is required before retrying.');
+    return await this.prisma.withLock(`run:${id}`, async () => {
+      const row = await this.readRun(agent, id, options);
+      if (!['running', 'recovery_required', 'taken'].includes(row.status)) {
+        throw new ConflictException('Only an interrupted run can be recovered.');
+      }
+      await this.prisma.db.pausedRun.updateMany({ where: { id, version: row.version }, data: { status: 'waiting', version: { increment: 1 }, recoveryNote: options.note } });
+      return await this.loadRun(agent, id, options);
+    });
+  }
+
+  private async readRun(agent: AnyAgent, id: string, access: RunAccess) {
+    if (!z.uuid().safeParse(id).success) throw new Error(RUN_GONE);
+    const row = await this.prisma.db.pausedRun.findUnique({ where: { id } });
+    if (!row || (row.ownerId && row.ownerId !== access.ownerId)) throw new Error(RUN_GONE);
+    if ((row.agentName && row.agentName !== agent.name) || (row.agentVersion && row.agentVersion !== access.agentVersion)) {
+      throw new ConflictException('The saved agent or configuration version does not match.');
+    }
+    return row;
   }
 
   //1. Approve or reject each chosen pause, then hand back the state to resume.
@@ -552,22 +650,85 @@ export class OpenaiService implements OnModuleInit {
 
   private async executeRun(
     agent: AnyAgent,
-    input: string | RunState<any, AnyAgent>,
+    input: string | AgentInputItem[] | RunState<any, AnyAgent>,
     options?: RunAgentOptions<unknown> & { stream?: boolean },
   ) {
-    const runOptions = {
-      context: options?.context,
-      session: options?.session,
-      signal: options?.signal,
-      maxTurns: options?.maxTurns,
-      outputGuardrailBlockedMessage: options?.outputGuardrailBlockedMessage,
-    };
-    const runner = this.runner(options?.websocket);
-
-    if (options?.stream) {
-      return await runner.run(agent, input, { ...runOptions, stream: true });
+    const metadata = typeof input === 'object' ? this.runMetadata.get(input) : undefined;
+    const policy = { ...metadata?.options, ...options };
+    const saved = metadata?.saved;
+    const session = policy.session;
+    if (saved && metadata?.options.session && session !== metadata.options.session) {
+      if (await session?.getSessionId() !== await metadata.options.session.getSessionId()) {
+        throw new ConflictException('A saved run must resume in its original chat.');
+      }
     }
-    return await runner.run(agent, input, runOptions);
+    const runner = this.runner(policy.websocket);
+    let deliver!: (result: StreamedRunResult<unknown, AnyAgent>) => void;
+    let rejectDelivery!: (error: unknown) => void;
+    const ready = policy.stream ? new Promise<StreamedRunResult<unknown, AnyAgent>>((resolve, reject) => { deliver = resolve; rejectDelivery = reject; }) : undefined;
+    let claimedVersion: number | undefined;
+
+    const execute = async (lockSignal?: AbortSignal) => {
+      const signal = policy.signal && lockSignal ? AbortSignal.any([policy.signal, lockSignal]) : policy.signal ?? lockSignal;
+      signal?.throwIfAborted();
+      if (!saved && session instanceof DatabaseSession) {
+        const pending = await this.prisma.db.pausedRun.findMany({ where: { chatId: session.chatId, status: { in: ['waiting', 'running', 'recovery_required', 'taken'] } }, take: 1 });
+        if (pending.length) throw new ConflictException('This chat has a pending approval or interrupted run. Resume or reconcile it first.');
+      }
+      if (saved) {
+        const claim = await this.prisma.db.pausedRun.updateMany({ where: { id: saved.id, version: saved.version, status: 'waiting' }, data: { status: 'running', state: (input as RunState<any, AnyAgent>).toString(), version: { increment: 1 } } });
+        if (claim.count !== 1) throw new ConflictException('This checkpoint is stale or already running. Reload the saved run.');
+        claimedVersion = saved.version + 1;
+      }
+      try {
+        const runOptions = {
+          context: policy.context, session, signal, maxTurns: policy.maxTurns,
+          outputGuardrailBlockedMessage: policy.outputGuardrailBlockedMessage,
+          sandbox: policy.sandbox,
+        };
+        const result = policy.stream
+          ? await runner.run(agent, input, { ...runOptions, stream: true })
+          : await runner.run(agent, input, runOptions);
+        if (policy.stream) {
+          const streamed = result as StreamedRunResult<unknown, AnyAgent>;
+          // Capture the SDK promise before exposing completion that includes persistence and unlock.
+          const sdkCompletion = streamed.completed;
+          deliver(streamed);
+          await sdkCompletion;
+        }
+        signal?.throwIfAborted();
+        if (result.state) {
+          this.runMetadata.set(result.state, { options: policy, agentName: agent.name });
+          if (saved) {
+            const persisted = await this.prisma.db.pausedRun.updateMany({ where: { id: saved.id, version: claimedVersion, status: 'running' }, data: { state: result.state.toString(), status: result.interruptions.length ? 'waiting' : 'completed', version: { increment: 1 } } });
+            if (persisted.count !== 1) throw new ConflictException('The run checkpoint changed before completion.');
+            this.runMetadata.set(result.state, { options: policy, agentName: agent.name, saved: { id: saved.id, version: claimedVersion! + 1 } });
+          } else if (session instanceof DatabaseSession && result.interruptions.length) {
+            await this.saveRun(result, policy);
+          }
+        }
+        return result;
+      } catch (error) {
+        if (saved && claimedVersion !== undefined) {
+          // Keep the last known checkpoint; never replay an uncertain side effect automatically.
+          await this.prisma.db.pausedRun.updateMany({ where: { id: saved.id, version: claimedVersion, status: 'running' }, data: { status: 'recovery_required' } }).catch(() => {});
+          // If the database is down, the durable 'running' marker also requires reconciliation.
+        }
+        throw error;
+      }
+    };
+    const withSession = async (outerSignal?: AbortSignal) => session instanceof DatabaseSession
+      ? await this.prisma.withLock(`chat:${session.chatId}`, (signal) => execute(outerSignal ? AbortSignal.any([outerSignal, signal]) : signal))
+      : await execute(outerSignal);
+    const lifecycle = saved
+      ? this.prisma.withLock(`run:${saved.id}`, withSession)
+      : withSession();
+    if (!ready) return await lifecycle;
+    const completion = lifecycle.then(() => {});
+    completion.catch(rejectDelivery);
+    const streamed = await ready;
+    Object.defineProperty(streamed, 'completed', { value: completion, configurable: true });
+    return streamed;
   }
 
   // The socket runner, the shared runner from createRunner, or the SDK's plain default.
@@ -589,4 +750,17 @@ export class OpenaiService implements OnModuleInit {
   private apiKey() {
     return this.configService.getOrThrow<string>('OPENAI_API_KEY').trim();
   }
+}
+
+// Normalize object key order so JSONB round-trips preserve operation identity.
+function historyDigest(value: unknown): string {
+  const normalize = (entry: unknown): unknown => {
+    if (Array.isArray(entry)) return entry.map(normalize);
+    if (entry && typeof entry === 'object') return Object.fromEntries(
+      Object.entries(entry).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => [key, normalize(child)]),
+    );
+    return entry;
+  };
+  const canonical = JSON.stringify(normalize(JSON.parse(JSON.stringify(value))));
+  return createHash('sha256').update(canonical).digest('hex');
 }

@@ -392,6 +392,58 @@ describe('OpenaiService orchestration', () => {
 });
 
 describe('OpenaiService storage and limits', () => {
+  it('holds the conversation lock until streaming and persistence finish', async () => {
+    const { prisma } = fakePrisma();
+    const first = service(prisma);
+    const second = service(prisma);
+    const agent = new Agent({ name: 'Helper' });
+    let end!: () => void;
+    const completed = new Promise<void>((resolve) => { end = resolve; });
+    const run = vi.spyOn(Runner.prototype, 'run').mockResolvedValue({ completed } as never);
+    try {
+      const stream = await first.runAgent('hello', agent, { session: first.createSession('shared'), stream: true });
+      await expect(second.runAgent('overlap', agent, { session: second.createSession('shared') })).rejects.toThrow(/already running/);
+      end();
+      await stream.completed;
+      run.mockResolvedValue({} as never);
+      await expect(second.runAgent('next', agent, { session: second.createSession('shared') })).resolves.toBeDefined();
+    } finally { end(); run.mockRestore(); }
+  });
+
+  it('bounds history at a user-turn boundary without orphan tool output', async () => {
+    const openai = service();
+    const session = openai.createSession('bounded', { maxItems: 3 });
+    await session.addItems([
+      { role: 'user', content: 'old' },
+      { type: 'function_call', callId: 'c1', name: 'lookup', arguments: '{}' },
+      { type: 'function_call_result', callId: 'c1', name: 'lookup', output: { type: 'text', text: 'done' } },
+      { role: 'user', content: 'new' },
+    ] as AgentInputItem[]);
+    expect(await session.getItems()).toEqual([{ role: 'user', content: 'new' }]);
+  });
+
+  it('preserves cancellation and turn limits through reply', async () => {
+    const openai = service();
+    const agent = new Agent({ name: 'Helper' });
+    const signal = new AbortController().signal;
+    const run = vi.spyOn(openai, 'runAgent').mockResolvedValue({} as never);
+    await openai.reply('hello', agent, { signal, maxTurns: 2 });
+    expect(run).toHaveBeenCalledWith('hello', agent, expect.objectContaining({ signal, maxTurns: 2 }));
+  });
+
+  it('keeps the session and execution policy when finishing an approval', async () => {
+    const openai = service();
+    const agent = new Agent({ name: 'Helper' });
+    const session = openai.createSession('chat');
+    const signal = new AbortController().signal;
+    const state = { approve: vi.fn() };
+    vi.spyOn(openai, 'runAgent').mockResolvedValue({ state, interruptions: [{}] } as never);
+    const resume = vi.spyOn(openai, 'resumeAgent').mockResolvedValue({} as never);
+    const turn = await openai.reply('hello', agent, { session, signal, maxTurns: 2, websocket: true });
+    await openai.finish(turn, 'approve');
+    expect(resume).toHaveBeenCalledWith(agent, state, expect.objectContaining({ session, signal, maxTurns: 2, websocket: true }));
+  });
+
   const message = (text: string) =>
     ({ role: 'user', content: text }) as AgentInputItem;
 
@@ -430,7 +482,7 @@ describe('OpenaiService storage and limits', () => {
     expect(first).not.toBe(second);
   });
 
-  it('lets a saved run be taken only once', async () => {
+  it('loading a saved approval never consumes it before execution', async () => {
     const { db, prisma } = fakePrisma();
     const openai = service(prisma);
     const agent = new Agent({ name: 'Order helper', instructions: 'Orders.' });
@@ -453,11 +505,48 @@ describe('OpenaiService storage and limits', () => {
 
     expect(attempts.map((attempt) => attempt.status).sort()).toEqual([
       'fulfilled',
-      'rejected',
+      'fulfilled',
     ]);
     expect(fromString).toHaveBeenCalledWith(agent, 'paused');
-    expect(db.pausedRun.rows[0]).toMatchObject({ status: 'taken' });
+    expect(db.pausedRun.rows[0]).toMatchObject({ status: 'waiting' });
     fromString.mockRestore();
+  });
+
+  it('records ambiguous execution and requires reconciliation before retry', async () => {
+    const { db, prisma } = fakePrisma();
+    const openai = service(prisma);
+    const agent = new Agent({ name: 'Helper' });
+    const state = { toString: () => 'checkpoint' } as unknown as RunState<unknown, Agent>;
+    const decode = vi.spyOn(RunState, 'fromString').mockResolvedValue(state);
+    const run = vi.spyOn(Runner.prototype, 'run').mockRejectedValue(new Error('connection lost'));
+    try {
+      const id = await openai.saveRun({ state });
+      const loaded = await openai.loadRun(agent, id);
+      await expect(openai.resumeAgent(agent, loaded)).rejects.toThrow('connection lost');
+      expect(db.pausedRun.rows[0]).toMatchObject({ status: 'recovery_required', state: 'checkpoint' });
+      await expect(openai.loadRun(agent, id)).rejects.toThrow(/reconcil/i);
+      await openai.recoverRun(agent, id, { note: 'Provider confirmed that the idempotent operation may be retried.' });
+      expect(db.pausedRun.rows[0]).toMatchObject({ status: 'waiting' });
+    } finally { decode.mockRestore(); run.mockRestore(); }
+  });
+
+  it('restores persisted chat options and refuses a stale second resume', async () => {
+    const { db, prisma } = fakePrisma();
+    const openai = service(prisma);
+    const agent = new Agent({ name: 'Helper' });
+    const makeState = () => ({ toString: () => 'checkpoint' }) as unknown as RunState<unknown, Agent>;
+    const decode = vi.spyOn(RunState, 'fromString').mockImplementation(async () => makeState());
+    const run = vi.spyOn(Runner.prototype, 'run').mockResolvedValue({ state: makeState(), interruptions: [], finalOutput: 'done' } as never);
+    try {
+      const id = await openai.saveRun({ state: makeState() }, { session: openai.createSession('persisted-chat'), maxTurns: 3 });
+      const first = await openai.loadRun(agent, id);
+      const stale = await openai.loadRun(agent, id);
+      await openai.resumeAgent(agent, first);
+      expect(run).toHaveBeenCalledWith(agent, first, expect.objectContaining({ maxTurns: 3, session: expect.objectContaining({ chatId: 'persisted-chat' }) }));
+      expect(db.pausedRun.rows[0]).toMatchObject({ status: 'completed' });
+      await expect(openai.resumeAgent(agent, stale)).rejects.toThrow();
+      expect(run).toHaveBeenCalledTimes(1);
+    } finally { decode.mockRestore(); run.mockRestore(); }
   });
 
   it('keeps a saved run waiting when it does not fit the agent', async () => {
