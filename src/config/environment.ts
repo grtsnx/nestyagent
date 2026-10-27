@@ -97,6 +97,10 @@ const environmentSchema = z
     LANGFUSE_PUBLIC_KEY: optionalString(),
     LANGFUSE_SECRET_KEY: optionalString(),
     LANGFUSE_BASE_URL: optionalString(),
+    TRACE_PAYLOADS: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      booleanValue('TRACE_PAYLOADS').optional(),
+    ),
   })
   .superRefine((environment, context) => {
     if (environment.OBSERVE_ENABLED) {
@@ -148,12 +152,13 @@ const environmentSchema = z
 // The parsed values, with the defaults validateEnvironment fills in.
 export type Environment = Omit<
   z.output<typeof environmentSchema>,
-  'CORS_ORIGINS' | 'OBSERVE_ENABLED' | 'SWAGGER_ENABLED'
+  'CORS_ORIGINS' | 'OBSERVE_ENABLED' | 'SWAGGER_ENABLED' | 'TRACE_PAYLOADS'
 > & {
   CORS_ORIGINS: string[];
   OBSERVE_ENABLED: boolean;
   SWAGGER_ENABLED: boolean;
   LANGFUSE_ENABLED: boolean;
+  TRACE_PAYLOADS: boolean;
 };
 
 export function validateEnvironment(
@@ -165,6 +170,7 @@ export function validateEnvironment(
     CORS_ORIGINS: corsOrigins(parsed.CORS_ORIGINS),
     OBSERVE_ENABLED: parsed.OBSERVE_ENABLED ?? false,
     SWAGGER_ENABLED: parsed.SWAGGER_ENABLED ?? parsed.NODE_ENV !== 'production',
+    TRACE_PAYLOADS: parsed.TRACE_PAYLOADS ?? false,
     LANGFUSE_ENABLED: Boolean(
       parsed.LANGFUSE_PUBLIC_KEY &&
       parsed.LANGFUSE_SECRET_KEY &&

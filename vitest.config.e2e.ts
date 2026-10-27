@@ -14,6 +14,7 @@ export default defineConfig({
       LANGFUSE_PUBLIC_KEY: '',
       LANGFUSE_SECRET_KEY: '',
       LANGFUSE_BASE_URL: '',
+      TRACE_PAYLOADS: '',
     },
   },
 });

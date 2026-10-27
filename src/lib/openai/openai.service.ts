@@ -75,6 +75,7 @@ type ResumeOptions = {
   maxTurns?: number;
   previousResponseId?: string;
   promptCacheKey?: string;
+  tracePayloads?: boolean;
   userId?: string;
   workflowName?: string;
   groupId?: string;
@@ -99,6 +100,7 @@ const storedOptionsSchema = z.object({
   maxTurns: z.number().int().positive().optional(),
   outputGuardrailBlockedMessage: z.string().optional(),
   promptCacheKey: z.string().optional(),
+  tracePayloads: z.boolean().optional(),
   userId: z.string().optional(),
   workflowName: z.string().optional(),
   groupId: z.string().optional(),
@@ -795,6 +797,9 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
           ...(policy.promptCacheKey && {
             promptCacheKey: policy.promptCacheKey,
           }),
+          ...(policy.tracePayloads !== undefined && {
+            tracePayloads: policy.tracePayloads,
+          }),
           ...(policy.userId && { userId: policy.userId }),
           ...(policy.workflowName && { workflowName: policy.workflowName }),
           ...(policy.groupId && { groupId: policy.groupId }),
@@ -943,6 +948,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
       policy.websocket,
       agent,
       policy.promptCacheKey ?? (await session?.getSessionId()),
+      policy.tracePayloads,
     );
     let deliver!: (result: StreamedRunResult<unknown, AnyAgent>) => void;
     let rejectDelivery!: (error: unknown) => void;
@@ -1141,33 +1147,43 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   //2. With a prompt cache key, a light runner for this one run sends prompt_cache_key.
   //3. The key travels in providerData, which replaces an agent's own, so the agent's is copied in.
   //   An agent reached by handoff keeps only the key, not its own providerData.
+  //4. A run whose trace payloads differ from TRACE_PAYLOADS gets its own runner.
   private runner(
     websocket?: boolean,
     agent?: AnyAgent,
     promptCacheKey?: string,
+    tracePayloads?: boolean,
   ) {
-    const config = this.runnerConfig(websocket);
-    if (promptCacheKey)
+    const includePayloads = tracePayloads ?? this.tracePayloadsDefault();
+    const config = this.runnerConfig(websocket, includePayloads);
+    if (promptCacheKey || includePayloads !== this.tracePayloadsDefault())
       return new Runner({
         ...config,
-        modelSettings: {
-          providerData: {
-            ...agent?.modelSettings?.providerData,
-            prompt_cache_key: promptCacheKey,
+        ...(promptCacheKey && {
+          modelSettings: {
+            providerData: {
+              ...agent?.modelSettings?.providerData,
+              prompt_cache_key: promptCacheKey,
+            },
           },
-        },
+        }),
       });
     if (websocket) return (this.socketRunner ??= new Runner(config));
     return (this.sharedRunner ??= new Runner(config));
   }
 
   // What every runner shares. All socket runs reuse one socket provider.
-  private runnerConfig(websocket?: boolean) {
+  // Payloads stay off until TRACE_PAYLOADS or a run's tracePayloads flag turns them on.
+  private runnerConfig(websocket?: boolean, includePayloads?: boolean) {
     return {
       ...(this.runnerModel && { model: this.runnerModel }),
-      traceIncludeSensitiveData: false,
+      traceIncludeSensitiveData: includePayloads ?? this.tracePayloadsDefault(),
       ...(websocket && { modelProvider: this.socketProvider() }),
     };
+  }
+
+  private tracePayloadsDefault() {
+    return this.configService.get<boolean>('TRACE_PAYLOADS') === true;
   }
 
   private socketProvider() {

@@ -21,11 +21,22 @@ import { OpenaiService } from '@/lib/openai/openai.service.js';
 import { SandboxService } from '@/lib/sandbox/sandbox.service.js';
 import { fakePrisma } from './fake-prisma.js';
 
-function service(prisma = fakePrisma().prisma) {
+function service(
+  prisma = fakePrisma().prisma,
+  env: Record<string, unknown> = {},
+) {
   return new OpenaiService(
-    { getOrThrow: () => 'sk-test' } as unknown as ConfigService,
+    {
+      getOrThrow: () => 'sk-test',
+      get: (key: string) => env[key],
+    } as unknown as ConfigService,
     prisma,
   );
+}
+
+function tracePayloads(run: { mock: { contexts: unknown[] } }) {
+  const runner = run.mock.contexts[0] as { config: RunConfig };
+  return runner.config.traceIncludeSensitiveData;
 }
 
 describe('OpenaiService orchestration', () => {
@@ -935,6 +946,76 @@ describe('OpenaiService storage and limits', () => {
         },
       });
     } finally {
+      run.mockRestore();
+    }
+  });
+
+  it('leaves model and tool payloads out of traces', async () => {
+    const agent = new Agent({ name: 'Menu helper', instructions: 'Menu.' });
+    const run = vi
+      .spyOn(Runner.prototype, 'run')
+      .mockResolvedValue({ interruptions: [] } as never);
+    try {
+      await service().runAgent('Any cakes?', agent);
+      expect(tracePayloads(run)).toBe(false);
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it('includes model and tool payloads when a run asks for a gradable trace', async () => {
+    const agent = new Agent({ name: 'Menu helper', instructions: 'Menu.' });
+    const run = vi
+      .spyOn(Runner.prototype, 'run')
+      .mockResolvedValue({ interruptions: [] } as never);
+    try {
+      await service().runAgent('Any cakes?', agent, { tracePayloads: true });
+      expect(tracePayloads(run)).toBe(true);
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it('includes trace payloads for every run when the environment asks', async () => {
+    const agent = new Agent({ name: 'Menu helper', instructions: 'Menu.' });
+    const run = vi
+      .spyOn(Runner.prototype, 'run')
+      .mockResolvedValue({ interruptions: [] } as never);
+    try {
+      await service(fakePrisma().prisma, { TRACE_PAYLOADS: true }).runAgent(
+        'Any cakes?',
+        agent,
+      );
+      expect(tracePayloads(run)).toBe(true);
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it('keeps a gradable trace when a saved run resumes', async () => {
+    const { prisma } = fakePrisma();
+    const openai = service(prisma);
+    const agent = new Agent({ name: 'Order helper', instructions: 'Orders.' });
+    const makeState = () =>
+      ({ toString: () => 'checkpoint' }) as unknown as RunState<unknown, Agent>;
+    const decode = vi
+      .spyOn(RunState, 'fromString')
+      .mockImplementation(async () => makeState());
+    const run = vi.spyOn(Runner.prototype, 'run').mockResolvedValue({
+      state: makeState(),
+      interruptions: [],
+      finalOutput: 'done',
+    } as never);
+    try {
+      const id = await openai.saveRun(
+        { state: makeState() },
+        { tracePayloads: true },
+      );
+      const state = await openai.loadRun(agent, id);
+      await openai.resumeAgent(agent, state);
+      expect(tracePayloads(run)).toBe(true);
+    } finally {
+      decode.mockRestore();
       run.mockRestore();
     }
   });

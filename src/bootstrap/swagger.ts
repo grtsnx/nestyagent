@@ -185,12 +185,7 @@ export function configureSwagger(
       darkMode: false,
       hideDarkModeToggle: true,
       pageTitle: `${environment.PLATFORM_NAME} API Reference`,
-      showDeveloperTools: 'always',
-      // Scalar has no setting for these, so hide the toolbar's Share and Deploy buttons by position.
-      customCss: [
-        '.api-reference-toolbar > div > div.contents:nth-child(4),',
-        '.api-reference-toolbar > div > div.contents:nth-child(6) { display: none !important; }',
-      ].join('\n'),
+      showDeveloperTools: 'never',
       sources: apiVersions.map((version, index) => ({
         default: index === 0,
         slug: `v${version}`,

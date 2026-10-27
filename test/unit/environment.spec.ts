@@ -10,6 +10,7 @@ describe('validateEnvironment', () => {
       CORS_ORIGINS: [],
       OBSERVE_ENABLED: false,
       SWAGGER_ENABLED: true,
+      TRACE_PAYLOADS: false,
     });
   });
 
@@ -118,5 +119,18 @@ describe('validateEnvironment', () => {
         LANGFUSE_BASE_URL: 'http://localhost:3100',
       }).LANGFUSE_ENABLED,
     ).toBe(true);
+  });
+
+  it('keeps trace payloads off unless the environment turns them on', () => {
+    expect(validateEnvironment({}).TRACE_PAYLOADS).toBe(false);
+    expect(validateEnvironment({ TRACE_PAYLOADS: 'true' }).TRACE_PAYLOADS).toBe(
+      true,
+    );
+    expect(validateEnvironment({ TRACE_PAYLOADS: '' }).TRACE_PAYLOADS).toBe(
+      false,
+    );
+    expect(() => validateEnvironment({ TRACE_PAYLOADS: 'sometimes' })).toThrow(
+      /TRACE_PAYLOADS/,
+    );
   });
 });

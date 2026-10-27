@@ -186,9 +186,9 @@ Keep your own tools in `src/config/tools`. `sample.tool.ts` there is a starting 
 
 ### See the run
 
-Each customer message is a trace named `agent-turn`. A chat id groups those traces into one session. Traces always go to the OpenAI dashboard, without model and tool payloads.
+Each customer message is a trace named `agent-turn`. A chat id groups those traces into one session. Traces always go to the OpenAI dashboard. Model messages and tool inputs and outputs stay off that trace until you turn payloads on. See [Check the answers (evals)](#check-the-answers-evals).
 
-Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` to also send each trace to your self-hosted Langfuse. Langfuse gets more than the OpenAI dashboard: the customer's message, the final answer, the chat id, the user id, the request id, the model, and token use. API keys in that text are masked. Tool inputs and outputs still stay out. Turn Langfuse on only where storing customer messages is allowed.
+Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` to also send each trace to your self-hosted Langfuse. Langfuse gets the customer's message, the final answer, the chat id, the user id, the request id, the model, and token use. With payloads on, it also gets tool inputs and outputs. API keys in that text are masked. Turn Langfuse on only where storing customer messages is allowed.
 
 A trace appears in Langfuse only after a helper runs. This app ships no route that runs a helper, so the dashboard stays empty until your own code calls `runAgent`, `reply`, or `runSandbox`. If Langfuse is down, the app keeps working and those traces are dropped.
 
@@ -196,12 +196,72 @@ A trace appears in Langfuse only after a helper runs. This app ships no route th
 
 ### Check the answers (evals)
 
-The OpenAI guide says to debug with traces first, then grade them. Langfuse does both on the traces above. Each trace has the customer's message and the helper's answer, so in Langfuse you can:
+Grade traces while you are still finding mistakes. Move to a dataset when you want the same checks again after a prompt, tool, or model change. Both happen in the OpenAI dashboard. This app's job is to send a trace a grader can actually read.
 
-1. Score traces by hand, or with an LLM-as-a-judge evaluator, for example "Did the helper give the right cake price?"
-2. Save good traces to a dataset, then run the dataset again after you change a prompt, tool, or model, and compare the scores.
+**1. Send a gradable trace**
 
-Pass `userId` on `runAgent` or `reply` to filter scores by customer.
+Payloads stay off until you ask for them. A customer chat can stay redacted. A run you want to grade includes the model messages, the tool arguments, and the tool results.
+
+```typescript
+await this.openai.runAgent('Where is my order?', frontDesk, {
+  session: chat,
+  userId: 'c-42',
+  workflowName: 'agent-turn',
+  tracePayloads: true,
+});
+```
+
+`workflowName` is optional. Leave it out and the dashboard workflow is still `agent-turn`. Pass `userId` when you want to filter by customer.
+
+To grade every run in one environment, such as a staging shop, set this and restart:
+
+```bash
+TRACE_PAYLOADS=true
+```
+
+> [!WARNING]
+> A gradable trace stores the customer message and the tool results in the OpenAI dashboard. Turn it on only where that storage is allowed. Langfuse still masks API keys in its copy.
+
+**2. Grade it in Logs**
+
+1. Open [Logs > Traces](https://platform.openai.com/logs?api=traces) and select the workflow `agent-turn`.
+2. Open one trace. With payloads on you can see each model call, each tool call and its result, each handoff, and each guardrail.
+3. Create a grader and run it on the traces you selected.
+4. Use the scores to edit the prompt, the tools, the routing, or the guardrails.
+
+| Question the grader asks                  | Sunny Bakery example                                                             |
+| ----------------------------------------- | -------------------------------------------------------------------------------- |
+| Did the helper pick the right tool?       | `cancel_order` runs when the customer asks to cancel, and stays quiet otherwise. |
+| Did a handoff happen when it should have? | "Where is my order?" goes to Order helper.                                       |
+| Did the run break a rule?                 | The answer leaves out the secret recipe, and a homework message is stopped.      |
+| Did a prompt, tool, or model change help? | Grade the same kind of trace again after the change.                             |
+
+Select **Grade all** when you want those checks across many traces. A run there can be narrowed by model, date, or tool call.
+
+`traceWorkflow` puts several runs in one trace when one customer job is more than one helper call. `span` records a step the SDK does not already record.
+
+**3. Repeat it on a dataset**
+
+When you know what a good answer looks like, save those cases as a dataset and grade them again after each change.
+
+1. Open the [evaluation datasets](https://platform.openai.com/evaluation) page and create one named `Sunny Bakery orders`.
+2. Add rows. `message` is the customer text. `correct_price` or `expected_tool` is the ground truth. A CSV upload uses the same columns.
+3. Generate outputs, then annotate a few. Mark one Good or Bad, and write a short note in `output_feedback`.
+4. Add a grader. Run it, change the helper, and run it again. The new column shows what got better.
+
+| Grader          | What it checks                               | Bakery example                              |
+| --------------- | -------------------------------------------- | ------------------------------------------- |
+| String check    | The answer matches the ground truth exactly. | The price is `$25`.                         |
+| Text similarity | The answer is close to the ground truth.     | "Open every day from 7am to 6pm."           |
+| Score model     | A model gives a number.                      | Friendliness from 1 to 5.                   |
+| Label model     | A model picks one label.                     | `menu`, `order`, or `off-topic`.            |
+| Python          | Your code scores the answer.                 | The reply does not contain `secret recipe`. |
+
+The prompt optimizer rewrites the prompt from that dataset and those notes. Open it from the dataset when the same grader keeps failing.
+
+Langfuse can score the same turns by hand, or with an LLM-as-a-judge, when you want a copy outside the OpenAI dashboard.
+
+The older Evals API becomes read-only on October 31, 2026 and is removed on November 30, 2026. Use trace grading and datasets.
 
 ### Get a filled-in form back
 
@@ -1491,7 +1551,7 @@ A lock is a row with an expiry time, not a held database connection, so any numb
 
 **Deployment:** drain old workers before applying the recovery migration and starting this version. Older binaries do not participate in the new execution locks or inbox. The migration preserves data and marks legacy consumed approvals and incomplete machine claims for reconciliation. Back up production data and inspect these records after deployment; do not replay them automatically.
 
-The Agents SDK's built-in tracing remains enabled, with sensitive model/tool payloads excluded by default in this wrapper. Use the returned result's `runContext.usage` for token accounting, and correlate application request ids with run/chat ids in your own telemetry. Define task-specific evaluation datasets and measure latency and cost on representative workloads before making performance claims. Retention and authorization policies belong to the application; authenticate before loading a chat or deciding an approval.
+The Agents SDK's built-in tracing remains enabled. Model and tool payloads stay off each trace unless `TRACE_PAYLOADS` or a run's `tracePayloads` flag turns them on for grading. Use the returned result's `runContext.usage` for token accounting, and correlate application request ids with run/chat ids in your own telemetry. Define task-specific evaluation datasets and measure latency and cost on representative workloads before making performance claims. Retention and authorization policies belong to the application; authenticate before loading a chat or deciding an approval.
 
 Sandbox files require their own retained workspace, provider storage, or snapshot. Keep executor credentials separate from application credentials, and use isolated compute for untrusted code. Shutdown cancels run signals, closes cached WebSocket providers, and stops locally owned executors; interrupted external operations remain subject to reconciliation.
 
