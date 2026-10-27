@@ -101,41 +101,40 @@ describe('Postgres persistence', () => {
     expect(await a.getItems()).toEqual(operation.transaction.items);
   });
 
-  it('acquires related locks on one connection without starving the pool', async () => {
+  it('runs fifty chats at once, because a lock holds no connection', async () => {
     let release!: () => void;
-    let entered!: () => void;
-    let count = 0;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const allEntered = new Promise<void>((resolve) => {
-      entered = resolve;
-    });
-    const keys = Array.from({ length: 10 }, () => {
+    let running = 0;
+    const keys = Array.from({ length: 50 }, () => {
       const id = randomUUID();
       return [`run:${id}`, `chat:${id}`];
     });
     const tasks = keys.map((pair) =>
       first.withLock(pair, async () => {
-        count += 1;
-        if (count === 10) entered();
+        running += 1;
         await gate;
       }),
     );
     try {
-      await Promise.race([allEntered, Promise.all(tasks)]);
-      expect(count).toBe(10);
-      await expect(second.withLock(keys[0][0], async () => {})).rejects.toThrow(
+      await expect.poll(() => running, { timeout: 10_000 }).toBe(50);
+      await expect(second.withLock(keys[0][1], async () => {})).rejects.toThrow(
         /already running/,
       );
     } finally {
       release();
-      await Promise.allSettled(tasks);
+      await Promise.all(tasks);
     }
+    const left = await first.db.executionLock.count({
+      where: { key: { in: keys.flat() } },
+    });
+    expect(left).toBe(0);
   });
 
-  it('aborts an owner whose database connection dies and releases its lock', async () => {
+  it('aborts an owner that loses its lock', async () => {
     const key = `test:${randomUUID()}`;
+    first.lockRenewMs = 100;
     let entered!: () => void;
     const acquired = new Promise<void>((resolve) => {
       entered = resolve;
@@ -146,14 +145,60 @@ describe('Postgres persistence', () => {
         signal.addEventListener('abort', () => resolve(), { once: true }),
       );
     });
-    const rejected = expect(running).rejects.toThrow(/lock was lost/);
-    await acquired;
-    await second.db
-      .$queryRaw`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user AND state = 'idle' AND query LIKE 'SELECT pg_try_advisory_lock%'`;
-    await rejected;
+    try {
+      const rejected = expect(running).rejects.toThrow(/lock was lost/);
+      await acquired;
+      // Another worker took the row, as if this owner had stalled past its expiry.
+      await second.db.executionLock.update({
+        where: { key },
+        data: { owner: randomUUID() },
+      });
+      await rejected;
+    } finally {
+      first.lockRenewMs = 15_000;
+    }
+  });
+
+  it('frees the lock of an owner that crashed once it expires', async () => {
+    const key = `test:${randomUUID()}`;
+    await first.db.executionLock.create({
+      data: {
+        key,
+        owner: randomUUID(),
+        expiresAt: new Date(Date.now() + 60_000),
+      },
+    });
+    await expect(second.withLock(key, async () => {})).rejects.toThrow(
+      /already running/,
+    );
+    await first.db.executionLock.update({
+      where: { key },
+      // Well in the past, so a small clock gap between this machine and Postgres does not matter.
+      data: { expiresAt: new Date(Date.now() - 60_000) },
+    });
     await expect(second.withLock(key, async () => 'recovered')).resolves.toBe(
       'recovered',
     );
+  });
+
+  it('sends a current turn longer than maxItems whole', async () => {
+    const session = new DatabaseSession(first, chat(), { maxItems: 3 });
+    const steps = Array.from({ length: 4 }, (_, index) => ({
+      type: 'function_call_result' as const,
+      callId: `c${index}`,
+      name: 'bake',
+      status: 'completed' as const,
+      output: { type: 'text' as const, text: 'ok' },
+    }));
+    await session.addItems([
+      { role: 'user', content: 'old' },
+      { role: 'user', content: 'Bake 4 cakes.' },
+      ...steps,
+    ]);
+    expect(await session.getItems()).toEqual([
+      { role: 'user', content: 'Bake 4 cakes.' },
+      ...steps,
+    ]);
   });
 
   it('rolls back a suffix rewrite when the expected history changed', async () => {

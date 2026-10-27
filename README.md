@@ -90,21 +90,23 @@ The AWS, DigitalOcean, Databricks, OCI, and Cloudflare settings are in `.env.exa
 
 The app uses Postgres through Prisma. The database keeps durable workflow records shared by every app replica:
 
-| Table                     | What it keeps                                                      | Key                                        |
-| ------------------------- | ------------------------------------------------------------------ | ------------------------------------------ |
-| `chats`                   | One row per chat, with when it started and when it last moved.     | The chat id you pick, like `chat-c-42`     |
-| `chat_items`              | Every chat message, so a helper remembers the chat.                | A counter, so messages stay in exact order |
-| `paused_runs`             | Approval checkpoints, execution status, owner, and recovery notes. | A Prisma-generated UUIDv7                  |
-| `remote_machines`         | Which self-hosted machine belongs to which session.                | OpenAI's session id                        |
-| `hosted_webhooks`         | Verified events, retries, worker leases, and terminal records.     | OpenAI event id                            |
-| `chat_history_operations` | Completed SDK history operations and their content digest.         | Chat id + operation id                     |
+| Table                     | What it keeps                                                       | Key                                        |
+| ------------------------- | ------------------------------------------------------------------- | ------------------------------------------ |
+| `chats`                   | One row per chat, with when it started and when it last moved.      | The chat id you pick, like `chat-c-42`     |
+| `chat_items`              | Every chat message, so a helper remembers the chat.                 | A counter, so messages stay in exact order |
+| `paused_runs`             | Approval checkpoints, execution status, owner, and recovery notes.  | A Prisma-generated UUIDv7                  |
+| `remote_machines`         | Which self-hosted machine belongs to which session.                 | OpenAI's session id                        |
+| `hosted_webhooks`         | Verified events, retries, worker leases, and terminal records.      | OpenAI event id                            |
+| `chat_history_operations` | Completed SDK history operations and their content digest.          | Chat id + operation id                     |
+| `execution_locks`         | Which worker is running a chat, a saved run, or a machine change.   | The lock name, like `chat:chat-c-42`       |
+| `expired_environments`    | Environments OpenAI said are gone, so they are never started again. | OpenAI's environment id                    |
 
 How the tables are built:
 
 - **Ids.** Approval ids are native UUID columns generated as UUIDv7. Worker claim tokens use random UUIDs. Ids from outside, like your chat ids and OpenAI's session ids, are kept as they are. Chat messages use a counter instead of a UUID, because the order of a chat must be exact.
 - **Keys.** Each chat message points at its chat. Deleting a chat deletes its messages. One environment can only belong to one session.
 - **Times.** Every table has `created_at`. Tables whose rows change also have `updated_at`. All times are stored with their time zone.
-- **Indexes.** Only where a query needs one: a chat's messages by chat and order, and the machine for an environment. Webhook queue indexes cover due work and terminal-event lookups; history-operation ids deduplicate writes.
+- **Indexes.** Only where a query needs one: a chat's messages by chat and order, and the machine for an environment. Webhook queue indexes cover due work and terminal-event lookups; history-operation ids deduplicate writes. Locks are found by owner, so a worker frees all of its locks in one step.
 
 The app only connects the first time one of these is used. Without `DATABASE_URL`, everything else still works.
 
@@ -240,7 +242,7 @@ The second message works because the helper remembers the cake.
 
 Only one active run may use a database chat at a time, across all app replicas. An overlapping request gets a conflict; queue it in your application or retry after the first run finishes. Streaming holds that lock until `stream.completed`, including history persistence. A saved pending approval blocks new messages until it is resolved.
 
-History reads default to 200 items and 256,000 serialized bytes. When older items are omitted, the retained context starts at a user message so tool results are not detached from their calls. A single oversized turn fails with an explicit limit error. Adjust limits with `createSession(chatId, { maxItems: 400, maxBytes: 512_000 })`, or use the SDK's compaction capabilities. Limits bound model context; they do not delete stored history. Explicit `getItems(limit)` reads preserve the SDK's exact suffix contract for recovery.
+The helper reads at most 200 messages and 256,000 bytes of the chat. When a chat is longer, the oldest whole turns are left out, so a tool result never loses the call it answers. The current turn is always sent whole, even when it alone is bigger than the limits. A customer who shares one huge menu file can keep chatting; on the next message, that old turn is left out. Change the limits with `createSession(chatId, { maxItems: 400, maxBytes: 512_000 })`. Limits only change what the model sees; every message stays stored. For very long chats, the SDK's `OpenAIResponsesCompactionSession` can summarize old turns.
 
 Give each chat its own id, like the customer's chat id, and store it. Pass that id again tomorrow and the chat carries on. With no id, `createSession()` makes a new random one, which you can read with `await chat.getSessionId()`.
 
@@ -683,6 +685,18 @@ const finished = await this.openai.resumeAgent(orderHelper, state);
 ```
 
 `recoverRun` requires a reconciliation note and refuses to reclaim a run while another worker holds its execution lock. It does not prove that an external action is safe to repeat. Completed checkpoints remain available for audit but cannot be executed again.
+
+### Nobody answers
+
+While a question waits, that chat takes no new messages. The OpenAI guide says a pause must be answered, not skipped. If the customer never answers, cancel it. Every waiting tool call is rejected, the helper tells the customer it did not happen, and the chat moves on.
+
+```typescript
+await this.openai.cancelRun(orderHelper, runId, { ownerId, agentVersion });
+// Optional: your own words for the helper.
+await this.openai.cancelRun(orderHelper, runId, {
+  message: 'The customer did not confirm in time.',
+});
+```
 
 ### Streaming
 
@@ -1136,13 +1150,13 @@ All of these need the Docker image above.
 
 ### Choose the computer
 
-| `computer`                                                  | What it is                                                                |
-| ----------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `unix` (development default)                                | Runs on this machine; rejected in production.                             |
-| `docker`                                                    | Production default. Uses `node:24-bookworm-slim` unless you pass `image`. |
-| `modal`, `vercel`, `cloudflare`, `e2b`, `daytona`, `blaxel` | A computer in the cloud. Each reads its own login.                        |
+| `computer`                                                  | What it is                                                         |
+| ----------------------------------------------------------- | ------------------------------------------------------------------ |
+| `unix` (development default)                                | Runs on this machine; rejected in production.                      |
+| `docker`                                                    | A container. Uses `node:24-bookworm-slim` unless you pass `image`. |
+| `modal`, `vercel`, `cloudflare`, `e2b`, `daytona`, `blaxel` | A computer in the cloud. Each reads its own login.                 |
 
-In production, choose an isolated provider explicitly when Docker is unavailable. Docker requires a reachable Docker daemon; installing the application container does not itself supply one. Local executor provisioning is development-only.
+Production has no default: pass `computer` or `client`, or you get a clear error. The app's own container usually cannot reach Docker (Coolify does not give it access), so a cloud computer such as `modal` or `e2b` is the simple choice there. Local executors are for development only.
 
 Cloud logins: Modal uses `modal setup` or `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`. E2B uses `E2B_API_KEY`. Daytona uses `DAYTONA_API_KEY`. Vercel uses `VERCEL_TOKEN`. Blaxel uses its own login. Cloudflare needs `workerUrl` or `CLOUDFLARE_SANDBOX_WORKER_URL`, plus `CLOUDFLARE_SANDBOX_API_KEY` if the worker checks a key.
 
@@ -1257,11 +1271,12 @@ OpenAI can call this app when a session needs a computer. The app then makes one
 | `databricks`   | `DATABRICKS_HOST` (an `https` address) and `DATABRICKS_TOKEN`. The computer is named after the session, so a retry reuses it.                                                             |
 | `oci`          | Run `oci session authenticate --profile-name Sandbox --region <region>`. Then set `OCI_SANDBOX_PROJECT_ID`, `OCI_SANDBOX_TOKEN`, and `OCI_SANDBOX_CREATE_URL` from the current OCI guide. |
 
-The webhook needs `DATABASE_URL`. It verifies the signature and inserts a deduplicated event in `hosted_webhooks` before acknowledging it. Provider work runs in a background worker, which starts when both `DATABASE_URL` and `OPENAI_WEBHOOK_SECRET` are configured. It checks for work every second; each worker claims up to 20 events per pass.
+The webhook needs `DATABASE_URL`. It verifies the signature and inserts a deduplicated event in `hosted_webhooks` before acknowledging it. Provider work runs in a background worker, which starts when both `DATABASE_URL` and `OPENAI_WEBHOOK_SECRET` are configured. It starts as soon as this server stores an event, and checks every 5 seconds for events other servers stored. Each pass claims up to 20 events.
 
 - Duplicate deliveries share one event id. Database leases and per-environment locks coordinate replicas.
 - Retryable worker failures stay queued with bounded exponential backoff. An expired five-minute worker lease can be reclaimed after a crash; an active worker renews it.
-- Environment expiry is retained as a terminal record. Cleanup is coordinated with provisioning, including events arriving while a machine is being created.
+- Environment expiry is kept forever in `expired_environments`, so a late event never starts that environment again. Cleanup is coordinated with provisioning, including events arriving while a machine is being created.
+- Finished events are deleted after 7 days. Until then they drop repeat deliveries from OpenAI.
 - A known machine that is still awaiting connection gets a two-minute startup grace period; a later connection request stays queued during that grace period. Missing local executors and expired grace periods require operator inspection.
 - Unknown provider outcomes enter `reconciliation`. The worker does not blindly create another machine when the first request may have succeeded.
 - Failed cleanup preserves the machine id for retry. Local executor ids include their owning process; another replica cannot silently claim to have stopped them.
@@ -1276,7 +1291,7 @@ await this.sandbox.reconcileRemoteMachine(sessionId, {
 await this.sandbox.reconcileRemoteMachine(sessionId, { absent: true });
 ```
 
-Reconciliation requeues the associated events. Keep terminal inbox records and machine tombstones; removing them without an equivalent durable record would allow a delayed event to resurrect compute. Monitor pending-event age, retries, and `reconciliation` records. The worker logs queue-access failures without logging credentials or webhook bodies.
+Reconciliation requeues the associated events. Keep `expired_environments` and the machine rows marked deleted; removing them would let a delayed event start a machine again. Monitor pending-event age, retries, and `reconciliation` records. The worker logs queue-access failures without logging credentials or webhook bodies.
 
 </details>
 
@@ -1368,7 +1383,7 @@ Chats, approval checkpoints, webhook events, and provider identities are stored 
 
 | Operation               | Guarantee                                                                                                                         |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| Chat turn               | A PostgreSQL session advisory lock excludes other app workers for the same chat until execution and persistence finish.           |
+| Chat turn               | A lock row in `execution_locks` keeps other app workers out of the same chat until execution and persistence finish.              |
 | SDK history transaction | The operation id and history change commit together; repeating the same operation does not append duplicate items.                |
 | Approval resume         | A versioned checkpoint is claimed before execution and updated on completion; ambiguous outcomes require reconciliation.          |
 | Webhook processing      | Durable inbox, retry schedule, expiring leases, and environment locks prevent lost acknowledgements and overlapping provisioning. |
@@ -1376,7 +1391,7 @@ Chats, approval checkpoints, webhook events, and provider identities are stored 
 
 Database transactions are short and never span a model or provider call. External actions cannot be committed atomically with PostgreSQL: use stable idempotency keys or compensating actions in tools, and reconcile unknown results before retrying. A normal run interrupted before reaching a saved checkpoint must be inspected by the application; this is not a general-purpose durable workflow engine.
 
-Use a direct PostgreSQL connection or session-pooling mode for execution locks. Transaction-pooling proxies do not preserve session advisory locks. The lock pool allows ten held connections per app instance; size replicas and database connection capacity together. Connection loss aborts the run signal. Custom tools must honor cancellation and independently enforce idempotency.
+A lock is a row with an expiry time, not a held database connection, so any number of chats can run at once and any connection pooler works. The worker renews its locks every 15 seconds. If a server crashes, its locks free themselves after 60 seconds. If a worker loses a lock, or cannot renew it before it expires, its run signal aborts. Custom tools must honor cancellation and independently enforce idempotency.
 
 **Deployment:** drain old workers before applying the recovery migration and starting this version. Older binaries do not participate in the new execution locks or inbox. The migration preserves data and marks legacy consumed approvals and incomplete machine claims for reconciliation. Back up production data and inspect these records after deployment; do not replay them automatically.
 

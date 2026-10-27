@@ -555,6 +555,84 @@ describe('OpenaiService storage and limits', () => {
     }
   });
 
+  it('keeps a chat working after one very big tool result', async () => {
+    const session = service().createSession('big-file', { maxBytes: 1_000 });
+    const bigResult = {
+      type: 'function_call_result',
+      callId: 'c1',
+      name: 'readMenu',
+      output: { type: 'text', text: 'x'.repeat(5_000) },
+    };
+    await session.addItems([
+      { role: 'user', content: 'Read the menu.' },
+      bigResult,
+    ] as AgentInputItem[]);
+
+    // The current turn is bigger than maxBytes, but it is sent whole instead of failing.
+    expect(await session.getItems()).toHaveLength(2);
+    await session.addItems([
+      { role: 'user', content: 'Any cakes?' },
+    ] as AgentInputItem[]);
+    // The next turn drops the old big turn to fit.
+    expect(await session.getItems()).toEqual([
+      { role: 'user', content: 'Any cakes?' },
+    ]);
+  });
+
+  it('sends a current turn longer than maxItems whole', async () => {
+    const session = service().createSession('long-turn', { maxItems: 3 });
+    const steps = Array.from({ length: 4 }, (_, index) => ({
+      type: 'function_call_result',
+      callId: `c${index}`,
+      name: 'bake',
+      output: { type: 'text', text: 'ok' },
+    }));
+    await session.addItems([
+      { role: 'user', content: 'old' },
+      { role: 'user', content: 'Bake 4 cakes.' },
+      ...steps,
+    ] as AgentInputItem[]);
+
+    expect(await session.getItems()).toEqual([
+      { role: 'user', content: 'Bake 4 cakes.' },
+      ...steps,
+    ]);
+    // An explicit limit is still exact, as the SDK expects.
+    expect(await session.getItems(2)).toEqual(steps.slice(2));
+  });
+
+  it('cancels a saved approval so the chat can move on', async () => {
+    const openai = service();
+    const agent = new Agent({ name: 'Order helper', instructions: 'Orders.' });
+    const state = {
+      getInterruptions: () => [{ name: 'cancelOrder' }],
+      reject: vi.fn(),
+      toString: () => 'paused',
+    };
+    vi.spyOn(RunState, 'fromString').mockResolvedValue(state as never);
+    const run = vi.spyOn(Runner.prototype, 'run').mockResolvedValue({
+      state: { toString: () => 'done' },
+      interruptions: [],
+    } as never);
+    try {
+      const id = await openai.saveRun({ state: state as never });
+      await openai.cancelRun(agent, id);
+
+      expect(state.reject).toHaveBeenCalledWith(
+        { name: 'cancelOrder' },
+        expect.objectContaining({
+          message: 'Not approved. The request was cancelled.',
+        }),
+      );
+      expect(run).toHaveBeenCalledWith(agent, state, expect.anything());
+      await expect(openai.loadRun(agent, id)).rejects.toThrow(
+        'already taken or does not exist',
+      );
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
   it('preserves cancellation and turn limits through reply', async () => {
     const openai = service();
     const agent = new Agent({ name: 'Helper' });

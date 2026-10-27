@@ -17,6 +17,19 @@ function matches(row: Row, where: Where = {}): boolean {
         return (row[key] as Date) < (expected as { lt: Date }).lt;
       if ('lte' in expected)
         return (row[key] as Date) <= (expected as { lte: Date }).lte;
+      if ('gte' in expected)
+        return (row[key] as number) >= (expected as { gte: number }).gte;
+      // A JSON path filter, like { item: { path: ['role'], equals: 'user' } }.
+      if ('path' in expected) {
+        const { path, equals } = expected as {
+          path: string[];
+          equals: unknown;
+        };
+        let value: unknown = row[key];
+        for (const step of path)
+          value = (value as Record<string, unknown> | undefined)?.[step];
+        return value === equals;
+      }
       if ('in' in expected)
         return (expected as { in: unknown[] }).in.includes(row[key]);
     }
@@ -73,6 +86,10 @@ class Table {
     return args.take === undefined ? rows : rows.slice(0, args.take);
   }
 
+  async findFirst(args: { where?: Where; orderBy?: { id: 'asc' | 'desc' } }) {
+    return (await this.findMany({ ...args, take: 1 }))[0] ?? null;
+  }
+
   async findUnique({ where }: { where: Where }) {
     return this.rows.find((row) => matches(row, where)) ?? null;
   }
@@ -127,6 +144,7 @@ type FakeDb = {
   remoteMachine: Table;
   hostedWebhook: Table;
   chatHistoryOperation: Table;
+  expiredEnvironment: Table;
   $queryRaw(sql: TemplateStringsArray, chatId: string): Promise<Row[]>;
   $transaction<T>(
     work: ((tx: FakeDb) => Promise<T>) | Promise<unknown>[],
@@ -168,6 +186,9 @@ export function fakePrisma() {
       updatedAt: new Date(),
     })),
     chatHistoryOperation: new Table([]),
+    expiredEnvironment: new Table(['environmentId'], () => ({
+      expiredAt: new Date(),
+    })),
 
     // Only the chat pop query is used: remove and return the newest item of one chat.
     async $queryRaw(_sql: TemplateStringsArray, chatId: string) {
@@ -188,6 +209,7 @@ export function fakePrisma() {
         db.remoteMachine,
         db.hostedWebhook,
         db.chatHistoryOperation,
+        db.expiredEnvironment,
       ];
       const saved = tables.map((table) =>
         table.rows.map((row) => ({ ...row })),

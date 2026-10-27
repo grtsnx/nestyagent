@@ -591,6 +591,34 @@ describe('self-hosted machines', () => {
     ).toBe(true);
   });
 
+  it('remembers an expiry after its webhook is pruned', async () => {
+    const fetchMock = digitalOcean();
+    const { db, prisma } = fakePrisma();
+    const service = sandboxService(remoteSettings, hostedApi(), prisma);
+    await service.handleHostedWebhook(
+      JSON.stringify({
+        type: 'agent.environment.expired',
+        data: { id: 'env_1' },
+      }),
+      {},
+    );
+    await service.processHostedWebhooks();
+    expect(db.expiredEnvironment.rows).toMatchObject([
+      { environmentId: 'env_1' },
+    ]);
+
+    // Eight days later the finished webhook is deleted, but the expiry is kept.
+    db.hostedWebhook.rows.forEach(
+      (row) => (row.updatedAt = new Date(Date.now() - 8 * 86_400_000)),
+    );
+    await service.processHostedWebhooks();
+    expect(db.hostedWebhook.rows).toEqual([]);
+
+    await service.handleHostedWebhook(connectEvent, {});
+    await service.processHostedWebhooks();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('retains the machine and retries cleanup failures', async () => {
     const { db, prisma } = fakePrisma();
     await db.remoteMachine.create({
@@ -947,7 +975,23 @@ describe('sandbox workspaces', () => {
     });
   });
 
-  it('defaults production workspaces to a pinned Docker image', async () => {
+  it('asks for a computer in production instead of guessing one', async () => {
+    const runAgent = vi.fn();
+    const service = sandboxService(
+      { NODE_ENV: 'production' },
+      {},
+      fakePrisma().prisma,
+      { runAgent },
+    );
+    const agent = service.createSandboxAgent('sandbox', 'Do the work.');
+
+    await expect(service.runSandboxOnce('hello', agent)).rejects.toThrow(
+      'Choose a computer in production',
+    );
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it('uses the pinned Docker image when production picks docker', async () => {
     const runAgent = vi.fn(async (..._args: unknown[]) => ({
       finalOutput: 'done',
     }));
@@ -960,6 +1004,7 @@ describe('sandbox workspaces', () => {
     await service.runSandboxOnce(
       'hello',
       service.createSandboxAgent('sandbox', 'Do the work.'),
+      { computer: 'docker' },
     );
     const options = runAgent.mock.calls[0][2] as {
       sandbox: { client: unknown };
