@@ -32,6 +32,8 @@ import {
 import type { Prisma } from '@/generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 
+const RUN_GONE = 'This paused run was already taken or does not exist.';
+
 // Any agent, whatever its context or output type.
 type AnyAgent = Agent<any, any>;
 
@@ -126,14 +128,23 @@ export class DatabaseSession implements Session {
     return limit === undefined ? items : items.reverse();
   }
 
+  // One transaction: the chat row is made or touched, and every item is added, or none are.
   async addItems(items: AgentInputItem[]) {
     if (items.length === 0) return;
-    await this.prisma.db.chatItem.createMany({
-      data: items.map((item) => ({
-        chatId: this.chatId,
-        item: item as unknown as Prisma.InputJsonValue,
-      })),
-    });
+    const db = this.prisma.db;
+    await db.$transaction([
+      db.chat.upsert({
+        where: { id: this.chatId },
+        create: { id: this.chatId },
+        update: { updatedAt: new Date() },
+      }),
+      db.chatItem.createMany({
+        data: items.map((item) => ({
+          chatId: this.chatId,
+          item: item as unknown as Prisma.InputJsonValue,
+        })),
+      }),
+    ]);
   }
 
   // Removes and returns the newest item. SKIP LOCKED lets two pops at once take different items.
@@ -151,10 +162,9 @@ export class DatabaseSession implements Session {
     return rows[0]?.item;
   }
 
+  // Deleting the chat row deletes its items too.
   async clearSession() {
-    await this.prisma.db.chatItem.deleteMany({
-      where: { chatId: this.chatId },
-    });
+    await this.prisma.db.chat.deleteMany({ where: { id: this.chatId } });
   }
 }
 
@@ -509,13 +519,15 @@ export class OpenaiService implements OnModuleInit {
   //2. A run can be taken once. A second load throws, so a double click cannot run a tool twice.
   //3. If the state does not fit the agent, the transaction rolls back and the run stays waiting.
   async loadRun(agent: AnyAgent, id: string) {
+    // Ids are UUIDs. Anything else cannot exist, and Postgres would reject it with a type error.
+    if (!z.uuid().safeParse(id).success) throw new Error(RUN_GONE);
     return await this.prisma.db.$transaction(async (tx) => {
       const taken = await tx.pausedRun.updateMany({
         where: { id, status: 'waiting' },
         data: { status: 'taken' },
       });
       if (taken.count !== 1) {
-        throw new Error('This paused run was already taken or does not exist.');
+        throw new Error(RUN_GONE);
       }
       const run = await tx.pausedRun.findUniqueOrThrow({
         where: { id },

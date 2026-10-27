@@ -396,7 +396,7 @@ describe('OpenaiService storage and limits', () => {
     ({ role: 'user', content: text }) as AgentInputItem;
 
   it('keeps a chat in the database and reopens it by id', async () => {
-    const { prisma } = fakePrisma();
+    const { db, prisma } = fakePrisma();
     const chat = service(prisma).createSession('chat-c-42');
     await chat.addItems([
       message('I ordered a cake.'),
@@ -414,8 +414,11 @@ describe('OpenaiService storage and limits', () => {
     expect(await reopened.popItem()).toEqual(message('Is it ready?'));
     expect(await reopened.getItems()).toEqual([message('I ordered a cake.')]);
 
+    expect(db.chat.rows).toMatchObject([{ id: 'chat-c-42' }]);
     await reopened.clearSession();
     expect(await reopened.getItems()).toEqual([]);
+    expect(db.chat.rows).toEqual([]);
+    expect(db.chatItem.rows).toEqual([]);
     expect(await service(prisma).createSession('other').getItems()).toEqual([]);
   });
 
@@ -474,6 +477,17 @@ describe('OpenaiService storage and limits', () => {
     await expect(openai.loadRun(agent, id)).rejects.toThrow('Wrong agent.');
     expect(db.pausedRun.rows[0]).toMatchObject({ status: 'waiting' });
     fromString.mockRestore();
+  });
+
+  it('refuses a saved run id that is not a UUID', async () => {
+    const { db, prisma } = fakePrisma();
+    const transaction = vi.spyOn(db, '$transaction');
+    const agent = new Agent({ name: 'Order helper', instructions: 'Orders.' });
+
+    await expect(service(prisma).loadRun(agent, 'order-42')).rejects.toThrow(
+      'This paused run was already taken or does not exist.',
+    );
+    expect(transaction).not.toHaveBeenCalled();
   });
 
   it('passes signal and maxTurns to the run', async () => {

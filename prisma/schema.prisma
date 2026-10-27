@@ -13,13 +13,30 @@ datasource db {
   provider = "postgresql"
 }
 
-// One message or tool step in a chat. Ordered by id.
+// Ids we create are UUIDv7: time ordered, so new rows land at the end of the index.
+// Ids from outside (chat ids you pick, OpenAI session and environment ids) stay text.
+// Every time is stored with its time zone (timestamptz).
+
+// One chat. Deleting it deletes its items.
+model Chat {
+  id        String     @id
+  createdAt DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  items     ChatItem[]
+
+  @@map("chats")
+}
+
+// One message or tool step in a chat.
+// The id is a counter, not a UUID: it keeps items in the exact order they were added.
 model ChatItem {
   id        BigInt   @id @default(autoincrement())
   chatId    String   @map("chat_id")
   item      Json
-  createdAt DateTime @default(now()) @map("created_at")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  chat      Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
 
+  // Reads, limits, and pops all ask for one chat's items by id.
   @@index([chatId, id])
   @@map("chat_items")
 }
@@ -31,11 +48,11 @@ enum PausedRunStatus {
 
 // A run that stopped for a person to approve. It can be taken once.
 model PausedRun {
-  id        String          @id @default(uuid())
+  id        String          @id @default(uuid(7)) @db.Uuid
   state     String
   status    PausedRunStatus @default(waiting)
-  createdAt DateTime        @default(now()) @map("created_at")
-  updatedAt DateTime        @updatedAt @map("updated_at")
+  createdAt DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   @@map("paused_runs")
 }
@@ -45,9 +62,11 @@ model PausedRun {
 model RemoteMachine {
   sessionId     String   @id @map("session_id")
   environmentId String   @unique @map("environment_id")
-  claimToken    String   @map("claim_token")
-  claimedAt     DateTime @default(now()) @map("claimed_at")
+  claimToken    String   @map("claim_token") @db.Uuid
+  claimedAt     DateTime @default(now()) @map("claimed_at") @db.Timestamptz(3)
   machineId     String?  @map("machine_id")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   @@map("remote_machines")
 }

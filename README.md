@@ -42,16 +42,15 @@ A few words you will see a lot:
 
 ```bash
 cp .env.example .env
+docker compose up -d --wait
 bun install --frozen-lockfile
 bun run db:migrate
 bun run start:dev
 ```
 
-`bun install` also builds the database client. `bun run db:migrate` creates the tables. It needs Postgres running at `DATABASE_URL`. For a quick local one:
+`docker compose up -d --wait` starts this project's Postgres (`agentic-postgres`) from `compose.yaml`, at the same address as `DATABASE_URL` in `.env.example`. Its data lives in the `agentic_postgres-data` volume, so it survives a restart. `docker compose down` stops it and keeps the data. `docker compose down --volumes` deletes the data too.
 
-```bash
-docker run -d --name agentic-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=agentic -p 5432:5432 postgres:17-alpine
-```
+`bun install` also builds the database client. `bun run db:migrate` creates the tables. The Prisma commands read `DATABASE_URL` from `.env` themselves. A value already set in your shell wins.
 
 Swagger UI opens at `http://localhost:3000/api`. Scalar opens at `http://localhost:3000/docs`. The raw API documents are at `/api/v1-json` and `/api/v2-json`. The app prints every docs link when it starts.
 
@@ -91,11 +90,19 @@ The AWS, DigitalOcean, Databricks, OCI, and Cloudflare settings are in `.env.exa
 
 The app uses Postgres through Prisma. The database keeps three things, so they survive a restart and every copy of the app sees the same data:
 
-| Table             | What it keeps                                       |
-| ----------------- | --------------------------------------------------- |
-| `chat_items`      | Every chat message, so a helper remembers the chat. |
-| `paused_runs`     | Runs waiting for a person to say yes or no.         |
-| `remote_machines` | Which self-hosted machine belongs to which session. |
+| Table             | What it keeps                                                  | Key                                          |
+| ----------------- | -------------------------------------------------------------- | -------------------------------------------- |
+| `chats`           | One row per chat, with when it started and when it last moved. | The chat id you pick, like `chat-c-42`       |
+| `chat_items`      | Every chat message, so a helper remembers the chat.            | A counter, so messages stay in exact order   |
+| `paused_runs`     | Runs waiting for a person to say yes or no.                    | A UUID the database makes (v7, time ordered) |
+| `remote_machines` | Which self-hosted machine belongs to which session.            | OpenAI's session id                          |
+
+How the tables are built:
+
+- **Ids.** Ids the app makes are native `uuid` columns, version 7. They are sorted by time, so new rows go at the end of the index and stay fast. Ids from outside, like your chat ids and OpenAI's session ids, are kept as they are. Chat messages use a counter instead of a UUID, because the order of a chat must be exact.
+- **Keys.** Each chat message points at its chat. Deleting a chat deletes its messages. One environment can only belong to one session.
+- **Times.** Every table has `created_at`. Tables whose rows change also have `updated_at`. All times are stored with their time zone.
+- **Indexes.** Only where a query needs one: a chat's messages by chat and order, and the machine for an environment. Every other lookup uses the table's key.
 
 The app only connects the first time one of these is used. Without `DATABASE_URL`, everything else still works.
 

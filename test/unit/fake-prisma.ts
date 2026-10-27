@@ -62,6 +62,20 @@ class Table {
     return row;
   }
 
+  async upsert({
+    where,
+    create,
+    update,
+  }: {
+    where: Where;
+    create: Row;
+    update: Row;
+  }) {
+    const row = await this.findUnique({ where });
+    if (!row) return await this.create({ data: create });
+    return Object.assign(row, update);
+  }
+
   async updateMany({ where, data }: { where: Where; data: Row }) {
     const hits = this.rows.filter((row) => matches(row, where));
     for (const row of hits) Object.assign(row, data);
@@ -69,24 +83,33 @@ class Table {
   }
 
   async deleteMany({ where }: { where: Where }) {
-    const before = this.rows.length;
-    this.rows = this.rows.filter((row) => !matches(row, where));
-    return { count: before - this.rows.length };
+    const gone = this.rows.filter((row) => matches(row, where));
+    this.rows = this.rows.filter((row) => !gone.includes(row));
+    this.onDelete(gone);
+    return { count: gone.length };
   }
+
+  // Set by the parent table, like ON DELETE CASCADE.
+  onDelete: (rows: Row[]) => void = () => {};
 }
 
 type FakeDb = {
+  chat: Table;
   chatItem: Table;
   pausedRun: Table;
   remoteMachine: Table;
   $queryRaw(sql: TemplateStringsArray, chatId: string): Promise<Row[]>;
-  $transaction<T>(work: (tx: FakeDb) => Promise<T>): Promise<T>;
+  $transaction<T>(
+    work: ((tx: FakeDb) => Promise<T>) | Promise<unknown>[],
+  ): Promise<T>;
 };
 
 //1. An in-memory stand-in for PrismaService, for unit tests without Postgres.
 //2. $transaction puts every row back when the callback throws, like a rollback.
+//3. Deleting a chat deletes its items, like the foreign key does.
 export function fakePrisma() {
   const db: FakeDb = {
+    chat: new Table(['id']),
     chatItem: new Table([]),
     pausedRun: new Table(['id'], () => ({
       id: crypto.randomUUID(),
@@ -106,8 +129,10 @@ export function fakePrisma() {
       return [{ item: newest.item }];
     },
 
+    // The list form takes calls that already ran, so it only waits for them.
     async $transaction(work) {
-      const tables = [db.chatItem, db.pausedRun, db.remoteMachine];
+      if (Array.isArray(work)) return (await Promise.all(work)) as never;
+      const tables = [db.chat, db.chatItem, db.pausedRun, db.remoteMachine];
       const saved = tables.map((table) =>
         table.rows.map((row) => ({ ...row })),
       );
@@ -118,6 +143,12 @@ export function fakePrisma() {
         throw error;
       }
     },
+  };
+  db.chat.onDelete = (chats) => {
+    const ids = chats.map((chat) => chat.id);
+    db.chatItem.rows = db.chatItem.rows.filter(
+      (row) => !ids.includes(row.chatId),
+    );
   };
   return { db, prisma: { db } as unknown as PrismaService };
 }
