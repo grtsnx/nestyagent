@@ -195,6 +195,8 @@ export function configureSwagger(
       hideDarkModeToggle: true,
       pageTitle: `${environment.PLATFORM_NAME} API Reference`,
       showDeveloperTools: 'never',
+      // Hide the Models list, like Swagger's hidden Schemas. Each route shows its own example.
+      hideModels: true,
       sources: apiVersions.map((version, index) => ({
         default: index === 0,
         slug: `v${version}`,
