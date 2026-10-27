@@ -26,18 +26,23 @@ Swagger UI runs at `http://localhost:3000/api`, and Scalar runs at `http://local
 
 The application validates configuration before it starts. Invalid ports, booleans, and CORS origins stop startup.
 
-| Variable                  | Default               | Purpose                                                                                |
-| ------------------------- | --------------------- | -------------------------------------------------------------------------------------- |
-| `NODE_ENV`                | `development`         | Selects development, test, or production behavior.                                     |
-| `PORT`                    | `3000`                | Sets the HTTP port.                                                                    |
-| `PLATFORM_NAME`           | `Agentic`             | Names the API and OpenAPI document.                                                    |
-| `CORS_ORIGINS`            | empty                 | Lists exact, comma-separated browser origins. Empty disables CORS.                     |
-| `SWAGGER_ENABLED`         | on outside production | Enables Swagger, Scalar, and OpenAPI JSON. Set it explicitly in production.            |
-| `OBSERVE_ENABLED`         | `false`               | Enables NestJS Observe when valid credentials are present.                             |
-| `OPENAI_API_KEY`          | required              | Authenticates every OpenAI agent and the hosted session API. The app stops without it. |
-| `OPENAI_HOSTED_MODEL`     | `gpt-6-astra`         | Model for `createHostedSession` when the call does not pass one.                       |
-| `ACCOUNT_PASSWORD`        | empty                 | Login secret for every workspace. Blank starts a workspace without one.                |
-| `OPENAI_EXECUTOR_API_KEY` | empty                 | Codex environment key from the platform Agents tab. Blank leaves the executor unset.   |
+| Variable                                                      | Default               | Purpose                                                                                        |
+| ------------------------------------------------------------- | --------------------- | ---------------------------------------------------------------------------------------------- |
+| `NODE_ENV`                                                    | `development`         | Selects development, test, or production behavior.                                             |
+| `PORT`                                                        | `3000`                | Sets the HTTP port.                                                                            |
+| `PLATFORM_NAME`                                               | `Agentic`             | Names the API and OpenAPI document.                                                            |
+| `CORS_ORIGINS`                                                | empty                 | Lists exact, comma-separated browser origins. Empty disables CORS.                             |
+| `SWAGGER_ENABLED`                                             | on outside production | Enables Swagger, Scalar, and OpenAPI JSON. Set it explicitly in production.                    |
+| `OBSERVE_ENABLED`                                             | `false`               | Enables NestJS Observe when valid credentials are present.                                     |
+| `OPENAI_API_KEY`                                              | required              | Authenticates every OpenAI agent and the hosted session API. The app stops without it.         |
+| `OPENAI_HOSTED_MODEL`                                         | `gpt-6-astra`         | Model for `createHostedSession` when the call does not pass one.                               |
+| `ACCOUNT_PASSWORD`                                            | empty                 | Login secret for every workspace. Blank starts a workspace without one.                        |
+| `OPENAI_EXECUTOR_API_KEY`                                     | empty                 | Codex environment key from the platform Agents tab. Blank leaves the executor unset.           |
+| `OPENAI_WEBHOOK_SECRET`                                       | empty                 | Signing secret for `POST /v1/webhook`. Blank rejects every webhook.                            |
+| `REMOTE_MACHINE_PROVIDER`                                     | `local`               | Where the webhook starts the executor: `local`, `aws`, `digitalocean`, `databricks`, or `oci`. |
+| `OBSERVE_APP_KEY`, `OBSERVE_APP_SECRET`, `OBSERVE_SERVICE_ID` | empty                 | NestJS Observe credentials. Required when `OBSERVE_ENABLED` is on.                             |
+
+The AWS, DigitalOcean, Databricks, OCI, and Cloudflare settings are listed in `.env.example`. The Self-hosted and Choose the computer sections explain when each one is needed.
 
 > [!CAUTION]
 > Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS origins without paths.
@@ -47,7 +52,7 @@ The application validates configuration before it starts. Invalid ports, boolean
 <details>
 <summary><h2>🤖 OpenAI agents</h2></summary>
 
-`OpenaiService` is global. Inject it where you create or run an agent. `OPENAI_API_KEY` is registered once at startup and is shared by every agent.
+`OpenaiService` is global. Inject it where you create or run an agent. `OPENAI_API_KEY` is registered once at startup and is shared by every agent and by the hosted session client.
 
 `instructions` is the agent's job description. `prompt` is the question for one run. `context` is optional data your code can read, such as a user id or a database client. The model reads the instructions and the prompt. Context stays in your code.
 
@@ -106,7 +111,7 @@ const historyTutor = this.openai.createAgent(
 
 ### Shared runner model
 
-Call `createRunner` only when agents should share a fallback model. An agent that sets `model` keeps its own model. An agent that leaves `model` out uses the runner model. Skip `createRunner` when every agent sets its own model.
+Call `createRunner` only when agents should share a fallback model. An agent that sets `model` keeps its own model. An agent that leaves `model` out uses the runner model. Skip `createRunner` when every agent sets its own model. Call it once at startup, because it changes the fallback for every later run in this app.
 
 ```typescript
 this.openai.createRunner('gpt-6-astra');
@@ -844,12 +849,14 @@ const workspace = await this.sandbox.openSandbox(
 );
 ```
 
-Cloud and Drive mounts attach only when the computer is Docker. `node:latest` does not include `git`, `rclone`, or FUSE, so build an image that does and pass it as `image`. Git hosts use `git`. Drive, S3, GCS, R2, Azure, and Box use `rclone`.
+Cloud and Drive mounts attach only when the computer is Docker. `node:latest` does not include `rclone` or FUSE, so build an image that does and pass it as `image`. Drive, S3, GCS, R2, Azure, and Box use `rclone`.
+
+Git hosts are not mounts. The SDK clones the repo on this machine and copies it into the workspace, so a `github`, `gitlab`, or `bitbucket` entry works on any computer. It needs `git` on this machine, not in the image.
 
 ```dockerfile
 FROM node:latest
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git rclone fuse3 ca-certificates \
+  && apt-get install -y --no-install-recommends rclone fuse3 ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 ```
 
@@ -879,7 +886,7 @@ const workspace = await this.sandbox.openSandbox(
 );
 ```
 
-3. Open the workspace with the image above. The folder name is the repo name unless you set `path` on `repo`.
+4. Open the workspace on any computer. The folder name is the repo name unless you set `path` on `repo`.
 
 ### GitLab
 
@@ -899,7 +906,7 @@ const workspace = await this.sandbox.openSandbox(
 
 1. GitBucket uses the same `/tree/<branch>` shape as GitHub. Pass that URL with `provider: 'github'`.
 2. The host in the URL is your GitBucket server, for example `https://gitbucket.example.com/owner/starter/tree/main`.
-3. Add that host to the machine's SSH known hosts or git credentials before the clone.
+3. Add that host to this machine's SSH known hosts or git credentials before the clone.
 
 ### Google Drive
 
@@ -967,7 +974,7 @@ mounts: {
 
 Unix is the default. Docker uses `node:latest`, so a new Node release arrives with the image and this file stays as it is. Pass `image` when a workspace needs a fixed tag.
 
-Modal, Vercel, Cloudflare, E2B, Daytona, and Blaxel are installed with this app. Pass `computer` and the same agent. Cloudflare also needs `workerUrl` or `CLOUDFLARE_SANDBOX_WORKER_URL`. Each provider still reads its own credential: Modal uses `modal setup` or `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`, E2B uses `E2B_API_KEY`, Daytona uses `DAYTONA_API_KEY`, Vercel uses `VERCEL_TOKEN`, and Blaxel uses its own workspace login.
+Modal, Vercel, Cloudflare, E2B, Daytona, and Blaxel are installed with this app. Pass `computer` and the same agent. Cloudflare also needs `workerUrl` or `CLOUDFLARE_SANDBOX_WORKER_URL`, plus `CLOUDFLARE_SANDBOX_API_KEY` when the worker checks a key. Each provider still reads its own credential: Modal uses `modal setup` or `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`, E2B uses `E2B_API_KEY`, Daytona uses `DAYTONA_API_KEY`, Vercel uses `VERCEL_TOKEN`, and Blaxel uses its own workspace login.
 
 ```typescript
 const workspace = await this.sandbox.openSandbox(createManifest(), {
@@ -1125,7 +1132,7 @@ The workflow delivers a portable image. Each hosting platform can deploy that im
 <summary><h2>🛡️ Reliability and state</h2></summary>
 
 > [!IMPORTANT]
-> The HTTP API owns no durable state. A sandbox workspace lasts only while it stays open, until you save and resume it, or until a new workspace starts from its snapshot.
+> The HTTP API owns no durable state. A sandbox workspace lasts only while it stays open, until you save and resume it, or until a new workspace starts from its snapshot. The webhook keeps each self-hosted machine id in the OpenAI session's metadata, not in this app.
 
 Add workflow and idempotency modules only with a shared production store and tested transaction boundaries. Until then, replicas can start, stop, and roll back without losing application-owned state because the application owns none.
 
