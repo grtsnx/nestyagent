@@ -556,6 +556,86 @@ describe('runtime reliability with the real SDK', () => {
     });
   });
 
+  it('removes the reasoning behind an unanswered call, like the SDK history does', async () => {
+    const { db, openai } = fixture();
+    const reasoning = (id: string) => ({
+      type: 'reasoning' as const,
+      id,
+      content: [{ type: 'input_text' as const, text: `Thinking ${id}.` }],
+    });
+    let calls = 0;
+    const respond = vi.fn<Model['getResponse']>(async () =>
+      ++calls === 1
+        ? {
+            usage: new Usage(),
+            output: [
+              reasoning('rs_done'),
+              {
+                type: 'function_call',
+                callId: 'done',
+                name: 'read_order',
+                arguments: '{}',
+              },
+            ],
+          }
+        : {
+            usage: new Usage(),
+            output: [
+              reasoning('rs_order_a'),
+              reasoning('rs_order_b'),
+              ...call().output,
+            ],
+          },
+    );
+    const ran = vi.fn(async () => 'completed action');
+    const confirm = vi.fn(async () => 'confirmed');
+    const agent = new Agent({
+      name: 'Orders',
+      model: model(respond),
+      tools: [
+        approval(confirm),
+        tool({
+          name: 'read_order',
+          description: 'Read order.',
+          parameters: z.object({}),
+          execute: ran,
+        }),
+      ],
+    });
+    const session = openai.createSession('cancel-reasoning');
+    const paused = await openai.runAgent('Confirm.', agent, { session });
+    expect(paused.interruptions).toHaveLength(1);
+    const restore = vi.spyOn(RunState, 'fromString');
+    await openai.cancelRun(agent, await openai.saveRun(paused));
+    expect(restore).not.toHaveBeenCalled();
+    const history = await session.getItems();
+    // The completed call keeps its reasoning and its result.
+    expect(history).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'reasoning', id: 'rs_done' }),
+        expect.objectContaining({ type: 'function_call', callId: 'done' }),
+        expect.objectContaining({
+          type: 'function_call_result',
+          callId: 'done',
+        }),
+      ]),
+    );
+    // The unanswered approval call and both reasoning items before it are gone.
+    for (const gone of [
+      expect.objectContaining({ id: 'rs_order_a' }),
+      expect.objectContaining({ id: 'rs_order_b' }),
+      expect.objectContaining({ callId: 'order' }),
+    ])
+      expect(history).not.toEqual(expect.arrayContaining([gone]));
+    expect(ran).toHaveBeenCalledTimes(1);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(respond).toHaveBeenCalledTimes(2);
+    expect(db.pausedRun.rows[0]).toMatchObject({
+      status: 'completed',
+      recoveryNote: 'cancelled',
+    });
+  });
+
   it('preserves completed actions when cancelling an unrelated pending approval', async () => {
     const { db, openai } = fixture();
     let calls = 0;

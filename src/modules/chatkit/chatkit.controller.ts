@@ -135,6 +135,7 @@ export class ChatKitController {
     const threadId =
       createdThreadId ??
       ('thread_id' in parsed.params ? parsed.params.thread_id : undefined);
+    let json: string | undefined;
     const run = async (lock?: AbortSignal) => {
       const signal = lock
         ? AbortSignal.any([disconnected.signal, lock])
@@ -148,16 +149,29 @@ export class ChatKitController {
         .processRequest(parsed, context, signal)
         .catch(rethrow);
       if (!result.streaming) {
-        response.status(200).type('application/json').send(result.json);
+        json = result.json;
         return;
       }
       await this.stream(result.stream, response, (error) =>
         disconnected.abort(error),
       );
     };
-    // One reply at a time per thread, across every server, so two messages never interleave.
-    if (threadId) await this.prisma.withLock(`chatkit:${threadId}`, run);
-    else await run();
+    //1. One reply at a time per thread, across every server, so two messages never interleave.
+    //2. The response finishes only after the lock is released, so the client's next request
+    //   never finds this one still holding it.
+    try {
+      if (threadId) await this.prisma.withLock(`chatkit:${threadId}`, run);
+      else await run();
+    } finally {
+      if (
+        response.headersSent &&
+        !response.writableEnded &&
+        !response.destroyed
+      )
+        response.end();
+    }
+    if (json !== undefined)
+      response.status(200).type('application/json').send(json);
   }
 
   @ApiOperation({
@@ -462,8 +476,8 @@ export class ChatKitController {
         // The cancelled run may reject after its own cleanup has completed.
       }
     } finally {
+      // process() ends the response once the thread lock is released.
       await events.return(undefined);
-      if (!response.writableEnded && !response.destroyed) response.end();
     }
   }
 

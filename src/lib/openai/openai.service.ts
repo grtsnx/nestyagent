@@ -1666,10 +1666,12 @@ type SavedState = {
   currentStep?: { data?: { interruptions?: Array<{ rawItem?: SavedItem }> } };
 };
 
-//1. History items a cancelled run added that must go: calls left without a result, and the
-//   calls waiting for approval. Counted by key, so exactly those rows are removed.
-//2. Read from the saved JSON only. Restoring RunState would rebuild the agent and can run
-//   its callbacks, or fail when a tool was removed since the run paused.
+//1. History items a cancelled run added that must go: calls left without a result, the
+//   reasoning that led straight to them, and the calls waiting for approval. Counted by key,
+//   so exactly those rows are removed. Completed calls, their results, and messages stay.
+//2. Mirrors the SDK's continuation history, read from the saved JSON only. Restoring
+//   RunState would rebuild the agent and can run its callbacks, or fail when a tool was
+//   removed since the run paused.
 function discardedHistory(saved: string) {
   const state = JSON.parse(saved) as SavedState;
   const generated = (state.generatedItems ?? [])
@@ -1683,18 +1685,29 @@ function discardedHistory(saved: string) {
       )
       .map((item) => `${String(item.type)}:${String(item.callId)}`),
   );
-  const discarded = new Map<string, number>();
-  for (const item of generated) {
+  const dropped = new Set<number>();
+  generated.forEach((item, index) => {
     const resultType = CALL_RESULT_TYPES[item.type as string];
-    if (!resultType || typeof item.callId !== 'string') continue;
+    if (!resultType || typeof item.callId !== 'string') return;
     // The SDK keeps a hosted shell call that is still running.
     if (
       item.type === 'shell_call' &&
       (item.status ?? 'in_progress') === 'in_progress'
     )
-      continue;
-    if (answered.has(`${resultType}:${item.callId}`)) continue;
-    const key = historyItemKey(item);
+      return;
+    if (!answered.has(`${resultType}:${item.callId}`)) dropped.add(index);
+  });
+  // Reasoning goes with the call it led to: the next item that is not reasoning was dropped.
+  for (let index = generated.length - 1; index >= 0; index--) {
+    if (generated[index].type !== 'reasoning') continue;
+    let next = index + 1;
+    while (next < generated.length && generated[next].type === 'reasoning')
+      next++;
+    if (dropped.has(next)) dropped.add(index);
+  }
+  const discarded = new Map<string, number>();
+  for (const index of dropped) {
+    const key = historyItemKey(generated[index]);
     discarded.set(key, (discarded.get(key) ?? 0) + 1);
   }
   // Hosted approvals may be retained by the SDK's ordinary continuation history.

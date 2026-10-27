@@ -1490,18 +1490,42 @@ export abstract class ChatKitService<TContext> {
     context: TContext,
     signal?: AbortSignal,
   ): AsyncGenerator<string> {
+    let started = false;
     try {
-      for await (const event of this.processStreaming(request, context, signal))
+      for await (const event of this.processStreaming(
+        request,
+        context,
+        signal,
+      )) {
+        started = true;
         yield `data: ${serialize(event)}\n\n`;
+      }
     } catch (error) {
-      // A refusal before the reply starts, such as a paused chat, is shown to the user too.
-      if (!(error instanceof CustomStreamError)) throw error;
-      const event: ThreadStreamEvent = {
-        type: 'error',
-        code: 'custom',
-        message: error.message,
-        allow_retry: error.allowRetry,
-      };
+      //1. A refusal, such as a paused chat, is shown to the user as written.
+      //2. Any other failure before the first event stays an HTTP error, such as 404.
+      //3. After the first event the response is already 200, so the failure becomes an
+      //   error event. What was sent before it is committed; the failed step is not, so
+      //   the user can retry it.
+      let event: ThreadStreamEvent;
+      if (error instanceof CustomStreamError)
+        event = {
+          type: 'error',
+          code: 'custom',
+          message: error.message,
+          allow_retry: error.allowRetry,
+        };
+      else if (!started) throw error;
+      else {
+        this.logger.error({
+          message: 'A ChatKit request failed after its stream started.',
+          error: error instanceof Error ? error.name : 'Error',
+        });
+        event = {
+          type: 'error',
+          code: ErrorCode.STREAM_ERROR,
+          allow_retry: true,
+        };
+      }
       yield `data: ${serialize(event)}\n\n`;
     }
   }

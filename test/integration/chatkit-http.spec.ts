@@ -1,10 +1,18 @@
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { OpenAIProvider, setTracingDisabled } from '@openai/agents';
+import {
+  Agent,
+  OpenAIProvider,
+  setTracingDisabled,
+  tool,
+} from '@openai/agents';
 import request from 'supertest';
 import { vi } from 'vitest';
+import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
+import { ChatKitStore } from '@/config/chatkit/index.js';
 import { PrismaService } from '@/lib/prisma/prisma.service.js';
+import { MsSuzieChatKitService } from '@/modules/chatkit/chatkit.service.js';
 import { scriptedModel } from '../unit/chatkit-model.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -83,6 +91,117 @@ describe('ChatKit over HTTP', () => {
         return JSON.parse(line.slice(6)) as Record<string, any>;
       });
   }
+
+  it('reports a failed message save after the decline was sent, and keeps the decline', async () => {
+    const userId = `guardian-${Date.now()}-decline`;
+    const effect = vi.fn(async () => 'Cancelled.');
+    vi.spyOn(app.get(MsSuzieChatKitService), 'agent').mockReturnValue(
+      new Agent({
+        name: 'MsSuzie',
+        tools: [
+          tool({
+            name: 'cancel_session',
+            description: 'Cancel a session.',
+            parameters: z.object({}),
+            needsApproval: true,
+            execute: effect,
+          }),
+        ],
+      }),
+    );
+    vi.spyOn(OpenAIProvider.prototype, 'getModel').mockResolvedValue(
+      scriptedModel([
+        { call: { name: 'cancel_session' } },
+        { text: 'Sure, what else?' },
+      ]),
+    );
+    const token = await tokenFor(userId);
+    const message = (text: string) => ({
+      content: [{ type: 'input_text', text }],
+      attachments: [],
+      inference_options: {},
+    });
+    const created = events(
+      (
+        await http()
+          .post('/v1/chatkit')
+          .set('Authorization', token)
+          .send({
+            type: 'threads.create',
+            params: { input: message('Cancel my session.') },
+          })
+          .expect(200)
+      ).text,
+    );
+    const threadId = created[0].thread.id as string;
+    const card = created.find(
+      (event) =>
+        event.type === 'thread.item.done' && event.item.type === 'widget',
+    )!.item;
+
+    // Saving the new message fails after the decline was already committed and sent.
+    const store = app.get(ChatKitStore);
+    const add = store.addThreadItem.bind(store);
+    const write = vi
+      .spyOn(store, 'addThreadItem')
+      .mockImplementation(async (id, item, context) => {
+        if (item.type === 'user_message')
+          throw new Error('Message write failed.');
+        return add(id, item, context);
+      });
+    const add_message = {
+      type: 'threads.add_user_message',
+      params: { thread_id: threadId, input: message('Never mind.') },
+    };
+    const failed = await http()
+      .post('/v1/chatkit')
+      .set('Authorization', token)
+      .send(add_message)
+      .expect(200);
+    expect(failed.headers['content-type']).toContain('text/event-stream');
+    const sent = events(failed.text);
+    expect(sent.map((event) => event.type)).toEqual([
+      'thread.item.replaced',
+      'error',
+    ]);
+    expect(JSON.stringify(sent[0].item)).toContain('Declined.');
+    expect(sent[1]).toEqual({
+      type: 'error',
+      code: 'stream.error',
+      allow_retry: true,
+    });
+
+    // The decline is stored as sent; the message is not.
+    const context = { userId, baseUrl: 'https://example.invalid' };
+    const stored = await store.loadItem(threadId, card.id, context);
+    expect(stored).toEqual(sent[0].item);
+    expect(
+      await app.get(PrismaService).db.pausedRun.findFirstOrThrow({
+        where: { chatkitThreadId: threadId },
+      }),
+    ).toMatchObject({ status: 'completed', recoveryNote: 'cancelled' });
+    const users = async () =>
+      (
+        await store.loadThreadItems(threadId, null, 50, 'asc', context)
+      ).data.filter((item) => item.type === 'user_message');
+    expect(await users()).toHaveLength(1);
+
+    // Retrying the message works and is answered.
+    write.mockRestore();
+    const retried = events(
+      (
+        await http()
+          .post('/v1/chatkit')
+          .set('Authorization', token)
+          .send(add_message)
+          .expect(200)
+      ).text,
+    );
+    expect(retried.some((event) => event.type === 'error')).toBe(false);
+    expect(await users()).toHaveLength(2);
+    expect(effect).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+  });
 
   it('issues tokens only with the admin key, and needs one for chat', async () => {
     await http()
