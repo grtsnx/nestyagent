@@ -6,6 +6,7 @@ import {
   UnixLocalSandboxClient,
 } from '@openai/agents/sandbox/local';
 import type { Session } from '@openai/agents';
+import { APIError } from 'openai';
 import type { OpenaiService } from '@/lib/openai/openai.service.js';
 import { fakePrisma } from './fake-prisma.js';
 import {
@@ -82,6 +83,10 @@ const remoteSettings = {
 const connectEvent = JSON.stringify({
   type: 'agent.session.action_required',
   data: { id: 'sess_1', required_action: { type: 'environment_connection' } },
+});
+const failedEvent = JSON.stringify({
+  type: 'agent.session.failed',
+  data: { id: 'sess_1' },
 });
 
 describe('remote machine commands', () => {
@@ -160,6 +165,223 @@ describe('self-hosted machines', () => {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
   });
+
+  it('ignores a delayed failure event after the session has recovered', async () => {
+    const fetchMock = digitalOcean();
+    const { db, prisma } = fakePrisma();
+    await db.remoteMachine.create({
+      data: {
+        sessionId: 'sess_1',
+        environmentId: 'env_1',
+        claimToken: 'ready',
+        machineId: 'digitalocean:do_1',
+        status: 'ready',
+      },
+    });
+    const service = sandboxService(remoteSettings, hostedApi('idle'), prisma);
+    await service.handleHostedWebhook(failedEvent, {});
+    await service.processHostedWebhooks();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(db.remoteMachine.rows[0]).toMatchObject({
+      status: 'ready',
+      desiredState: 'active',
+      machineId: 'digitalocean:do_1',
+    });
+    expect(db.hostedWebhook.rows[0]).toMatchObject({ status: 'completed' });
+  });
+
+  it('abandons failed-session cleanup retries when the session recovers', async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 503 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { db, prisma } = fakePrisma();
+    await db.remoteMachine.create({
+      data: {
+        sessionId: 'sess_1',
+        environmentId: 'env_1',
+        claimToken: 'ready',
+        machineId: 'digitalocean:do_1',
+        status: 'ready',
+      },
+    });
+    let currentStatus = 'failed';
+    const api = hostedApi();
+    const retrieve = api.beta.agents.sessions.retrieve;
+    api.beta.agents.sessions.retrieve = async () => ({
+      ...(await retrieve()),
+      status: currentStatus,
+    });
+    const service = sandboxService(remoteSettings, api, prisma);
+    await service.handleHostedWebhook(failedEvent, {});
+    await service.processHostedWebhooks();
+    currentStatus = 'idle';
+    db.hostedWebhook.rows[0].availableAt = new Date(0);
+    await service.processHostedWebhooks();
+    await service.handleHostedWebhook(connectEvent, {});
+    await service.processHostedWebhooks();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(db.remoteMachine.rows[0]).toMatchObject({
+      status: 'ready',
+      desiredState: 'active',
+      machineId: 'digitalocean:do_1',
+    });
+  });
+
+  it.each([
+    ['digitalocean:do_1', new Date(), 'pending'],
+    ['digitalocean:do_1', new Date(0), 'reconciliation'],
+    ['local:missing-owner:123', new Date(), 'reconciliation'],
+  ] as const)(
+    'keeps unresolved reconnect work for %s created at %s as %s',
+    async (machineId, claimedAt, status) => {
+      const fetchMock = digitalOcean();
+      const { db, prisma } = fakePrisma();
+      await db.remoteMachine.create({
+        data: {
+          sessionId: 'sess_1',
+          environmentId: 'env_1',
+          claimToken: 'ready',
+          machineId,
+          claimedAt,
+          status: 'ready',
+        },
+      });
+      const service = sandboxService(remoteSettings, hostedApi('idle'), prisma);
+      await service.handleHostedWebhook(connectEvent, {});
+      await service.processHostedWebhooks();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(db.hostedWebhook.rows[0]).toMatchObject({ status });
+      expect(db.remoteMachine.rows[0]).toMatchObject({
+        machineId,
+        desiredState: 'active',
+        status: status === 'pending' ? 'ready' : 'reconciliation',
+      });
+    },
+  );
+
+  it('requires reconciliation when an exited local executor is asked to reconnect', async () => {
+    const fetchMock = digitalOcean();
+    const { db, prisma } = fakePrisma();
+    await db.remoteMachine.create({
+      data: {
+        sessionId: 'sess_1',
+        environmentId: 'env_1',
+        claimToken: 'exited',
+        provider: 'local',
+        status: 'deleted',
+        desiredState: 'deleted',
+        machineId: null,
+      },
+    });
+    const service = sandboxService(remoteSettings, hostedApi('idle'), prisma);
+    await service.handleHostedWebhook(connectEvent, {});
+    await service.processHostedWebhooks();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(db.hostedWebhook.rows[0]).toMatchObject({
+      status: 'reconciliation',
+    });
+    expect(db.remoteMachine.rows[0]).toMatchObject({
+      desiredState: 'active',
+      status: 'reconciliation',
+      lastError: 'executor_connection_missing',
+    });
+  });
+
+  it('completes reconnect work once the session no longer needs a connection', async () => {
+    const fetchMock = digitalOcean();
+    const { db, prisma } = fakePrisma();
+    await db.remoteMachine.create({
+      data: {
+        sessionId: 'sess_1',
+        environmentId: 'env_1',
+        claimToken: 'ready',
+        machineId: 'digitalocean:do_1',
+        claimedAt: new Date(0),
+        status: 'ready',
+      },
+    });
+    const api = hostedApi();
+    const retrieve = api.beta.agents.sessions.retrieve;
+    api.beta.agents.sessions.retrieve = async () => ({
+      ...(await retrieve()),
+      required_actions: [],
+    });
+    const service = sandboxService(remoteSettings, api, prisma);
+    await service.handleHostedWebhook(connectEvent, {});
+    await service.processHostedWebhooks();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(db.hostedWebhook.rows[0]).toMatchObject({ status: 'completed' });
+    expect(db.remoteMachine.rows[0]).toMatchObject({ status: 'ready' });
+  });
+
+  it('does not treat historical session failures as permanent expiry tombstones', async () => {
+    const fetchMock = digitalOcean();
+    const { db, prisma } = fakePrisma();
+    const service = sandboxService(remoteSettings, hostedApi('idle'), prisma);
+    await service.handleHostedWebhook(failedEvent, {});
+    await service.processHostedWebhooks();
+    await service.handleHostedWebhook(connectEvent, {});
+    await service.processHostedWebhooks();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(db.remoteMachine.rows[0]).toMatchObject({ status: 'ready' });
+  });
+
+  it('cleans up a failed session that no longer exists', async () => {
+    const fetchMock = digitalOcean();
+    const { db, prisma } = fakePrisma();
+    await db.remoteMachine.create({
+      data: {
+        sessionId: 'sess_1',
+        environmentId: 'env_1',
+        claimToken: 'ready',
+        machineId: 'digitalocean:do_1',
+        status: 'ready',
+      },
+    });
+    const api = hostedApi();
+    api.beta.agents.sessions.retrieve = vi
+      .fn()
+      .mockRejectedValue(
+        new APIError(404, {}, 'Session missing', new Headers()),
+      );
+    const service = sandboxService(remoteSettings, api, prisma);
+    await service.handleHostedWebhook(failedEvent, {});
+    await service.processHostedWebhooks();
+    expect(fetchMock.mock.calls[0][1]?.method).toBe('DELETE');
+    expect(db.remoteMachine.rows[0]).toMatchObject({ status: 'deleted' });
+  });
+
+  it.each(['idle', 'failed'])(
+    'checks live failure status after provisioning when the session is %s',
+    async (status) => {
+      const { db, prisma } = fakePrisma();
+      const api = hostedApi();
+      let currentStatus = 'idle';
+      const retrieve = api.beta.agents.sessions.retrieve;
+      api.beta.agents.sessions.retrieve = async () => ({
+        ...(await retrieve()),
+        status: currentStatus,
+      });
+      const service = sandboxService(remoteSettings, api, prisma);
+      const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+        if (init?.method === 'POST') {
+          currentStatus = status;
+          await service.handleHostedWebhook(failedEvent, {});
+          return new Response(JSON.stringify({ id: 'do_1' }));
+        }
+        return new Response(null);
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      await service.handleHostedWebhook(connectEvent, {});
+      await service.processHostedWebhooks();
+      await service.processHostedWebhooks();
+      expect(fetchMock.mock.calls.map((call) => call[1]?.method)).toEqual(
+        status === 'failed' ? ['POST', 'DELETE'] : ['POST'],
+      );
+      expect(db.remoteMachine.rows[0]).toMatchObject({
+        status: status === 'failed' ? 'deleted' : 'ready',
+      });
+    },
+  );
 
   it('acknowledges a verified webhook before making provider requests', async () => {
     const fetchMock = digitalOcean();
@@ -519,6 +741,33 @@ describe('self-hosted machines', () => {
     });
   });
 
+  it('does not start a second executor when Databricks reports an existing sandbox', async () => {
+    const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) =>
+      init?.body?.toString().includes('execution_timeout')
+        ? new Response(JSON.stringify({}))
+        : new Response(null, { status: 409 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const { db, prisma } = fakePrisma();
+    const service = sandboxService(
+      {
+        ...remoteSettings,
+        REMOTE_MACHINE_PROVIDER: 'databricks',
+        DATABRICKS_HOST: 'https://workspace.example.com',
+        DATABRICKS_TOKEN: 'token',
+      },
+      hostedApi(),
+      prisma,
+    );
+    await service.handleHostedWebhook(connectEvent, {});
+    await service.processHostedWebhooks();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(db.remoteMachine.rows[0]).toMatchObject({
+      status: 'reconciliation',
+      machineId: 'databricks:sandboxes/openai-sess1',
+    });
+  });
+
   it('cancels provider work during shutdown and retains its uncertain outcome', async () => {
     let started!: () => void;
     const creating = new Promise<void>((resolve) => {
@@ -557,17 +806,25 @@ describe('self-hosted machines', () => {
 
   it('keeps a late provider success in reconciliation after losing its execution lock', async () => {
     const lock = new AbortController();
-    vi.stubGlobal('fetch', vi.fn(async () => {
-      lock.abort(new Error('database lock lost'));
-      return new Response(JSON.stringify({ id: 'do_1' }));
-    }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        lock.abort(new Error('database lock lost'));
+        return new Response(JSON.stringify({ id: 'do_1' }));
+      }),
+    );
     const { db, prisma } = fakePrisma();
     prisma.withLock = async (_key, work) => await work(lock.signal);
     const service = sandboxService(remoteSettings, hostedApi(), prisma);
     await service.handleHostedWebhook(connectEvent, {});
     await service.processHostedWebhooks();
-    expect(db.remoteMachine.rows[0]).toMatchObject({ machineId: 'digitalocean:do_1', status: 'reconciliation' });
-    expect(db.hostedWebhook.rows[0]).toMatchObject({ status: 'reconciliation' });
+    expect(db.remoteMachine.rows[0]).toMatchObject({
+      machineId: 'digitalocean:do_1',
+      status: 'reconciliation',
+    });
+    expect(db.hostedWebhook.rows[0]).toMatchObject({
+      status: 'reconciliation',
+    });
   });
 
   it('rejects a local executor in production before spawning', () => {

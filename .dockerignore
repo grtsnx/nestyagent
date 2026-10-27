@@ -9,6 +9,7 @@ coverage
 dist
 node_modules
 .msagents-git-*
+.msagents
 test
 *.log
 *.tsbuildinfo

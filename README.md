@@ -17,22 +17,22 @@ Every example in this guide is about one shop: **Sunny Bakery**.
 
 A few words you will see a lot:
 
-| Word         | Meaning                                                                         |
-| ------------ | ------------------------------------------------------------------------------- |
-| Agent        | A helper with one job.                                                          |
-| Instructions | The helper's job description. You write it once.                                |
-| Prompt       | The customer's message for one run.                                             |
-| Tool         | Something a helper can do, like look up the opening hours.                      |
-| Schema       | A form. The helper fills it in instead of writing free text.                    |
-| Session      | The chat history, so the helper remembers earlier messages.                     |
-| Guardrail    | A safety check on a message, an answer, or a tool.                              |
-| Approval     | A pause where a person says yes or no before a tool runs.                       |
-| Workspace    | A small computer the helper can use for files and commands.                     |
-| Database     | Postgres. It keeps chats, waiting approvals, and machines safe across restarts. |
+| Word         | Meaning                                                                                  |
+| ------------ | ---------------------------------------------------------------------------------------- |
+| Agent        | A helper with one job.                                                                   |
+| Instructions | The helper's job description. You write it once.                                         |
+| Prompt       | The customer's message for one run.                                                      |
+| Tool         | Something a helper can do, like look up the opening hours.                               |
+| Schema       | A form. The helper fills it in instead of writing free text.                             |
+| Session      | The chat history, so the helper remembers earlier messages.                              |
+| Guardrail    | A safety check on a message, an answer, or a tool.                                       |
+| Approval     | A pause where a person says yes or no before a tool runs.                                |
+| Workspace    | A small computer the helper can use for files and commands.                              |
+| Database     | Postgres. It stores chats, approval checkpoints, webhook events, and machine identities. |
 
 ## 📋 Requirements
 
-- Bun 1.3.14
+- Bun 1.4.4
 - Node.js 24 or later to run in production
 - Postgres 14 or later for chats, approvals, and self-hosted machines
 - Docker, or another OCI container runtime, to deploy
@@ -88,21 +88,23 @@ The AWS, DigitalOcean, Databricks, OCI, and Cloudflare settings are in `.env.exa
 <details>
 <summary><h2>🗄️ Database</h2></summary>
 
-The app uses Postgres through Prisma. The database keeps three things, so they survive a restart and every copy of the app sees the same data:
+The app uses Postgres through Prisma. The database keeps durable workflow records shared by every app replica:
 
-| Table             | What it keeps                                                  | Key                                          |
-| ----------------- | -------------------------------------------------------------- | -------------------------------------------- |
-| `chats`           | One row per chat, with when it started and when it last moved. | The chat id you pick, like `chat-c-42`       |
-| `chat_items`      | Every chat message, so a helper remembers the chat.            | A counter, so messages stay in exact order   |
-| `paused_runs`     | Runs waiting for a person to say yes or no.                    | A UUID the database makes (v7, time ordered) |
-| `remote_machines` | Which self-hosted machine belongs to which session.            | OpenAI's session id                          |
+| Table                     | What it keeps                                                      | Key                                        |
+| ------------------------- | ------------------------------------------------------------------ | ------------------------------------------ |
+| `chats`                   | One row per chat, with when it started and when it last moved.     | The chat id you pick, like `chat-c-42`     |
+| `chat_items`              | Every chat message, so a helper remembers the chat.                | A counter, so messages stay in exact order |
+| `paused_runs`             | Approval checkpoints, execution status, owner, and recovery notes. | A Prisma-generated UUIDv7                  |
+| `remote_machines`         | Which self-hosted machine belongs to which session.                | OpenAI's session id                        |
+| `hosted_webhooks`         | Verified events, retries, worker leases, and terminal records.     | OpenAI event id                            |
+| `chat_history_operations` | Completed SDK history operations and their content digest.         | Chat id + operation id                     |
 
 How the tables are built:
 
-- **Ids.** Ids the app makes are native `uuid` columns, version 7. They are sorted by time, so new rows go at the end of the index and stay fast. Ids from outside, like your chat ids and OpenAI's session ids, are kept as they are. Chat messages use a counter instead of a UUID, because the order of a chat must be exact.
+- **Ids.** Approval ids are native UUID columns generated as UUIDv7. Worker claim tokens use random UUIDs. Ids from outside, like your chat ids and OpenAI's session ids, are kept as they are. Chat messages use a counter instead of a UUID, because the order of a chat must be exact.
 - **Keys.** Each chat message points at its chat. Deleting a chat deletes its messages. One environment can only belong to one session.
 - **Times.** Every table has `created_at`. Tables whose rows change also have `updated_at`. All times are stored with their time zone.
-- **Indexes.** Only where a query needs one: a chat's messages by chat and order, and the machine for an environment. Every other lookup uses the table's key.
+- **Indexes.** Only where a query needs one: a chat's messages by chat and order, and the machine for an environment. Webhook queue indexes cover due work and terminal-event lookups; history-operation ids deduplicate writes.
 
 The app only connects the first time one of these is used. Without `DATABASE_URL`, everything else still works.
 
@@ -112,7 +114,7 @@ The app only connects the first time one of these is used. Without `DATABASE_URL
 | `bun run db:deploy`   | Applies new tables. The container already runs it when it starts. |
 | `bun run db:generate` | Rebuilds the database client. `bun install` already does this.    |
 
-You do not need a release step for the database. When the container starts with `DATABASE_URL` set, it applies any new migrations first, then starts the app. If a migration fails, the app does not start, so it never runs against the wrong tables. Two copies starting at once are safe: Postgres lets one migrate while the other waits.
+Drain old application workers before deploying a schema or execution-protocol change. When the container starts with `DATABASE_URL` set, it applies any new migrations first, then starts the app. If a migration fails, the app does not start, so it never runs against the wrong tables. Two copies starting at once are safe: Postgres lets one migrate while the other waits.
 
 </details>
 
@@ -235,6 +237,10 @@ const result = await this.openai.runAgent(
 ```
 
 The second message works because the helper remembers the cake.
+
+Only one active run may use a database chat at a time, across all app replicas. An overlapping request gets a conflict; queue it in your application or retry after the first run finishes. Streaming holds that lock until `stream.completed`, including history persistence. A saved pending approval blocks new messages until it is resolved.
+
+History reads default to 200 items and 256,000 serialized bytes. When older items are omitted, the retained context starts at a user message so tool results are not detached from their calls. A single oversized turn fails with an explicit limit error. Adjust limits with `createSession(chatId, { maxItems: 400, maxBytes: 512_000 })`, or use the SDK's compaction capabilities. Limits bound model context; they do not delete stored history. Explicit `getItems(limit)` reads preserve the SDK's exact suffix contract for recovery.
 
 Give each chat its own id, like the customer's chat id, and store it. Pass that id again tomorrow and the chat carries on. With no id, `createSession()` makes a new random one, which you can read with `await chat.getSessionId()`.
 
@@ -613,20 +619,44 @@ Options, all optional:
 
 ### Decide later
 
-A person may not answer right away. `saveRun` keeps the paused run in Postgres and gives you an id. Load it later with that id. It is still the same run, even after a restart.
+A person may not answer right away. Database-backed runs automatically save an approval checkpoint before returning a paused result. `saveRun` returns that checkpoint's id; for a run without a database chat, call it explicitly. Chat identity, history limits, turn limits, WebSocket selection, and a string blocked-output message are stored with the state.
 
 ```typescript
-const runId = await this.openai.saveRun(result); // keep this id
+const ownerId = authenticatedCustomer.id; // take this from your server's authentication
+const agentVersion = 'orders-v1';
+const result = await this.openai.runAgent('Cancel order 123.', orderHelper, {
+  session: chat,
+  ownerId,
+  agentVersion,
+  maxTurns: 5,
+});
+const runId = await this.openai.saveRun(result);
 
-// later, maybe in another request
-const state = await this.openai.loadRun(orderHelper, runId);
+// Later, possibly on another app replica:
+const state = await this.openai.loadRun(orderHelper, runId, {
+  ownerId,
+  agentVersion,
+});
 this.openai.approve({ state });
 const finished = await this.openai.resumeAgent(orderHelper, state);
 ```
 
-- Load it with the same helper that started the run.
-- A run can be loaded **once**. If the owner clicks "Yes" twice, the second load throws, so the order is never cancelled twice.
-- If the run does not fit the helper, nothing is taken. It stays waiting.
+Loading a checkpoint does not consume it. Resuming acquires its database execution lock and claims its version; a second or stale resume is rejected. The original database session is restored automatically. Supply the same agent definition, owner, and configuration version. Bind chat ids to authenticated users in your application; these helpers do not provide an authentication endpoint.
+
+`reply()` and `finish()` preserve the session, cancellation signal, and execution options during an in-process approval. Signals, formatter functions, and live sandbox objects cannot be restored from database JSON; reattach runtime-only configuration when resuming after a restart.
+
+A crash or failed resumed execution leaves `running` or `recovery_required`. Inspect **all external actions since the saved checkpoint** before retrying. Confirm that they did not happen, were compensated, or use stable idempotency keys. Then:
+
+```typescript
+const state = await this.openai.recoverRun(orderHelper, runId, {
+  ownerId,
+  agentVersion,
+  note: 'Checked the order system; retrying uses the original idempotency key.',
+});
+const finished = await this.openai.resumeAgent(orderHelper, state);
+```
+
+`recoverRun` requires a reconciliation note and refuses to reclaim a run while another worker holds its execution lock. It does not prove that an external action is safe to repeat. Completed checkpoints remain available for audit but cannot be executed again.
 
 ### Streaming
 
@@ -1020,7 +1050,7 @@ Two kinds of mounts:
 - **Storage** (Google Drive, S3, GCS, R2, Azure, Box) is attached live with `rclone`. It only works on a **Docker** computer whose image has `rclone` and `fuse3`:
 
 ```dockerfile
-FROM node:latest
+FROM node:24-bookworm-slim
 RUN apt-get update \
   && apt-get install -y --no-install-recommends rclone fuse3 ca-certificates \
   && rm -rf /var/lib/apt/lists/*
@@ -1032,19 +1062,30 @@ Storage is read-only unless you pass `readOnly: false`. Keep keys on the mount o
 
 ### Private git projects
 
-1. Make a read-only token on the git site.
-2. Pass it as `token`. Use an `https` link. A `git@` link cannot carry a token.
+Use `prepareManifest` for authenticated repositories. It clones with credentials scoped to that child process, then gives the SDK a local source. The synchronous `createManifest` rejects token-bearing repo shortcuts rather than putting credentials in shared process state.
 
 ```typescript
-createManifest({
+import { prepareManifest } from '@/config';
+
+const prepared = await prepareManifest({
   repo: {
     url: 'https://github.com/sunny-bakery/private-site',
     token: process.env.GITHUB_TOKEN,
   },
 });
+try {
+  const workspace = await this.sandbox.openSandbox(prepared.manifest, {
+    computer: 'docker',
+  });
+  // The workspace now owns a copy of the repository.
+} finally {
+  await prepared.dispose();
+}
 ```
 
-The token is never written into the link. It stays out of saved computers, snapshots, `.git/config`, and error messages. A Unix computer shares this app's environment and could still read it, so use Docker or a hosted computer for code you do not trust.
+Use an HTTPS URL and a read-only token. `prepareManifest` also isolates anonymous clones and Git entries supplied through `entries`. It does not inherit the server's Git credentials, credential helpers, or Git configuration. Tokens stay out of manifests, command arguments, clone URLs, `.git/config`, saved state, and surfaced errors.
+
+Preparation requires Git and a writable `.msagents/` directory under the app's working directory. Temporary source files are private and excluded from Git and Docker build contexts. Keep them until the SDK finishes materializing the workspace, then dispose them in `finally`. Prepare again before creating a fresh workspace from a disposed manifest. Existing workspace copies and snapshots remain usable. After an unclean process exit, remove abandoned preparation directories only when no active preparation uses them.
 
 | Site      | Where to make the token                                         | Notes                                                                                          |
 | --------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
@@ -1069,11 +1110,13 @@ All of these need the Docker image above.
 
 ### Choose the computer
 
-| `computer`                                                  | What it is                                               |
-| ----------------------------------------------------------- | -------------------------------------------------------- |
-| `unix` (default)                                            | Runs on this machine.                                    |
-| `docker`                                                    | A container. Uses `node:latest` unless you pass `image`. |
-| `modal`, `vercel`, `cloudflare`, `e2b`, `daytona`, `blaxel` | A computer in the cloud. Each reads its own login.       |
+| `computer`                                                  | What it is                                                                |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `unix` (development default)                                | Runs on this machine; rejected in production.                             |
+| `docker`                                                    | Production default. Uses `node:24-bookworm-slim` unless you pass `image`. |
+| `modal`, `vercel`, `cloudflare`, `e2b`, `daytona`, `blaxel` | A computer in the cloud. Each reads its own login.                        |
+
+In production, choose an isolated provider explicitly when Docker is unavailable. Docker requires a reachable Docker daemon; installing the application container does not itself supply one. Local executor provisioning is development-only.
 
 Cloud logins: Modal uses `modal setup` or `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`. E2B uses `E2B_API_KEY`. Daytona uses `DAYTONA_API_KEY`. Vercel uses `VERCEL_TOKEN`. Blaxel uses its own login. Cloudflare needs `workerUrl` or `CLOUDFLARE_SANDBOX_WORKER_URL`, plus `CLOUDFLARE_SANDBOX_API_KEY` if the worker checks a key.
 
@@ -1188,15 +1231,26 @@ OpenAI can call this app when a session needs a computer. The app then makes one
 | `databricks`   | `DATABRICKS_HOST` (an `https` address) and `DATABRICKS_TOKEN`. The computer is named after the session, so a retry reuses it.                                                             |
 | `oci`          | Run `oci session authenticate --profile-name Sandbox --region <region>`. Then set `OCI_SANDBOX_PROJECT_ID`, `OCI_SANDBOX_TOKEN`, and `OCI_SANDBOX_CREATE_URL` from the current OCI guide. |
 
-The webhook needs `DATABASE_URL`. It keeps one row per session in the `remote_machines` table.
+The webhook needs `DATABASE_URL`. It verifies the signature and inserts a deduplicated event in `hosted_webhooks` before acknowledging it. Provider work runs in a background worker, which starts when both `DATABASE_URL` and `OPENAI_WEBHOOK_SECRET` are configured. It checks for work every second; each worker claims up to 20 events per pass.
 
-Safe if things go wrong:
+- Duplicate deliveries share one event id. Database leases and per-environment locks coordinate replicas.
+- Retryable worker failures stay queued with bounded exponential backoff. An expired five-minute worker lease can be reclaimed after a crash; an active worker renews it.
+- Environment expiry is retained as a terminal record. Cleanup is coordinated with provisioning, including events arriving while a machine is being created.
+- A known machine that is still awaiting connection gets a two-minute startup grace period; a later connection request stays queued during that grace period. Missing local executors and expired grace periods require operator inspection.
+- Unknown provider outcomes enter `reconciliation`. The worker does not blindly create another machine when the first request may have succeeded.
+- Failed cleanup preserves the machine id for retry. Local executor ids include their owning process; another replica cannot silently claim to have stopped them.
 
-- **Same webhook twice, or two servers:** each tries to add the session's row. The database lets only one add it, so only one machine gets made.
-- **The machine fails to start:** the row is removed and the app answers with an error, so OpenAI tries again.
-- **The machine id cannot be saved:** the machine is deleted, so nothing runs that nobody knows about.
-- **A row with no machine, older than ten minutes:** it belongs to a crash. One later webhook takes it over.
-- **A failed session or an expired computer:** the machine is deleted first, then its row. If the delete fails, the row stays, so the next event tries again.
+After checking the provider, reconcile an uncertain operation with either its known provider-prefixed id or confirmed absence:
+
+```typescript
+await this.sandbox.reconcileRemoteMachine(sessionId, {
+  machineId: 'digitalocean:actual-provider-id',
+});
+// OR, only after verifying that no machine exists:
+await this.sandbox.reconcileRemoteMachine(sessionId, { absent: true });
+```
+
+Reconciliation requeues the associated events. Keep terminal inbox records and machine tombstones; removing them without an equivalent durable record would allow a delayed event to resurrect compute. Monitor pending-event age, retries, and `reconciliation` records. The worker logs queue-access failures without logging credentials or webhook bodies.
 
 </details>
 
@@ -1204,16 +1258,16 @@ Safe if things go wrong:
 <summary><h2>💚 Health checks</h2></summary>
 
 - `GET /v1/health/live` says the app is running.
-- `GET /v1/health/ready` says the app has enough memory to work.
+- `GET /v1/health/ready` checks memory and queries PostgreSQL when `DATABASE_URL` is configured. It returns 503 if the configured database is unavailable.
 
-Both also work on version 2, like `/v2/health/live`. They do not call other websites or databases.
+Both also work on version 2, like `/v2/health/live`. Liveness has no external dependencies. Without `DATABASE_URL`, readiness reports the database as disabled; storage features remain unavailable.
 
 </details>
 
 <details>
 <summary><h2>✅ Verification</h2></summary>
 
-All tests are in `test/`.
+All tests are in `test/`. Unit tests use controlled dependencies; integration tests exercise the real Agents SDK with an offline model and a disposable PostgreSQL database.
 
 ```bash
 bun run format:check
@@ -1225,6 +1279,16 @@ bun run test:cov
 bun run build
 ```
 
+Run database tests only against an isolated test database. `TEST_DATABASE_URL` is mandatory; the suite never falls back to the application database.
+
+```bash
+export TEST_DATABASE_URL=postgresql://agentic_test:agentic_test@127.0.0.1:55439/agentic_test
+DATABASE_URL="$TEST_DATABASE_URL" bun run db:deploy
+bun run test:integration
+```
+
+The suite covers cross-worker exclusion, connection-loss recovery, idempotent history writes, transactional suffix replacement, and approval resumption after service reconstruction. It uses no paid model calls. Live provider behavior and workload latency still require environment-specific tests.
+
 </details>
 
 <details>
@@ -1234,7 +1298,7 @@ Build one image and run it anywhere that runs containers, like Docker, Kubernete
 
 ```bash
 docker build --tag agentic:local .
-docker run --rm --read-only --tmpfs /tmp --publish 3000:3000 agentic:local
+docker run --rm --read-only --tmpfs /tmp --tmpfs /app/.msagents:uid=1000,gid=1000,mode=0700 --publish 3000:3000 agentic:local
 ```
 
 The image uses pinned Bun and Node versions, has only production packages, and runs as the `node` user, not as root.
@@ -1242,7 +1306,7 @@ The image uses pinned Bun and Node versions, has only production packages, and r
 On start, the image applies new database migrations, then starts the app (see Database). Give it `DATABASE_URL` and nothing else is needed:
 
 ```bash
-docker run --rm --read-only --tmpfs /tmp --publish 3000:3000 \
+docker run --rm --read-only --tmpfs /tmp --tmpfs /app/.msagents:uid=1000,gid=1000,mode=0700 --publish 3000:3000 \
   --env DATABASE_URL=postgresql://user:password@db-host:5432/agentic \
   --env OPENAI_API_KEY=sk-... \
   agentic:local
@@ -1258,7 +1322,7 @@ docker run --rm --read-only --tmpfs /tmp --publish 3000:3000 \
 <details>
 <summary><h2>🚀 CI/CD</h2></summary>
 
-`.github/workflows/ci.yml` installs the exact lockfile, checks formatting and types, runs every test, checks packages for known problems, builds the app and the image, and scans the image. Every outside action is pinned to an exact commit.
+`.github/workflows/ci.yml` runs for pull requests and pushes to `main` and `dev`. It uses Bun 1.4.4, matching the Docker build and release workflow, installs the exact lockfile, checks formatting and types, runs every test, checks packages for known problems, builds the app and the image, and scans the image. Every outside action is pinned to an exact commit. PostgreSQL integration tests run against a temporary CI database. BuildKit caches image layers in GitHub Actions, while the vulnerability database cache remains enabled.
 
 When a package deep inside the tree pins a version with a known problem, `overrides` in `package.json` forces the fixed version. Today that is `zod` and `js-yaml`. Remove an override once the package that pins it ships a fix.
 
@@ -1274,20 +1338,25 @@ git push origin v1.0.0
 <details>
 <summary><h2>🛡️ Reliability and state</h2></summary>
 
-> [!IMPORTANT]
-> Everything that must survive a restart lives in Postgres: chats, waiting approvals, and self-hosted machines. The app itself keeps nothing in memory that matters, so you can start, stop, or roll back copies of it at any time.
+Chats, approval checkpoints, webhook events, and provider identities are stored in PostgreSQL. Active model calls, child processes, and live sandbox handles are runtime resources; persistence does not make them restart automatically.
 
-How the database stays correct when two things happen at once:
+| Operation               | Guarantee                                                                                                                         |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Chat turn               | A PostgreSQL session advisory lock excludes other app workers for the same chat until execution and persistence finish.           |
+| SDK history transaction | The operation id and history change commit together; repeating the same operation does not append duplicate items.                |
+| Approval resume         | A versioned checkpoint is claimed before execution and updated on completion; ambiguous outcomes require reconciliation.          |
+| Webhook processing      | Durable inbox, retry schedule, expiring leases, and environment locks prevent lost acknowledgements and overlapping provisioning. |
+| Provider cleanup        | Known machine ids and terminal records survive failed cleanup and worker restarts.                                                |
 
-| Action                         | Why it cannot happen twice                                                     |
-| ------------------------------ | ------------------------------------------------------------------------------ |
-| Loading a saved approval       | One update marks it taken, inside a transaction. A second load finds it taken. |
-| Creating a self-hosted machine | The session id is the row's key, so only one insert can win.                   |
-| Removing a chat message        | One delete with `SKIP LOCKED`, so two removals take two different messages.    |
+Database transactions are short and never span a model or provider call. External actions cannot be committed atomically with PostgreSQL: use stable idempotency keys or compensating actions in tools, and reconcile unknown results before retrying. A normal run interrupted before reaching a saved checkpoint must be inspected by the application; this is not a general-purpose durable workflow engine.
 
-A sandbox computer lasts while it is open, until you save and resume it, or until a new one starts from its snapshot. See the `snapshotDir` warning in the Sandbox section.
+Use a direct PostgreSQL connection or session-pooling mode for execution locks. Transaction-pooling proxies do not preserve session advisory locks. The lock pool allows ten held connections per app instance; size replicas and database connection capacity together. Connection loss aborts the run signal. Custom tools must honor cancellation and independently enforce idempotency.
 
-The app shuts down cleanly. Its error handler also catches errors from middleware, gives every request a safe id, logs unexpected errors, and never shows internal details to callers.
+**Deployment:** drain old workers before applying the recovery migration and starting this version. Older binaries do not participate in the new execution locks or inbox. The migration preserves data and marks legacy consumed approvals and incomplete machine claims for reconciliation. Back up production data and inspect these records after deployment; do not replay them automatically.
+
+The Agents SDK's built-in tracing remains enabled, with sensitive model/tool payloads excluded by default in this wrapper. Use the returned result's `runContext.usage` for token accounting, and correlate application request ids with run/chat ids in your own telemetry. Define task-specific evaluation datasets and measure latency and cost on representative workloads before making performance claims. Retention and authorization policies belong to the application; authenticate before loading a chat or deciding an approval.
+
+Sandbox files require their own retained workspace, provider storage, or snapshot. Keep executor credentials separate from application credentials, and use isolated compute for untrusted code. Shutdown cancels run signals, closes cached WebSocket providers, and stops locally owned executors; interrupted external operations remain subject to reconciliation.
 
 </details>
 

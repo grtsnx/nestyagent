@@ -7,13 +7,18 @@ type Where = Record<string, unknown>;
 // Equality per field, plus { lt: Date } for the claim age check.
 function matches(row: Row, where: Where = {}): boolean {
   return Object.entries(where).every(([key, expected]) => {
-    if (key === 'OR') return (expected as Where[]).some((clause) => matches(row, clause));
-    if (key === 'AND') return (expected as Where[]).every((clause) => matches(row, clause));
+    if (key === 'OR')
+      return (expected as Where[]).some((clause) => matches(row, clause));
+    if (key === 'AND')
+      return (expected as Where[]).every((clause) => matches(row, clause));
     if (key === 'chatId_operationId') return matches(row, expected as Where);
     if (expected && typeof expected === 'object') {
-      if ('lt' in expected) return (row[key] as Date) < (expected as { lt: Date }).lt;
-      if ('lte' in expected) return (row[key] as Date) <= (expected as { lte: Date }).lte;
-      if ('in' in expected) return (expected as { in: unknown[] }).in.includes(row[key]);
+      if ('lt' in expected)
+        return (row[key] as Date) < (expected as { lt: Date }).lt;
+      if ('lte' in expected)
+        return (row[key] as Date) <= (expected as { lte: Date }).lte;
+      if ('in' in expected)
+        return (expected as { in: unknown[] }).in.includes(row[key]);
     }
     return row[key] === expected;
   });
@@ -54,11 +59,17 @@ class Table {
   }) {
     const rows = this.rows.filter((row) => matches(row, args.where));
     const ordering = Object.entries(args.orderBy ?? {})[0];
-    if (ordering) rows.sort((a, b) => {
-      const [key, direction] = ordering;
-      const comparison = (a[key] as number) < (b[key] as number) ? -1 : a[key] === b[key] ? 0 : 1;
-      return direction === 'asc' ? comparison : -comparison;
-    });
+    if (ordering)
+      rows.sort((a, b) => {
+        const [key, direction] = ordering;
+        const comparison =
+          (a[key] as number) < (b[key] as number)
+            ? -1
+            : a[key] === b[key]
+              ? 0
+              : 1;
+        return direction === 'asc' ? comparison : -comparison;
+      });
     return args.take === undefined ? rows : rows.slice(0, args.take);
   }
 
@@ -88,10 +99,13 @@ class Table {
 
   async updateMany({ where, data }: { where: Where; data: Row }) {
     const hits = this.rows.filter((row) => matches(row, where));
-    for (const row of hits) for (const [key, value] of Object.entries(data)) {
-      row[key] = value && typeof value === 'object' && 'increment' in value
-        ? Number(row[key] ?? 0) + Number(value.increment) : value;
-    }
+    for (const row of hits)
+      for (const [key, value] of Object.entries(data)) {
+        row[key] =
+          value && typeof value === 'object' && 'increment' in value
+            ? Number(row[key] ?? 0) + Number(value.increment)
+            : value;
+      }
     return { count: hits.length };
   }
 
@@ -143,7 +157,16 @@ export function fakePrisma() {
       status: 'pending',
       desiredState: 'active',
     })),
-    hostedWebhook: new Table(['id'], () => ({ status: 'pending', attempts: 0, availableAt: new Date(), leaseToken: null, leaseExpiresAt: null, lastError: null, createdAt: new Date(), updatedAt: new Date() })),
+    hostedWebhook: new Table(['id'], () => ({
+      status: 'pending',
+      attempts: 0,
+      availableAt: new Date(),
+      leaseToken: null,
+      leaseExpiresAt: null,
+      lastError: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })),
     chatHistoryOperation: new Table([]),
 
     // Only the chat pop query is used: remove and return the newest item of one chat.
@@ -158,7 +181,14 @@ export function fakePrisma() {
     // The list form takes calls that already ran, so it only waits for them.
     async $transaction(work) {
       if (Array.isArray(work)) return (await Promise.all(work)) as never;
-      const tables = [db.chat, db.chatItem, db.pausedRun, db.remoteMachine, db.hostedWebhook, db.chatHistoryOperation];
+      const tables = [
+        db.chat,
+        db.chatItem,
+        db.pausedRun,
+        db.remoteMachine,
+        db.hostedWebhook,
+        db.chatHistoryOperation,
+      ];
       const saved = tables.map((table) =>
         table.rows.map((row) => ({ ...row })),
       );
@@ -177,11 +207,19 @@ export function fakePrisma() {
     );
   };
   const locks = new Set<string>();
-  const withLock = async <T>(key: string, work: (signal: AbortSignal) => Promise<T>) => {
-    if (locks.has(key)) throw new ConflictException('This operation is already running.');
-    locks.add(key);
-    try { return await work(new AbortController().signal); }
-    finally { locks.delete(key); }
+  const withLock = async <T>(
+    key: string | string[],
+    work: (signal: AbortSignal) => Promise<T>,
+  ) => {
+    const keys = Array.isArray(key) ? key : [key];
+    if (keys.some((entry) => locks.has(entry)))
+      throw new ConflictException('This operation is already running.');
+    keys.forEach((entry) => locks.add(entry));
+    try {
+      return await work(new AbortController().signal);
+    } finally {
+      keys.forEach((entry) => locks.delete(entry));
+    }
   };
   return { db, prisma: { db, withLock } as unknown as PrismaService };
 }

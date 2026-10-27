@@ -26,8 +26,11 @@ WORKDIR /app
 # Apply available OS fixes and remove npm from the runtime attack surface.
 # The application starts with node and never installs packages at runtime.
 RUN apk upgrade --no-cache \
+  && apk add --no-cache git \
   && rm -rf /usr/local/lib/node_modules/npm \
-  && rm -f /usr/local/bin/npm /usr/local/bin/npx
+  && rm -f /usr/local/bin/npm /usr/local/bin/npx \
+  && mkdir -m 0700 /app/.msagents \
+  && chown node:node /app/.msagents
 
 COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules
 # Download the migration engine for this exact OS, so migrate deploy runs at start.

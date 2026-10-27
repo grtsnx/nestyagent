@@ -201,11 +201,11 @@ export async function prepareManifest(options?: CreateManifestOptions) {
   );
   if (gitEntries.length === 0) return { manifest, dispose: async () => {} };
 
-  // SDK local sources must be within cwd. Hosted clients reject extraPathGrants,
-  // so keep disposable sources here instead of exposing host paths to sandboxes.
-  const temporary = await mkdtemp(
-    join(await realpath(process.cwd()), '.msagents-git-'),
-  );
+  // SDK local sources must be within cwd. A dedicated writable directory also
+  // supports non-root containers whose application directory is read-only.
+  const preparationRoot = join(await realpath(process.cwd()), '.msagents');
+  await mkdir(preparationRoot, { recursive: true, mode: 0o700 });
+  const temporary = await mkdtemp(join(preparationRoot, 'git-'));
   const dispose = () => rm(temporary, { recursive: true, force: true });
   const home = join(temporary, 'home');
   try {

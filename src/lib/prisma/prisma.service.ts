@@ -1,4 +1,10 @@
-import { ConflictException, Injectable, OnModuleDestroy, ServiceUnavailableException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@/generated/prisma/client.js';
@@ -9,6 +15,7 @@ export class PrismaService implements OnModuleDestroy {
   private client?: PrismaClient;
   private lockPool?: Pool;
   private readonly locks = new Set<AbortController>();
+  private readonly logger = new Logger(PrismaService.name);
 
   constructor(private readonly configService: ConfigService) {}
 
@@ -28,7 +35,8 @@ export class PrismaService implements OnModuleDestroy {
   }
 
   async onModuleDestroy() {
-    for (const lock of this.locks) lock.abort(new Error('Application is shutting down.'));
+    for (const lock of this.locks)
+      lock.abort(new Error('Application is shutting down.'));
     await this.client?.$disconnect();
     await this.lockPool?.end();
   }
@@ -48,29 +56,44 @@ export class PrismaService implements OnModuleDestroy {
   // A dedicated connection holds a session lock, never a long-running SQL transaction.
   // PostgreSQL releases it when the connection dies. Callers must honour the signal
   // and make external side effects idempotent before retrying an interrupted operation.
-  async withLock<T>(key: string, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  async withLock<T>(
+    key: string | string[],
+    work: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
     this.lockPool ??= new Pool({
-      connectionString: this.configService.getOrThrow<string>('DATABASE_URL').trim(),
+      connectionString: this.configService
+        .getOrThrow<string>('DATABASE_URL')
+        .trim(),
       max: 10,
       connectionTimeoutMillis: 5_000,
       query_timeout: 5_000,
       keepAlive: true,
       keepAliveInitialDelayMillis: 5_000,
-    });
+    }).on('error', () =>
+      this.logger.error('An idle execution-lock connection was lost.'),
+    );
     const connection = await this.lockPool.connect();
     const controller = new AbortController();
-    const lost = () => controller.abort(new Error('Database execution lock was lost.'));
+    const lost = () =>
+      controller.abort(new Error('Database execution lock was lost.'));
     connection.on('error', lost);
     connection.on('end', lost);
     this.locks.add(controller);
-    let held = false;
+    const keys = [...new Set(Array.isArray(key) ? key : [key])].sort();
+    const held: string[] = [];
     let broken = false;
     try {
-      const result = await connection.query<{ locked: boolean }>(
-        'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked', [key],
-      );
-      held = result.rows[0].locked;
-      if (!held) throw new ConflictException('This operation is already running. Retry after it finishes.');
+      for (const lockKey of keys) {
+        const result = await connection.query<{ locked: boolean }>(
+          'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
+          [lockKey],
+        );
+        if (!result.rows[0].locked)
+          throw new ConflictException(
+            'This operation is already running. Retry after it finishes.',
+          );
+        held.push(lockKey);
+      }
       const resultValue = await work(controller.signal);
       controller.signal.throwIfAborted();
       return resultValue;
@@ -79,9 +102,16 @@ export class PrismaService implements OnModuleDestroy {
       throw error;
     } finally {
       this.locks.delete(controller);
-      if (held && !controller.signal.aborted) {
-        try { await connection.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [key]); }
-        catch { broken = true; }
+      if (!controller.signal.aborted) {
+        try {
+          for (const lockKey of held.reverse())
+            await connection.query(
+              'SELECT pg_advisory_unlock(hashtextextended($1, 0))',
+              [lockKey],
+            );
+        } catch {
+          broken = true;
+        }
       }
       connection.removeListener('error', lost);
       connection.removeListener('end', lost);

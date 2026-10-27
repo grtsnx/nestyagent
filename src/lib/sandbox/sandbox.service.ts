@@ -690,21 +690,41 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
         let row = await this.db().remoteMachine.findUnique({
           where: { sessionId },
         });
+        const expired = await this.hasExpiredEnvironment(environment.id);
+        const needsConnection = session.required_actions.some(
+          (action) => action.type === 'environment_connection',
+        );
+        if (
+          !expired &&
+          session.status !== 'failed' &&
+          needsConnection &&
+          row?.status === 'deleted'
+        ) {
+          await this.db().remoteMachine.updateMany({
+            where: { sessionId },
+            data: { desiredState: 'active' },
+          });
+          await this.requireReconciliation(
+            sessionId,
+            undefined,
+            'executor_connection_missing',
+          );
+        }
         if (
           row?.desiredState === 'deleted' ||
           session.status === 'failed' ||
-          (await this.hasTerminalEvent(sessionId, environment.id))
+          expired
         ) {
-          if (row) await this.deleteClaimedMachine(row, operationSignal);
+          if (row)
+            await this.deleteClaimedMachine(
+              row,
+              operationSignal,
+              expired || row.desiredState === 'deleted',
+            );
           return;
         }
-        if (
-          !session.required_actions.some(
-            (action) => action.type === 'environment_connection',
-          )
-        )
-          return;
-        if (row?.status === 'deleted' || row?.status === 'ready') return;
+        if (!needsConnection) return;
+        if (row?.status === 'ready') await this.checkReadyMachine(row);
         if (row && row.status !== 'pending') {
           await this.requireReconciliation(sessionId);
         }
@@ -757,6 +777,7 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
             data: {
               machineId,
               status: operationSignal.aborted ? 'reconciliation' : 'ready',
+              claimedAt: new Date(),
             },
           });
           if (saved.count !== 1) throw new Error('Machine claim was lost.');
@@ -766,7 +787,7 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
             await this.db().remoteMachine.updateMany({
               where: { sessionId },
               data: {
-                machineId: machineId,
+                machineId,
                 status: 'reconciliation',
                 desiredState: 'deleted',
                 lastError: 'machine_record_failed',
@@ -780,29 +801,60 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
           throw new MachineReconciliationRequired();
         }
         if (operationSignal.aborted) throw new MachineReconciliationRequired();
+        const expiredAfterCreate = await this.hasExpiredEnvironment(
+          environment.id,
+        );
         if (
           (provider === 'local' &&
             this.stoppedExecutors.has(machineId.slice('local:'.length))) ||
-          (await this.hasTerminalEvent(sessionId, environment.id))
+          expiredAfterCreate ||
+          (await this.isSessionFailed(sessionId, operationSignal))
         ) {
           await this.deleteClaimedMachine(
-            { ...row, machineId: machineId, status: 'ready' },
+            { ...row, machineId, status: 'ready' },
             operationSignal,
+            expiredAfterCreate,
           );
         }
       },
     );
   }
 
-  private async hasTerminalEvent(sessionId: string, environmentId: string) {
+  // A required connection can mean an executor is still booting. Retain the event during
+  // the grace period, then require an operator to inspect the provider before any replacement.
+  private async checkReadyMachine(row: {
+    sessionId: string;
+    machineId: string | null;
+    claimedAt: Date;
+  }): Promise<never> {
+    const local = row.machineId?.startsWith('local:');
+    const child =
+      local && row.machineId
+        ? this.localExecutors.get(row.machineId.slice('local:'.length))
+        : undefined;
+    if (
+      !row.machineId ||
+      (local &&
+        (!child || child.exitCode !== null || child.signalCode !== null)) ||
+      Date.now() - row.claimedAt.getTime() >= CONNECT_TIMEOUT_MS
+    ) {
+      return await this.requireReconciliation(
+        row.sessionId,
+        undefined,
+        'executor_connection_missing',
+      );
+    }
+    throw new Error('The executor is still waiting to connect.');
+  }
+
+  // Expiry is permanent. Session failures must be checked against the current session state.
+  private async hasExpiredEnvironment(environmentId: string) {
     return (
       (
         await this.db().hostedWebhook.findMany({
           where: {
-            OR: [
-              { type: 'agent.session.failed', resourceId: sessionId },
-              { type: 'agent.environment.expired', resourceId: environmentId },
-            ],
+            type: 'agent.environment.expired',
+            resourceId: environmentId,
           },
           take: 1,
         })
@@ -810,21 +862,43 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
+  private async isSessionFailed(sessionId: string, signal: AbortSignal) {
+    try {
+      const session = await this.openai().beta.agents.sessions.retrieve(
+        sessionId,
+        {
+          signal: providerSignal(signal),
+        },
+      );
+      return session.status === 'failed';
+    } catch (error) {
+      if (error instanceof APIError && error.status === 404) return true;
+      throw error;
+    }
+  }
+
   private async releaseMachine(
     where: { sessionId: string } | { environmentId: string },
     signal: AbortSignal,
   ) {
     const row = await this.db().remoteMachine.findUnique({ where });
-    // The inbox retains the terminal event even if provisioning has not inserted its row yet.
+    // Expiry remains in the inbox even if provisioning has not inserted its row yet.
     if (!row) return;
     await this.prisma.withLock(
       `sandbox:${row.environmentId}`,
       async (lockSignal) => {
+        const operationSignal = AbortSignal.any([signal, lockSignal]);
+        if (
+          'sessionId' in where &&
+          !(await this.isSessionFailed(where.sessionId, operationSignal))
+        )
+          return;
         const current = await this.db().remoteMachine.findUnique({ where });
         if (current)
           await this.deleteClaimedMachine(
             current,
-            AbortSignal.any([signal, lockSignal]),
+            operationSignal,
+            'environmentId' in where,
           );
       },
     );
@@ -833,11 +907,16 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
   private async deleteClaimedMachine(
     row: { sessionId: string; machineId: string | null; status: string },
     signal: AbortSignal,
+    permanent: boolean,
   ) {
-    await this.db().remoteMachine.updateMany({
-      where: { sessionId: row.sessionId },
-      data: { desiredState: 'deleted' },
-    });
+    // A failed session can recover before a retry; only expiry or explicit orphan disposal
+    // should persist a terminal intent. The failure event itself remains durable for retries.
+    if (permanent) {
+      await this.db().remoteMachine.updateMany({
+        where: { sessionId: row.sessionId },
+        data: { desiredState: 'deleted' },
+      });
+    }
     if (!row.machineId && ['creating', 'reconciliation'].includes(row.status))
       await this.requireReconciliation(row.sessionId);
     if (row.machineId) {
@@ -859,12 +938,13 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
   private async requireReconciliation(
     sessionId: string,
     machineId?: string,
+    reason = 'provider_outcome_unknown',
   ): Promise<never> {
     await this.db().remoteMachine.updateMany({
       where: { sessionId },
       data: {
         status: 'reconciliation',
-        lastError: 'provider_outcome_unknown',
+        lastError: reason,
         ...(machineId && { machineId }),
       },
     });
@@ -903,6 +983,7 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
                   ? 'deleted'
                   : 'pending',
             lastError: null,
+            claimedAt: new Date(),
           },
         });
         await tx.hostedWebhook.updateMany({
@@ -1001,6 +1082,8 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
       ],
     } as const;
     for (const key of required[provider]) this.setting(key);
+    if (provider === 'databricks')
+      databricksHost(this.setting('DATABRICKS_HOST'));
   }
 
   private assertLocalAllowed() {
@@ -1079,8 +1162,7 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
     assertDeleted(response, 'DigitalOcean');
   }
 
-  //1. The sandbox id comes from the session id, so a retry finds the same sandbox instead of making a second one.
-  //2. 409 means that sandbox already exists. The start command runs again on it.
+  // The stable id identifies an existing sandbox. Reconcile a conflict before launching another executor.
   private async createDatabricksMachine(request: MachineRequest) {
     const host = databricksHost(this.setting('DATABRICKS_HOST'));
     const token = this.setting('DATABRICKS_TOKEN');
@@ -1096,7 +1178,10 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
         }),
       },
     );
-    const body = created.status === 409 ? undefined : await readJson(created);
+    if (created.status === 409) {
+      throw new KnownMachineFailure(`databricks:sandboxes/${sandboxId}`);
+    }
+    const body = await readJson(created);
     const name =
       typeof body === 'object' &&
       body &&

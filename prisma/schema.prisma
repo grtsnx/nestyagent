@@ -13,16 +13,16 @@ datasource db {
   provider = "postgresql"
 }
 
-// Ids we create are UUIDv7: time ordered, so new rows land at the end of the index.
+// Approval ids use UUIDv7; worker ownership tokens use random UUIDs.
 // Ids from outside (chat ids you pick, OpenAI session and environment ids) stay text.
 // Every time is stored with its time zone (timestamptz).
 
 // One chat. Deleting it deletes its items.
 model Chat {
-  id        String     @id
-  createdAt DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
-  items     ChatItem[]
+  id                String                 @id
+  createdAt         DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
+  items             ChatItem[]
   historyOperations ChatHistoryOperation[]
 
   @@map("chats")
@@ -30,11 +30,12 @@ model Chat {
 
 // Deduplicates SDK history writes in the same transaction as their items.
 model ChatHistoryOperation {
-  chatId String @map("chat_id")
-  operationId String @map("operation_id")
-  digest String
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  chat Chat @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  chatId      String   @map("chat_id")
+  operationId String   @map("operation_id")
+  digest      String
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  chat        Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
+
   @@id([chatId, operationId])
   @@map("chat_history_operations")
 }
@@ -61,20 +62,20 @@ enum PausedRunStatus {
   recovery_required
 }
 
-// A run that stopped for a person to approve. It can be taken once.
+// A versioned approval checkpoint. Interrupted execution requires reconciliation.
 model PausedRun {
-  id        String          @id @default(uuid(7)) @db.Uuid
-  state     String
-  status    PausedRunStatus @default(waiting)
-  version Int @default(0)
-  chatId String? @map("chat_id")
-  agentName String? @map("agent_name")
-  agentVersion String? @map("agent_version")
-  ownerId String? @map("owner_id")
-  runOptions Json? @map("run_options")
-  recoveryNote String? @map("recovery_note")
-  createdAt DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  id           String          @id @default(uuid(7)) @db.Uuid
+  state        String
+  status       PausedRunStatus @default(waiting)
+  version      Int             @default(0)
+  chatId       String?         @map("chat_id")
+  agentName    String?         @map("agent_name")
+  agentVersion String?         @map("agent_version")
+  ownerId      String?         @map("owner_id")
+  runOptions   Json?           @map("run_options")
+  recoveryNote String?         @map("recovery_note")
+  createdAt    DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   @@map("paused_runs")
 }
@@ -82,17 +83,17 @@ model PausedRun {
 // The machine a self-hosted session runs on. One row per session.
 // claimToken marks which webhook owns the create. machineId is set once the machine exists.
 model RemoteMachine {
-  sessionId     String   @id @map("session_id")
-  environmentId String   @unique @map("environment_id")
-  claimToken    String   @map("claim_token") @db.Uuid
-  claimedAt     DateTime @default(now()) @map("claimed_at") @db.Timestamptz(3)
-  machineId     String?  @map("machine_id")
-  provider String?
-  status RemoteMachineStatus @default(pending)
-  desiredState RemoteMachineDesiredState @default(active) @map("desired_state")
-  lastError String? @map("last_error")
-  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  sessionId     String                    @id @map("session_id")
+  environmentId String                    @unique @map("environment_id")
+  claimToken    String                    @map("claim_token") @db.Uuid
+  claimedAt     DateTime                  @default(now()) @map("claimed_at") @db.Timestamptz(3)
+  machineId     String?                   @map("machine_id")
+  provider      String?
+  status        RemoteMachineStatus       @default(pending)
+  desiredState  RemoteMachineDesiredState @default(active) @map("desired_state")
+  lastError     String?                   @map("last_error")
+  createdAt     DateTime                  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime                  @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   @@map("remote_machines")
 }
@@ -118,17 +119,18 @@ enum HostedWebhookStatus {
 }
 
 model HostedWebhook {
-  id String @id
-  type String
-  resourceId String @map("resource_id")
-  status HostedWebhookStatus @default(pending)
-  attempts Int @default(0)
-  availableAt DateTime @default(now()) @map("available_at") @db.Timestamptz(3)
-  leaseToken String? @map("lease_token") @db.Uuid
-  leaseExpiresAt DateTime? @map("lease_expires_at") @db.Timestamptz(3)
-  lastError String? @map("last_error")
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  id             String              @id
+  type           String
+  resourceId     String              @map("resource_id")
+  status         HostedWebhookStatus @default(pending)
+  attempts       Int                 @default(0)
+  availableAt    DateTime            @default(now()) @map("available_at") @db.Timestamptz(3)
+  leaseToken     String?             @map("lease_token") @db.Uuid
+  leaseExpiresAt DateTime?           @map("lease_expires_at") @db.Timestamptz(3)
+  lastError      String?             @map("last_error")
+  createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
   @@index([status, availableAt])
   @@index([type, resourceId])
   @@map("hosted_webhooks")

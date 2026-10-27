@@ -1,4 +1,9 @@
-import { ConflictException, Injectable, OnModuleInit } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHash, randomUUID } from 'node:crypto';
 import OpenAI from 'openai';
@@ -65,13 +70,22 @@ export type RunAgentOptions<TContext = unknown> = ResumeOptions & {
 };
 
 type SavedRunIdentity = { id: string; version: number };
-type RunMetadata = { options: RunAgentOptions; agentName?: string; saved?: SavedRunIdentity };
+type RunMetadata = {
+  options: RunAgentOptions;
+  agentName?: string;
+  saved?: SavedRunIdentity;
+};
 type RunAccess = { ownerId?: string; agentVersion?: string };
 const storedOptionsSchema = z.object({
   websocket: z.boolean().optional(),
   maxTurns: z.number().int().positive().optional(),
   outputGuardrailBlockedMessage: z.string().optional(),
-  historyLimits: z.object({ maxItems: z.number().int().positive().optional(), maxBytes: z.number().int().positive().optional() }).optional(),
+  historyLimits: z
+    .object({
+      maxItems: z.number().int().positive().optional(),
+      maxBytes: z.number().int().positive().optional(),
+    })
+    .optional(),
 });
 
 type Streamed = { stream: true };
@@ -139,7 +153,8 @@ export class DatabaseSession implements Session {
   async getItems(limit?: number) {
     const maxItems = this.limits.maxItems ?? 200;
     const count = limit ?? maxItems;
-    if (!Number.isSafeInteger(count) || count < 0) throw new Error('History limit must be a nonnegative integer.');
+    if (!Number.isSafeInteger(count) || count < 0)
+      throw new Error('History limit must be a nonnegative integer.');
     if (count === 0) return [];
     const rows = await this.prisma.db.chatItem.findMany({
       where: { chatId: this.chatId },
@@ -148,28 +163,54 @@ export class DatabaseSession implements Session {
       select: { item: true },
     });
     const truncated = rows.length > count;
-    let items = rows.slice(0, count).reverse().map((row) => row.item as unknown as AgentInputItem);
+    let items = rows
+      .slice(0, count)
+      .reverse()
+      .map((row) => row.item as unknown as AgentInputItem);
     if (truncated && limit === undefined) {
-      const start = items.findIndex((item) => 'role' in item && item.role === 'user');
-      if (start < 0) throw new Error('The current turn exceeds the history limit. Compact it or increase maxItems.');
+      const start = items.findIndex(
+        (item) => 'role' in item && item.role === 'user',
+      );
+      if (start < 0)
+        throw new Error(
+          'The current turn exceeds the history limit. Compact it or increase maxItems.',
+        );
       items = items.slice(start);
     }
-    if (Buffer.byteLength(JSON.stringify(items)) > (this.limits.maxBytes ?? 256_000)) {
-      throw new Error('Chat history exceeds maxBytes. Compact it before continuing.');
+    if (
+      Buffer.byteLength(JSON.stringify(items)) >
+      (this.limits.maxBytes ?? 256_000)
+    ) {
+      throw new Error(
+        'Chat history exceeds maxBytes. Compact it before continuing.',
+      );
     }
     return items;
   }
 
   // The SDK retries the same operation ID when a history write has an uncertain outcome.
-  async applyHistoryTransaction({ operationId, transaction }: SessionHistoryTransactionArgs) {
-    if (!operationId.trim()) throw new Error('A history operation ID is required.');
+  async applyHistoryTransaction({
+    operationId,
+    transaction,
+  }: SessionHistoryTransactionArgs) {
+    if (!operationId.trim())
+      throw new Error('A history operation ID is required.');
     const digest = historyDigest(transaction);
     await this.prisma.db.$transaction(async (tx) => {
       // Updating the parent locks this chat until the short database transaction commits.
-      await tx.chat.upsert({ where: { id: this.chatId }, create: { id: this.chatId }, update: { updatedAt: new Date() } });
-      const previous = await tx.chatHistoryOperation.findUnique({ where: { chatId_operationId: { chatId: this.chatId, operationId } } });
+      await tx.chat.upsert({
+        where: { id: this.chatId },
+        create: { id: this.chatId },
+        update: { updatedAt: new Date() },
+      });
+      const previous = await tx.chatHistoryOperation.findUnique({
+        where: { chatId_operationId: { chatId: this.chatId, operationId } },
+      });
       if (previous) {
-        if (previous.digest !== digest) throw new ConflictException('History operation ID was reused with different data.');
+        if (previous.digest !== digest)
+          throw new ConflictException(
+            'History operation ID was reused with different data.',
+          );
         return;
       }
       let items: AgentInputItem[];
@@ -177,16 +218,42 @@ export class DatabaseSession implements Session {
         items = transaction.items;
       } else {
         const suffix = transaction.expectedSuffix.length
-          ? await tx.chatItem.findMany({ where: { chatId: this.chatId }, orderBy: { id: 'desc' }, take: transaction.expectedSuffix.length })
+          ? await tx.chatItem.findMany({
+              where: { chatId: this.chatId },
+              orderBy: { id: 'desc' },
+              take: transaction.expectedSuffix.length,
+            })
           : [];
-        if (historyDigest(suffix.slice().reverse().map((row) => row.item)) !== historyDigest(transaction.expectedSuffix)) {
-          throw new ConflictException('Chat history changed before its suffix could be replaced.');
+        if (
+          historyDigest(
+            suffix
+              .slice()
+              .reverse()
+              .map((row) => row.item),
+          ) !== historyDigest(transaction.expectedSuffix)
+        ) {
+          throw new ConflictException(
+            'Chat history changed before its suffix could be replaced.',
+          );
         }
-        await tx.chatItem.deleteMany({ where: { chatId: this.chatId, id: { in: suffix.map((row) => row.id) } } });
+        await tx.chatItem.deleteMany({
+          where: {
+            chatId: this.chatId,
+            id: { in: suffix.map((row) => row.id) },
+          },
+        });
         items = transaction.replacement;
       }
-      if (items.length) await tx.chatItem.createMany({ data: items.map((item) => ({ chatId: this.chatId, item: item as unknown as Prisma.InputJsonValue })) });
-      await tx.chatHistoryOperation.create({ data: { chatId: this.chatId, operationId, digest } });
+      if (items.length)
+        await tx.chatItem.createMany({
+          data: items.map((item) => ({
+            chatId: this.chatId,
+            item: item as unknown as Prisma.InputJsonValue,
+          })),
+        });
+      await tx.chatHistoryOperation.create({
+        data: { chatId: this.chatId, operationId, digest },
+      });
     });
   }
 
@@ -212,8 +279,11 @@ export class DatabaseSession implements Session {
   // Removes and returns the newest item. SKIP LOCKED lets two pops at once take different items.
   async popItem() {
     return await this.prisma.db.$transaction(async (tx) => {
-    await tx.chat.updateMany({ where: { id: this.chatId }, data: { updatedAt: new Date() } });
-    const rows = await tx.$queryRaw<{ item: AgentInputItem }[]>`
+      await tx.chat.updateMany({
+        where: { id: this.chatId },
+        data: { updatedAt: new Date() },
+      });
+      const rows = await tx.$queryRaw<{ item: AgentInputItem }[]>`
       DELETE FROM chat_items
       WHERE id = (
         SELECT id FROM chat_items
@@ -223,7 +293,7 @@ export class DatabaseSession implements Session {
         FOR UPDATE SKIP LOCKED
       )
       RETURNING item`;
-    return rows[0]?.item;
+      return rows[0]?.item;
     });
   }
 
@@ -242,12 +312,14 @@ export function guardrailConfig(options?: AgentGuardrails): AgentGuardrails {
 }
 
 @Injectable()
-export class OpenaiService implements OnModuleInit {
+export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   private sharedRunner?: Runner;
   private runnerModel?: string;
   private socketRunner?: Runner;
   private apiClient?: OpenAI;
   private readonly runMetadata = new WeakMap<object, RunMetadata>();
+  private readonly shutdown = new AbortController();
+  private readonly socketProviders = new Set<OpenAIProvider>();
 
   constructor(
     private readonly configService: ConfigService,
@@ -257,6 +329,14 @@ export class OpenaiService implements OnModuleInit {
   // Set the default OpenAI key
   onModuleInit() {
     setDefaultOpenAIKey(this.apiKey());
+  }
+
+  async onModuleDestroy() {
+    this.shutdown.abort(new Error('Application is shutting down.'));
+    await Promise.allSettled(
+      [...this.socketProviders].map((provider) => provider.close()),
+    );
+    this.socketProviders.clear();
   }
 
   // One OpenAI client for the hosted session API. It uses the same key as the agents.
@@ -269,7 +349,7 @@ export class OpenaiService implements OnModuleInit {
   //2. It applies to every later run in this app, so call it once at startup.
   createRunner(model: string) {
     this.runnerModel = model;
-    this.sharedRunner = new Runner({ model });
+    this.sharedRunner = new Runner({ model, traceIncludeSensitiveData: false });
     this.socketRunner = undefined;
     return this.sharedRunner;
   }
@@ -574,7 +654,9 @@ export class OpenaiService implements OnModuleInit {
     const policy = { ...metadata?.options, ...options };
     const session = policy.session;
     if (session && !(session instanceof DatabaseSession)) {
-      throw new Error('Saved runs require DatabaseSession so the session can be restored after a restart.');
+      throw new Error(
+        'Saved runs require DatabaseSession so the session can be restored after a restart.',
+      );
     }
     const row = await this.prisma.db.pausedRun.create({
       data: {
@@ -584,14 +666,22 @@ export class OpenaiService implements OnModuleInit {
         agentVersion: policy.agentVersion,
         ownerId: policy.ownerId,
         runOptions: {
-          ...(policy.websocket !== undefined && { websocket: policy.websocket }),
+          ...(policy.websocket !== undefined && {
+            websocket: policy.websocket,
+          }),
           ...(policy.maxTurns !== undefined && { maxTurns: policy.maxTurns }),
-          ...(typeof policy.outputGuardrailBlockedMessage === 'string' && { outputGuardrailBlockedMessage: policy.outputGuardrailBlockedMessage }),
+          ...(typeof policy.outputGuardrailBlockedMessage === 'string' && {
+            outputGuardrailBlockedMessage: policy.outputGuardrailBlockedMessage,
+          }),
           ...(session && { historyLimits: session.limits }),
         },
       },
     });
-    this.runMetadata.set(result.state, { options: policy, agentName: metadata?.agentName, saved: { id: row.id, version: row.version } });
+    this.runMetadata.set(result.state, {
+      options: policy,
+      agentName: metadata?.agentName,
+      saved: { id: row.id, version: row.version },
+    });
     return row.id;
   }
 
@@ -600,27 +690,51 @@ export class OpenaiService implements OnModuleInit {
     const row = await this.readRun(agent, id, access);
     if (row.status !== 'waiting') {
       if (row.status === 'completed') throw new Error(RUN_GONE);
-      throw new ConflictException('This run needs reconciliation before retry. Inspect external effects and call recoverRun.');
+      throw new ConflictException(
+        'This run needs reconciliation before retry. Inspect external effects and call recoverRun.',
+      );
     }
     const state = await RunState.fromString(agent, row.state);
-    const { historyLimits, ...policy } = storedOptionsSchema.parse(row.runOptions ?? {});
+    const { historyLimits, ...policy } = storedOptionsSchema.parse(
+      row.runOptions ?? {},
+    );
     this.runMetadata.set(state, {
       agentName: agent.name,
       saved: { id, version: row.version },
-      options: { ...policy, ...access, ...(row.chatId && { session: this.createSession(row.chatId, historyLimits) }) },
+      options: {
+        ...policy,
+        ...access,
+        ...(row.chatId && {
+          session: this.createSession(row.chatId, historyLimits),
+        }),
+      },
     });
     return state;
   }
 
   // An interrupted external action may have succeeded. Only the application can reconcile it.
-  async recoverRun(agent: AnyAgent, id: string, options: RunAccess & { note: string }) {
-    if (!options.note.trim()) throw new Error('A reconciliation note is required before retrying.');
+  async recoverRun(
+    agent: AnyAgent,
+    id: string,
+    options: RunAccess & { note: string },
+  ) {
+    if (!options.note.trim())
+      throw new Error('A reconciliation note is required before retrying.');
     return await this.prisma.withLock(`run:${id}`, async () => {
       const row = await this.readRun(agent, id, options);
       if (!['running', 'recovery_required', 'taken'].includes(row.status)) {
-        throw new ConflictException('Only an interrupted run can be recovered.');
+        throw new ConflictException(
+          'Only an interrupted run can be recovered.',
+        );
       }
-      await this.prisma.db.pausedRun.updateMany({ where: { id, version: row.version }, data: { status: 'waiting', version: { increment: 1 }, recoveryNote: options.note } });
+      await this.prisma.db.pausedRun.updateMany({
+        where: { id, version: row.version },
+        data: {
+          status: 'waiting',
+          version: { increment: 1 },
+          recoveryNote: options.note,
+        },
+      });
       return await this.loadRun(agent, id, options);
     });
   }
@@ -628,9 +742,15 @@ export class OpenaiService implements OnModuleInit {
   private async readRun(agent: AnyAgent, id: string, access: RunAccess) {
     if (!z.uuid().safeParse(id).success) throw new Error(RUN_GONE);
     const row = await this.prisma.db.pausedRun.findUnique({ where: { id } });
-    if (!row || (row.ownerId && row.ownerId !== access.ownerId)) throw new Error(RUN_GONE);
-    if ((row.agentName && row.agentName !== agent.name) || (row.agentVersion && row.agentVersion !== access.agentVersion)) {
-      throw new ConflictException('The saved agent or configuration version does not match.');
+    if (!row || (row.ownerId && row.ownerId !== access.ownerId))
+      throw new Error(RUN_GONE);
+    if (
+      (row.agentName && row.agentName !== agent.name) ||
+      (row.agentVersion && row.agentVersion !== access.agentVersion)
+    ) {
+      throw new ConflictException(
+        'The saved agent or configuration version does not match.',
+      );
     }
     return row;
   }
@@ -653,36 +773,83 @@ export class OpenaiService implements OnModuleInit {
     input: string | AgentInputItem[] | RunState<any, AnyAgent>,
     options?: RunAgentOptions<unknown> & { stream?: boolean },
   ) {
-    const metadata = typeof input === 'object' ? this.runMetadata.get(input) : undefined;
-    const policy = { ...metadata?.options, ...options };
+    const metadata =
+      typeof input === 'object' ? this.runMetadata.get(input) : undefined;
+    const policy = {
+      ...metadata?.options,
+      ...options,
+      stream: options?.stream ?? false,
+    };
     const saved = metadata?.saved;
     const session = policy.session;
-    if (saved && metadata?.options.session && session !== metadata.options.session) {
-      if (await session?.getSessionId() !== await metadata.options.session.getSessionId()) {
-        throw new ConflictException('A saved run must resume in its original chat.');
+    if (
+      saved &&
+      metadata?.options.session &&
+      session !== metadata.options.session
+    ) {
+      if (
+        (await session?.getSessionId()) !==
+        (await metadata.options.session.getSessionId())
+      ) {
+        throw new ConflictException(
+          'A saved run must resume in its original chat.',
+        );
       }
     }
     const runner = this.runner(policy.websocket);
     let deliver!: (result: StreamedRunResult<unknown, AnyAgent>) => void;
     let rejectDelivery!: (error: unknown) => void;
-    const ready = policy.stream ? new Promise<StreamedRunResult<unknown, AnyAgent>>((resolve, reject) => { deliver = resolve; rejectDelivery = reject; }) : undefined;
+    const ready = policy.stream
+      ? new Promise<StreamedRunResult<unknown, AnyAgent>>((resolve, reject) => {
+          deliver = resolve;
+          rejectDelivery = reject;
+        })
+      : undefined;
     let claimedVersion: number | undefined;
 
     const execute = async (lockSignal?: AbortSignal) => {
-      const signal = policy.signal && lockSignal ? AbortSignal.any([policy.signal, lockSignal]) : policy.signal ?? lockSignal;
+      const signal = AbortSignal.any([
+        this.shutdown.signal,
+        ...(policy.signal ? [policy.signal] : []),
+        ...(lockSignal ? [lockSignal] : []),
+      ]);
       signal?.throwIfAborted();
       if (!saved && session instanceof DatabaseSession) {
-        const pending = await this.prisma.db.pausedRun.findMany({ where: { chatId: session.chatId, status: { in: ['waiting', 'running', 'recovery_required', 'taken'] } }, take: 1 });
-        if (pending.length) throw new ConflictException('This chat has a pending approval or interrupted run. Resume or reconcile it first.');
+        const pending = await this.prisma.db.pausedRun.findMany({
+          where: {
+            chatId: session.chatId,
+            status: {
+              in: ['waiting', 'running', 'recovery_required', 'taken'],
+            },
+          },
+          take: 1,
+        });
+        if (pending.length)
+          throw new ConflictException(
+            'This chat has a pending approval or interrupted run. Resume or reconcile it first.',
+          );
       }
       if (saved) {
-        const claim = await this.prisma.db.pausedRun.updateMany({ where: { id: saved.id, version: saved.version, status: 'waiting' }, data: { status: 'running', state: (input as RunState<any, AnyAgent>).toString(), version: { increment: 1 } } });
-        if (claim.count !== 1) throw new ConflictException('This checkpoint is stale or already running. Reload the saved run.');
+        const claim = await this.prisma.db.pausedRun.updateMany({
+          where: { id: saved.id, version: saved.version, status: 'waiting' },
+          data: {
+            status: 'running',
+            state: (input as RunState<any, AnyAgent>).toString(),
+            version: { increment: 1 },
+          },
+        });
+        if (claim.count !== 1)
+          throw new ConflictException(
+            'This checkpoint is stale or already running. Reload the saved run.',
+          );
         claimedVersion = saved.version + 1;
       }
       try {
         const runOptions = {
-          context: policy.context, session, signal, maxTurns: policy.maxTurns,
+          context: policy.context,
+          session,
+          signal,
+          maxTurns: policy.maxTurns,
           outputGuardrailBlockedMessage: policy.outputGuardrailBlockedMessage,
           sandbox: policy.sandbox,
         };
@@ -698,12 +865,36 @@ export class OpenaiService implements OnModuleInit {
         }
         signal?.throwIfAborted();
         if (result.state) {
-          this.runMetadata.set(result.state, { options: policy, agentName: agent.name });
+          this.runMetadata.set(result.state, {
+            options: policy,
+            agentName: agent.name,
+          });
           if (saved) {
-            const persisted = await this.prisma.db.pausedRun.updateMany({ where: { id: saved.id, version: claimedVersion, status: 'running' }, data: { state: result.state.toString(), status: result.interruptions.length ? 'waiting' : 'completed', version: { increment: 1 } } });
-            if (persisted.count !== 1) throw new ConflictException('The run checkpoint changed before completion.');
-            this.runMetadata.set(result.state, { options: policy, agentName: agent.name, saved: { id: saved.id, version: claimedVersion! + 1 } });
-          } else if (session instanceof DatabaseSession && result.interruptions.length) {
+            const persisted = await this.prisma.db.pausedRun.updateMany({
+              where: {
+                id: saved.id,
+                version: claimedVersion,
+                status: 'running',
+              },
+              data: {
+                state: result.state.toString(),
+                status: result.interruptions.length ? 'waiting' : 'completed',
+                version: { increment: 1 },
+              },
+            });
+            if (persisted.count !== 1)
+              throw new ConflictException(
+                'The run checkpoint changed before completion.',
+              );
+            this.runMetadata.set(result.state, {
+              options: policy,
+              agentName: agent.name,
+              saved: { id: saved.id, version: claimedVersion! + 1 },
+            });
+          } else if (
+            session instanceof DatabaseSession &&
+            result.interruptions.length
+          ) {
             await this.saveRun(result, policy);
           }
         }
@@ -711,38 +902,55 @@ export class OpenaiService implements OnModuleInit {
       } catch (error) {
         if (saved && claimedVersion !== undefined) {
           // Keep the last known checkpoint; never replay an uncertain side effect automatically.
-          await this.prisma.db.pausedRun.updateMany({ where: { id: saved.id, version: claimedVersion, status: 'running' }, data: { status: 'recovery_required' } }).catch(() => {});
+          await this.prisma.db.pausedRun
+            .updateMany({
+              where: {
+                id: saved.id,
+                version: claimedVersion,
+                status: 'running',
+              },
+              data: { status: 'recovery_required' },
+            })
+            .catch(() => {});
           // If the database is down, the durable 'running' marker also requires reconciliation.
         }
         throw error;
       }
     };
-    const withSession = async (outerSignal?: AbortSignal) => session instanceof DatabaseSession
-      ? await this.prisma.withLock(`chat:${session.chatId}`, (signal) => execute(outerSignal ? AbortSignal.any([outerSignal, signal]) : signal))
-      : await execute(outerSignal);
-    const lifecycle = saved
-      ? this.prisma.withLock(`run:${saved.id}`, withSession)
-      : withSession();
+    const locks = [
+      ...(saved ? [`run:${saved.id}`] : []),
+      ...(session instanceof DatabaseSession ? [`chat:${session.chatId}`] : []),
+    ];
+    const lifecycle = locks.length
+      ? this.prisma.withLock(locks, execute)
+      : execute();
     if (!ready) return await lifecycle;
     const completion = lifecycle.then(() => {});
     completion.catch(rejectDelivery);
     const streamed = await ready;
-    Object.defineProperty(streamed, 'completed', { value: completion, configurable: true });
+    Object.defineProperty(streamed, 'completed', {
+      value: completion,
+      configurable: true,
+    });
     return streamed;
   }
 
   // The socket runner, the shared runner from createRunner, or the SDK's plain default.
   private runner(websocket?: boolean) {
     if (websocket) return this.webSocketRunner();
-    this.sharedRunner ??= new Runner();
+    this.sharedRunner ??= new Runner({ traceIncludeSensitiveData: false });
     return this.sharedRunner;
   }
 
   // Built once and reused, so later runs share the same socket provider.
   private webSocketRunner() {
-    this.socketRunner ??= new Runner({
+    if (this.socketRunner) return this.socketRunner;
+    const provider = new OpenAIProvider({ useResponsesWebSocket: true });
+    this.socketProviders.add(provider);
+    this.socketRunner = new Runner({
       ...(this.runnerModel && { model: this.runnerModel }),
-      modelProvider: new OpenAIProvider({ useResponsesWebSocket: true }),
+      traceIncludeSensitiveData: false,
+      modelProvider: provider,
     });
     return this.socketRunner;
   }
@@ -756,11 +964,16 @@ export class OpenaiService implements OnModuleInit {
 function historyDigest(value: unknown): string {
   const normalize = (entry: unknown): unknown => {
     if (Array.isArray(entry)) return entry.map(normalize);
-    if (entry && typeof entry === 'object') return Object.fromEntries(
-      Object.entries(entry).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => [key, normalize(child)]),
-    );
+    if (entry && typeof entry === 'object')
+      return Object.fromEntries(
+        Object.entries(entry)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([key, child]) => [key, normalize(child)]),
+      );
     return entry;
   };
-  const canonical = JSON.stringify(normalize(JSON.parse(JSON.stringify(value))));
+  const canonical = JSON.stringify(
+    normalize(JSON.parse(JSON.stringify(value))),
+  );
   return createHash('sha256').update(canonical).digest('hex');
 }

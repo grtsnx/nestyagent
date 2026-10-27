@@ -7,10 +7,11 @@ import {
   readdir,
   realpath,
   rm,
+  stat,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { dir, gitRepo } from '@openai/agents/sandbox';
 import { UnixLocalSandboxClient } from '@openai/agents/sandbox/local';
@@ -313,6 +314,9 @@ setTimeout(() => {
       expect(manifest.extraPathGrants).toEqual([]);
       if (entry.type !== 'local_dir')
         throw new Error('Expected prepared directory');
+      const preparationRoot = join(await realpath(process.cwd()), '.msagents');
+      expect(dirname(dirname(entry.src))).toBe(preparationRoot);
+      expect((await stat(preparationRoot)).mode & 0o777).toBe(0o700);
       expect(await readFile(join(entry.src, 'README.md'), 'utf8')).toBe(
         'fixture repository\n',
       );
