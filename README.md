@@ -23,16 +23,16 @@ Swagger UI runs at `http://localhost:3000/api`, and Scalar runs at `http://local
 
 The application validates configuration before it starts. Invalid ports, booleans, and CORS origins stop startup.
 
-| Variable                  | Default               | Purpose                                                                     |
-| ------------------------- | --------------------- | --------------------------------------------------------------------------- |
-| `NODE_ENV`                | `development`         | Selects development, test, or production behavior.                          |
-| `PORT`                    | `3000`                | Sets the HTTP port.                                                         |
-| `PLATFORM_NAME`           | `Agentic`             | Names the API and OpenAPI document.                                         |
-| `CORS_ORIGINS`            | empty                 | Lists exact, comma-separated browser origins. Empty disables CORS.          |
-| `SWAGGER_ENABLED`         | on outside production | Enables Swagger, Scalar, and OpenAPI JSON. Set it explicitly in production. |
-| `OBSERVE_ENABLED`         | `false`               | Enables NestJS Observe when valid credentials are present.                  |
-| `OPENAI_API_KEY`          | empty                 | Authenticates every OpenAI agent. Blank leaves the shared key unset.        |
-| `ACCOUNT_PASSWORD`        | empty                 | Login secret for every workspace. Blank starts a workspace without one.     |
+| Variable                  | Default               | Purpose                                                                              |
+| ------------------------- | --------------------- | ------------------------------------------------------------------------------------ |
+| `NODE_ENV`                | `development`         | Selects development, test, or production behavior.                                   |
+| `PORT`                    | `3000`                | Sets the HTTP port.                                                                  |
+| `PLATFORM_NAME`           | `Agentic`             | Names the API and OpenAPI document.                                                  |
+| `CORS_ORIGINS`            | empty                 | Lists exact, comma-separated browser origins. Empty disables CORS.                   |
+| `SWAGGER_ENABLED`         | on outside production | Enables Swagger, Scalar, and OpenAPI JSON. Set it explicitly in production.          |
+| `OBSERVE_ENABLED`         | `false`               | Enables NestJS Observe when valid credentials are present.                           |
+| `OPENAI_API_KEY`          | empty                 | Authenticates every OpenAI agent. Blank leaves the shared key unset.                 |
+| `ACCOUNT_PASSWORD`        | empty                 | Login secret for every workspace. Blank starts a workspace without one.              |
 | `OPENAI_EXECUTOR_API_KEY` | empty                 | Codex environment key from the platform Agents tab. Blank leaves the executor unset. |
 
 Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS origins without paths.
@@ -287,6 +287,8 @@ Every sandbox agent starts with three capabilities:
 
 `skills` and `memory` are optional. Pass `skills` when the agent should load a skill folder or repo. Pass `memory: true` when a later run should read lessons from earlier workspace work.
 
+The samples below cover these jobs: an empty computer, a website, notes, a cloned starter, files from this Mac, sandbox accounts, a login secret, GitHub, GitLab, Bitbucket, GitBucket, Google Drive, S3, GCS, R2, Azure, and Box, a preview, the same chat, save and resume, Docker, a hosted client, a one-off run, a handoff, a sandbox tool, skills, memory, and a self-hosted executor on this Mac or another machine.
+
 ### Create a sandbox agent
 
 ```typescript
@@ -299,7 +301,7 @@ const agent = this.sandbox.createSandboxAgent(
 
 ### Create a manifest
 
-`createManifest` builds the starting contents of a workspace. Call it with no argument for an empty computer. Pass `files` for text files, `localFiles` or `localDirs` to copy from this Mac, `repo` or a `github` mount for a GitHub boilerplate, `outputDirs` for empty folders, `mounts` for cloud storage or Google Drive, and `environment` for startup values. Give the result to `openSandbox`.
+`createManifest` builds the starting contents of a workspace. Call it with no argument for an empty computer. Pass `files` for text files, `localFiles` or `localDirs` to copy from this Mac, `repo` or a git host mount for a boilerplate, `outputDirs` for empty folders, `mounts` for cloud storage or Google Drive, `users` and `groups` for sandbox accounts, and `environment` for startup values. Give the result to `openSandbox`.
 
 An empty computer, for browsing:
 
@@ -361,6 +363,23 @@ const workspace = await this.sandbox.openSandbox(
 );
 ```
 
+Copy a folder from this Mac, and give the workspace its own account:
+
+```typescript
+const workspace = await this.sandbox.openSandbox(
+  createManifest({
+    localDirs: { notes: '/Users/me/notes' },
+    localFiles: { 'brief.md': '/Users/me/brief.md' },
+    outputDirs: ['output'],
+    users: ['agent'],
+    groups: [{ name: 'editors', users: ['agent'] }],
+    environment: { SITE_URL: 'https://bakery.example' },
+  }),
+);
+```
+
+`environment` holds ordinary startup values. `openSandbox` still adds `ACCOUNT_PASSWORD` when this app has one. Pass `entries` only when you already have an SDK entry the helpers above do not build.
+
 ### Open a workspace and run
 
 `openSandbox` starts the computer. Pass the same workspace on the next run to keep the same files and browser. `chat` is optional and comes from `this.openai.createSession()`.
@@ -393,6 +412,85 @@ await this.sandbox.runSandbox(
 await this.sandbox.runSandbox('Reply that I will call tomorrow.', agent, {
   chat,
   workspace,
+});
+```
+
+Open that first workspace with `snapshotDir` when the snapshot should live on disk:
+
+```typescript
+const workspace = await this.sandbox.openSandbox(createManifest(), {
+  snapshotDir: '/tmp/sandbox-snapshots',
+});
+```
+
+Lessons in `memories/` stay only while this workspace stays open, you resume it, or you start the next workspace from its snapshot. `closeSandbox` writes those lessons and then the live computer stops.
+
+```typescript
+const saved = await this.sandbox.saveSandbox(workspace);
+await this.sandbox.closeSandbox(workspace);
+
+const resumed = await this.sandbox.resumeSandbox(saved, {
+  snapshotDir: '/tmp/sandbox-snapshots',
+});
+
+const dockerResume = await this.sandbox.resumeSandbox(saved, {
+  computer: 'docker',
+  snapshotDir: '/tmp/sandbox-snapshots',
+});
+
+const report = await this.sandbox.readWorkspaceFile(
+  resumed,
+  'output/report.md',
+);
+```
+
+A one-off question can skip the saved workspace. The SDK deletes the computer when the run ends.
+
+```typescript
+const result = await this.sandbox.runSandboxOnce(
+  'Summarize the notes.',
+  agent,
+  { manifest: createManifest({ files: { 'notes.md': '# Notes' } }) },
+);
+```
+
+Leave the manifest on the agent when every one-off run should start from the same files:
+
+```typescript
+const notesAgent = this.sandbox.createSandboxAgent(
+  'Notes agent',
+  'Summarize the notes in the workspace.',
+  { manifest: createManifest({ files: { 'notes.md': '# Notes' } }) },
+);
+
+await this.sandbox.runSandboxOnce('Summarize the notes.', notesAgent);
+```
+
+A normal agent can call the sandbox agent as a tool. Pass `workspace` to keep the same files.
+
+```typescript
+const sandboxAgent = this.sandbox.createSandboxAgent(
+  'Workspace agent',
+  'Use the computer for files and commands.',
+  { handoffDescription: 'Use for files, commands, and the workspace.' },
+);
+
+const intake = this.openai.createTriageAgent(
+  'Intake',
+  'Hand workspace work to the sandbox agent.',
+  [sandboxAgent],
+  'Receives a request and routes it.',
+);
+
+const workspaceTool = this.sandbox.asTool(sandboxAgent, {
+  toolName: 'workspace',
+  toolDescription: 'Do the file and command work.',
+  workspace,
+});
+
+const freshWorkspaceTool = this.sandbox.asTool(sandboxAgent, {
+  toolName: 'fresh_workspace',
+  toolDescription: 'Do the work in a new Unix workspace.',
 });
 ```
 
@@ -442,6 +540,15 @@ const agent = this.sandbox.createSandboxAgent(
 ```
 
 A skills.sh page is a catalog. The SDK does not fetch skills.sh or install an npm package. Copy the GitHub link that page shows and pass it to `gitRepo`. If the skill files sit in a subfolder, set `subpath`.
+
+```typescript
+skills: {
+  from: gitRepo({
+    repo: 'https://github.com/owner/agent-skills',
+    subpath: 'skills',
+  }),
+},
+```
 
 Load one skill from that repo only when the agent asks for it:
 
@@ -513,6 +620,39 @@ const agent = this.sandbox.createSandboxAgent(
 );
 ```
 
+Write new lessons without reading old ones:
+
+```typescript
+const agent = this.sandbox.createSandboxAgent(
+  'Workspace agent',
+  'Store what this run learns. Ignore older notes.',
+  {
+    model: 'gpt-6-astra',
+    memory: { read: false, generate: true },
+  },
+);
+```
+
+Two agents in one workspace keep separate lessons:
+
+```typescript
+const reviewer = this.sandbox.createSandboxAgent(
+  'Reviewer',
+  'Review the site and keep your own notes.',
+  {
+    memory: { layout: { directory: 'memories/reviewer' } },
+  },
+);
+
+const editor = this.sandbox.createSandboxAgent(
+  'Editor',
+  'Edit the site and keep your own notes.',
+  {
+    memory: { layout: { directory: 'memories/editor' } },
+  },
+);
+```
+
 ### Account password
 
 The SDK does not ask a person for a password and does not fetch one. This NestJS app supplies one secret, and `openSandbox` copies it into the computer. The app is the process started with `bun run start:dev`. It is not OpenAI, and it is not the website the agent logs into.
@@ -554,17 +694,69 @@ const workspace = await this.sandbox.openSandbox(
       notes: {
         provider: 'google-drive',
         remote: 'gdrive:client-notes',
+        configFile: '/Users/me/.config/rclone/rclone.conf',
+      },
+      starter: {
+        provider: 'github',
+        url: 'https://gitbucket.example.com/owner/starter/tree/main',
       },
     },
   }),
 );
 ```
 
-`s3`, `gcs`, `r2`, `azure`, and `box` use the same `mounts` field with their own `provider`.
+Cloud storage uses the same `mounts` field. Credentials stay on the mount, not in the prompt.
+
+```typescript
+const workspace = await this.sandbox.openSandbox(
+  createManifest({
+    mounts: {
+      room: {
+        provider: 's3',
+        bucket: 'account-files',
+        region: 'us-east-1',
+        prefix: 'northwind/',
+        accessKeyId: process.env.S3_ACCESS_KEY_ID,
+        secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+      },
+      archive: {
+        provider: 'gcs',
+        bucket: 'account-archive',
+        serviceAccountFile: '/Users/me/gcs.json',
+      },
+      assets: {
+        provider: 'r2',
+        bucket: 'assets',
+        accountId: 'account-id',
+        accessKeyId: process.env.R2_ACCESS_KEY_ID,
+        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+      },
+      exports: {
+        provider: 'azure',
+        container: 'exports',
+        accountName: 'account',
+        accountKey: process.env.AZURE_ACCOUNT_KEY,
+      },
+      contracts: {
+        provider: 'box',
+        accessToken: process.env.BOX_ACCESS_TOKEN,
+      },
+    },
+  }),
+);
+```
 
 ### Choose the computer
 
 Unix is the default. Docker uses `node:latest`, so a new Node release arrives with the image and this file stays as it is. Pass `image` when a workspace needs a fixed tag.
+
+Modal, Vercel, Cloudflare, E2B, Daytona, and Blaxel are separate packages. Install the one you need and pass its client. The agent, the manifest, and the capabilities stay the same.
+
+```typescript
+const workspace = await this.sandbox.openSandbox(createManifest(), {
+  client: modalClient,
+});
+```
 
 ```typescript
 const workspace = await this.sandbox.openSandbox(createManifest(), {
@@ -602,6 +794,10 @@ Install `@openai/codex@alpha` inside the environment, and allow outbound traffic
 ```typescript
 const session = await this.sandbox.createHostedSession(
   'Write clean code and verify that it works.',
+  {
+    workspaceDirectory: '/workspace',
+    capabilityDirectories: ['/opt/skills'],
+  },
 );
 
 const executor = this.sandbox.startHostedExecutor(session);
@@ -612,7 +808,28 @@ const answer = await this.sandbox.sendToHostedSession(
 );
 ```
 
-Store `session.sessionId` with the chat. One session needs its own executor. On another machine, run `hostedExecutorCommand(session)` there instead of `startHostedExecutor`. Use `remoteUrl` unchanged when the executor reconnects.
+On another machine, take the command and run it there after that machine is up:
+
+```typescript
+const command = this.sandbox.hostedExecutorCommand(session);
+```
+
+When OpenAI posts `agent.session.created` for a self-hosted session, this starts the executor on this Mac:
+
+```typescript
+this.sandbox.onHostedSessionCreated({
+  type: 'agent.session.created',
+  data: {
+    environment_type: 'self_hosted',
+    environment_id: session.environmentId,
+    connect: { remote_url: session.remoteUrl },
+  },
+});
+```
+
+Store `session.sessionId` with the chat. One session needs its own executor. Use `remoteUrl` unchanged when the executor reconnects.
+
+On this Mac, `startHostedExecutor` runs the executor. On Lambda, Databricks, DigitalOcean, OCI, or another host, that machine runs `hostedExecutorCommand(session)` after it is up. When OpenAI posts `agent.session.created` for a self-hosted session, pass the event to `onHostedSessionCreated` to start the executor on this Mac. A webhook that creates or deletes a remote machine belongs to that provider.
 
 </details>
 
@@ -677,7 +894,7 @@ The workflow delivers a portable image. Each hosting platform can deploy that im
 
 ## Reliability and state
 
-The service is stateless. It does not pretend that memory or a container filesystem is durable. Add workflow and idempotency modules only with a shared production store and tested transaction boundaries. Until then, replicas can start, stop, and roll back without losing application-owned state because the application owns none.
+The HTTP API owns no durable state. A sandbox workspace lasts only while it stays open, until you save and resume it, or until a new workspace starts from its snapshot. Add workflow and idempotency modules only with a shared production store and tested transaction boundaries. Until then, replicas can start, stop, and roll back without losing application-owned state because the application owns none.
 
 The application enables graceful NestJS shutdown hooks. Its global exception filter also handles exceptions thrown by middleware, assigns a safe request ID, logs unexpected server errors, and keeps internal error details out of client responses.
 

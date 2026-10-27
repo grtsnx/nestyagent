@@ -47,6 +47,18 @@ describe('createManifest', () => {
     });
   });
 
+  it('keeps sandbox users and groups', () => {
+    const manifest = createManifest({
+      users: ['agent'],
+      groups: [{ name: 'editors', users: ['agent'] }],
+    });
+
+    expect(manifest.users).toEqual([{ name: 'agent' }]);
+    expect(manifest.groups).toEqual([
+      { name: 'editors', users: [{ name: 'agent' }] },
+    ]);
+  });
+
   it('rejects a workspace path that leaves the computer', () => {
     expect(() => createManifest({ files: { '../secret.md': 'nope' } })).toThrow(
       /inside the workspace/,

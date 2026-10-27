@@ -9,11 +9,13 @@ import {
   localDir,
   localFile,
   Manifest,
-  mount,
   ManifestEntries,
   ManifestEnvironment,
+  mount,
   r2Mount,
   s3Mount,
+  SandboxGroupInit,
+  SandboxUserInit,
 } from '@openai/agents/sandbox';
 
 type RepoLink = {
@@ -81,12 +83,14 @@ type CreateManifestOptions = {
   entries?: ManifestEntries;
   environment?: ManifestEnvironment;
   repo?: string | RepoLink;
+  users?: SandboxUserInit[];
+  groups?: SandboxGroupInit[];
 };
 
 // Build the starting contents of a workspace. Call it with no argument for an empty computer.
 // files are text. localFiles and localDirs are copied from this Mac. repo clones a GitHub link.
 // outputDirs are empty folders. mounts attach storage, including a Git host or Google Drive.
-// entries and environment are optional.
+// entries and environment are optional. users and groups are sandbox accounts.
 export function createManifest(options?: CreateManifestOptions) {
   const files = Object.fromEntries(
     Object.entries(options?.files ?? {}).map(([path, content]) => [
@@ -127,6 +131,8 @@ export function createManifest(options?: CreateManifestOptions) {
       ...options?.entries,
     },
     ...(options?.environment && { environment: options.environment }),
+    ...(options?.users && { users: options.users }),
+    ...(options?.groups && { groups: options.groups }),
   });
 }
 

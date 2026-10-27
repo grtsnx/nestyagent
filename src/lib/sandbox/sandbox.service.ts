@@ -9,6 +9,7 @@ import {
   Manifest,
   MemoryArgs,
   SandboxAgent,
+  SandboxSession,
   SkillsArgs,
   memory,
   skills,
@@ -27,6 +28,18 @@ type OpenSandboxOptions = {
   snapshotDir?: string;
   computer?: SandboxComputer;
   image?: string;
+  client?: WorkspaceClient;
+};
+
+type WorkspaceClient = {
+  create: (args: { manifest: Manifest }) => Promise<SandboxSession>;
+  resume?: (state: SandboxSession['state']) => Promise<SandboxSession>;
+  serializeSessionState?: (
+    state: SandboxSession['state'],
+  ) => Promise<Record<string, unknown>>;
+  deserializeSessionState?: (
+    state: Record<string, unknown>,
+  ) => Promise<SandboxSession['state']>;
 };
 
 type CreateSandboxAgentOptions = {
@@ -37,7 +50,7 @@ type CreateSandboxAgentOptions = {
   handoffDescription?: string;
 };
 
-export type SandboxWorkspace = UnixLocalSandboxSession | DockerSandboxSession;
+export type SandboxWorkspace = SandboxSession;
 
 type HostedSessionOptions = {
   model?: string;
@@ -95,8 +108,9 @@ export class SandboxService {
   }
 
   //1. Open a workspace. Unix is the default computer. Pass computer: 'docker' for a container.
-  //2. ports are the preview ports the agent may use. snapshotDir is where file snapshots are stored.
-  //3. ACCOUNT_PASSWORD is added only when this app has one, and it is ephemeral.
+  //2. Pass client for a hosted computer such as Modal, Vercel, Cloudflare, E2B, Daytona, or Blaxel.
+  //3. ports are preview ports. snapshotDir is where file snapshots are stored.
+  //4. ACCOUNT_PASSWORD is added only when this app has one, and it is ephemeral.
   async openSandbox(manifest = new Manifest(), options?: OpenSandboxOptions) {
     const password = this.configService.get<string>('ACCOUNT_PASSWORD');
     const nextManifest = new Manifest({
@@ -107,9 +121,14 @@ export class SandboxService {
           ACCOUNT_PASSWORD: { value: password, ephemeral: true },
         }),
       },
+      users: manifest.users,
+      groups: manifest.groups,
     });
-    const clientOptions = this.clientOptions(options);
 
+    if (options?.client)
+      return await options.client.create({ manifest: nextManifest });
+
+    const clientOptions = this.clientOptions(options);
     if (options?.computer === 'docker') {
       return await new DockerSandboxClient({
         image: options.image ?? DOCKER_IMAGE,
@@ -124,11 +143,25 @@ export class SandboxService {
 
   // Close the workspace. Memory writes its lessons during this close.
   async closeSandbox(workspace: SandboxWorkspace) {
+    if (!workspace.close) throw new Error('This workspace cannot be closed.');
     await workspace.close();
+  }
+
+  // Copy one workspace file back into this app.
+  async readWorkspaceFile(workspace: SandboxWorkspace, path: string) {
+    if (!workspace.readFile)
+      throw new Error('This workspace cannot read files.');
+    const payload = await workspace.readFile({ path });
+    return typeof payload === 'string'
+      ? payload
+      : new TextDecoder().decode(payload);
   }
 
   // The agent starts the server. This returns the URL for a port opened with the workspace.
   async previewUrl(workspace: SandboxWorkspace, port: number) {
+    if (!workspace.resolveExposedPort) {
+      throw new Error('This workspace does not expose ports.');
+    }
     const endpoint = await workspace.resolveExposedPort(port);
     if (endpoint.url) return endpoint.url;
     const scheme = endpoint.tls ? 'https' : 'http';
@@ -136,22 +169,29 @@ export class SandboxService {
   }
 
   // Save the live session so a later process can resume the same files.
-  async saveSandbox(workspace: SandboxWorkspace) {
+  async saveSandbox(workspace: SandboxWorkspace, client?: WorkspaceClient) {
+    if (client?.serializeSessionState) {
+      return await client.serializeSessionState(workspace.state);
+    }
     if (this.isDocker(workspace)) {
       return await new DockerSandboxClient().serializeSessionState(
-        workspace.state,
+        workspace.state as DockerSandboxSession['state'],
       );
     }
     return await new UnixLocalSandboxClient().serializeSessionState(
-      workspace.state,
+      workspace.state as UnixLocalSandboxSession['state'],
     );
   }
 
-  // Resume a saved session. Pass the same computer and snapshotDir used to open it.
+  // Resume a saved session. Pass the same computer, client, and snapshotDir used to open it.
   async resumeSandbox(
     saved: Record<string, unknown>,
     options?: OpenSandboxOptions,
   ) {
+    if (options?.client?.resume && options.client.deserializeSessionState) {
+      const state = await options.client.deserializeSessionState(saved);
+      return await options.client.resume(state);
+    }
     if (options?.computer === 'docker') {
       const client = new DockerSandboxClient({
         image: options.image ?? DOCKER_IMAGE,
@@ -320,6 +360,29 @@ export class SandboxService {
     events.withResultCollection();
     const result = await events.finalResult();
     return result.output_text;
+  }
+
+  // A self-hosted session event for this Mac. Another machine runs hostedExecutorCommand instead.
+  onHostedSessionCreated(event: {
+    type: string;
+    data?: {
+      environment_type?: string;
+      environment_id?: string;
+      connect?: { remote_url?: string };
+    };
+  }) {
+    if (event.type !== 'agent.session.created') return;
+    if (event.data?.environment_type !== 'self_hosted') return;
+
+    const environmentId = event.data.environment_id;
+    const remoteUrl = event.data.connect?.remote_url;
+    if (!environmentId || !remoteUrl) {
+      throw new Error(
+        'Self-hosted session event is missing the executor address.',
+      );
+    }
+
+    return this.startHostedExecutor({ environmentId, remoteUrl });
   }
 
   private openai() {
