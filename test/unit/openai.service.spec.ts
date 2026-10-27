@@ -10,7 +10,8 @@ import {
   ToolInputGuardrailTripwireTriggered,
   ToolOutputGuardrailTripwireTriggered,
 } from '@openai/agents';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { z } from 'zod';
 import { OpenaiService } from '@/lib/openai/openai.service.js';
 import { SandboxService } from '@/lib/sandbox/sandbox.service.js';
 
@@ -76,6 +77,28 @@ describe('OpenaiService orchestration', () => {
 
     expect(triage.handoffs).toHaveLength(2);
     expect(getHandoff(triage.handoffs[1]).toolName).toBe('refund_request');
+  });
+
+  it('types runs from created agents, with and without stream', () => {
+    const openai = service();
+    const writer = openai.createAgent('Writer', 'Write.');
+    const extractor = openai.createAgent('Extractor', 'Extract.', {
+      schema: z.object({ name: z.string() }),
+    });
+    // The typecheck verifies expectTypeOf. These runs are only typed, never started.
+    const plain = () => openai.runAgent('Hi.', writer);
+    const typed = () => openai.runAgent('Hi.', extractor);
+    const streamed = () => openai.runAgent('Hi.', writer, { stream: true });
+
+    expectTypeOf<
+      Awaited<ReturnType<typeof plain>>['finalOutput']
+    >().toEqualTypeOf<string | undefined>();
+    expectTypeOf<
+      Awaited<ReturnType<typeof typed>>['finalOutput']
+    >().toEqualTypeOf<{ name: string } | undefined>();
+    expectTypeOf<Awaited<ReturnType<typeof streamed>>>().toHaveProperty(
+      'completed',
+    );
   });
 
   it('leaves guardrails off until the caller passes them', () => {
@@ -144,6 +167,16 @@ describe('OpenaiService orchestration', () => {
     await expect(
       asks(openai.asTool(summarizer, { needsApproval: true })),
     ).resolves.toBe(true);
+
+    const refunds = openai.asTool(summarizer, {
+      needsApproval: async (_context, { input }) => input.includes('refund'),
+    });
+    const decide = refunds.needsApproval as (
+      context: unknown,
+      input: { input: string },
+    ) => Promise<boolean>;
+    await expect(decide({}, { input: 'refund order 1' })).resolves.toBe(true);
+    await expect(decide({}, { input: 'track order 1' })).resolves.toBe(false);
   });
 
   it('approves or rejects only the pauses the caller chooses', () => {
@@ -215,14 +248,13 @@ describe('OpenaiService orchestration', () => {
 
   it('builds an agent check, tool results, and names the blocking check', () => {
     const openai = service();
-    const checker = new Agent({
-      name: 'Homework check',
-      instructions: 'Check.',
+    const checker = openai.createAgent('Homework check', 'Check.', {
+      schema: z.object({ isMathHomework: z.boolean() }),
     });
     const guardrail = openai.agentInputGuardrail(
       'Math homework',
       checker,
-      (output) => output === true,
+      (output) => output?.isMathHomework === true,
       { runInParallel: false },
     );
 

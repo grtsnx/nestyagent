@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
-import { InputGuardrail, OutputGuardrail, run, Session } from '@openai/agents';
+import { run, Session } from '@openai/agents';
 import OpenAI, { APIError } from 'openai';
 import {
   Capabilities,
@@ -26,7 +26,11 @@ import {
   type Environment,
   type RemoteMachineProvider,
 } from '@/config/index.js';
-import { OpenaiService } from '../openai/openai.service.js';
+import {
+  guardrailConfig,
+  OpenaiService,
+  type AgentGuardrails,
+} from '../openai/openai.service.js';
 
 type SandboxComputer =
   | 'unix'
@@ -50,14 +54,12 @@ type OpenSandboxOptions = {
 
 type FreshSandboxOptions = OpenSandboxOptions & { manifest?: Manifest };
 
-type CreateSandboxAgentOptions = {
+type CreateSandboxAgentOptions = AgentGuardrails & {
   model?: string;
   manifest?: Manifest;
   skills?: SkillsArgs;
   memory?: boolean | MemoryArgs;
   handoffDescription?: string;
-  inputGuardrails?: InputGuardrail[];
-  outputGuardrails?: OutputGuardrail[];
 };
 
 export type SandboxWorkspace = SandboxSession;
@@ -152,12 +154,7 @@ export class SandboxService {
       ...(options?.handoffDescription && {
         handoffDescription: options.handoffDescription,
       }),
-      ...(options?.inputGuardrails && {
-        inputGuardrails: options.inputGuardrails,
-      }),
-      ...(options?.outputGuardrails && {
-        outputGuardrails: options.outputGuardrails,
-      }),
+      ...guardrailConfig(options),
     });
   }
 

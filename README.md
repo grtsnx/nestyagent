@@ -94,6 +94,8 @@ const calendarExtractor = this.openai.createAgent(
 );
 ```
 
+`runAgent` then types `result.finalOutput` with that schema. An agent without a schema returns text.
+
 ### Add a handoff description
 
 `handoffDescription` is optional on a normal agent.
@@ -389,6 +391,8 @@ const triage = this.openai.createTriageAgent(
 );
 ```
 
+`support` keeps its check for runs that start at `support`. When `triage` goes first, only the triage check runs.
+
 The same check with no third argument runs alongside the agent:
 
 ```typescript
@@ -422,7 +426,7 @@ try {
 
 ### Check with another agent
 
-`agentInputGuardrail` is optional. The check is an agent with its own instructions and schema. `tripwire` is required and returns true when that output should stop the request. `runInParallel` stays optional.
+`agentInputGuardrail` is optional. The check is an agent with its own instructions and schema. `tripwire` is required and returns true when that output should stop the request. It receives the check agent's output with its schema type. `runInParallel` stays optional.
 
 ```typescript
 import { z } from 'zod';
@@ -441,11 +445,7 @@ const homeworkCheck = this.openai.createAgent(
 const mathGuard = this.openai.agentInputGuardrail(
   'Math homework',
   homeworkCheck,
-  (output) =>
-    typeof output === 'object' &&
-    output !== null &&
-    'isMathHomework' in output &&
-    output.isMathHomework === true,
+  (output) => output?.isMathHomework === true,
   { runInParallel: false },
 );
 
@@ -521,6 +521,15 @@ const summarizeText = this.openai.asTool(summarizer, {
   needsApproval: true,
 });
 
+const refundHelp = this.openai.asTool(refundAgent, {
+  toolName: 'refund_help',
+  needsApproval: async (_context, { input }) => input.includes('refund'),
+});
+```
+
+A `tool()` takes the same function with its own parameters:
+
+```typescript
 const largeOrder = tool({
   name: 'cancel_order',
   description: 'Cancel a customer order.',
@@ -554,7 +563,7 @@ if (result.interruptions?.length) {
 }
 ```
 
-A streamed run uses the same pause. Wait until `completed` settles, then approve and resume.
+A streamed run uses the same pause. `stream: true` returns a streamed result, and leaving it out returns a normal one. Wait until `completed` settles, then approve and resume.
 
 ```typescript
 const streamed = await this.openai.runAgent('Cancel order 123.', support, {

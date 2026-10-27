@@ -13,52 +13,64 @@ import {
   ModelSettings,
   OpenAIProvider,
   OutputGuardrail,
+  OutputGuardrailBlockedMessageFormatter,
   OutputGuardrailTripwireTriggered,
-  run,
   Runner,
+  RunResult,
   RunState,
   RunToolApprovalItem,
   Session,
   setDefaultOpenAIKey,
+  StreamedRunResult,
+  TextOutput,
   Tool,
   ToolGuardrailFunctionOutputFactory,
   ToolInputGuardrailTripwireTriggered,
   ToolOutputGuardrailTripwireTriggered,
 } from '@openai/agents';
 
-type BlockedToolMessage =
-  | string
-  | ((args: {
-      defaultMessage: string;
-      guardrailName: string;
-    }) => Promise<string | undefined> | string | undefined);
+// Any agent, whatever its context or output type.
+type AnyAgent = Agent<any, any>;
 
-type RunAgentOptions<TContext> = {
+// A schema agent returns that schema's type. Without a schema the agent returns text.
+type OutputOf<TSchema> = TSchema extends z.ZodObject ? TSchema : TextOutput;
+
+export type AgentGuardrails = {
+  inputGuardrails?: InputGuardrail[];
+  outputGuardrails?: OutputGuardrail<AgentOutputType>[];
+};
+
+type ResumeOptions = {
+  websocket?: boolean;
+  outputGuardrailBlockedMessage?:
+    string | OutputGuardrailBlockedMessageFormatter;
+};
+
+type RunAgentOptions<TContext> = ResumeOptions & {
   context?: TContext;
   session?: Session;
-  websocket?: boolean;
-  stream?: boolean;
-  outputGuardrailBlockedMessage?: BlockedToolMessage;
 };
+
+type Streamed = { stream: true };
+type NotStreamed = { stream?: false };
 
 type AsToolOptions = Pick<
   NonNullable<Parameters<Agent['asTool']>[0]>,
   'toolName' | 'toolDescription' | 'needsApproval' | 'runConfig'
 >;
 
-type CreateAgentOptions = {
-  model?: string;
-  tools?: Tool[];
-  schema?: z.ZodObject;
-  handoffDescription?: string;
-  modelSettings?: ModelSettings;
-  temperature?: number;
-  inputGuardrails?: InputGuardrail[];
-  outputGuardrails?: OutputGuardrail<AgentOutputType>[];
-};
+type CreateAgentOptions<TSchema extends z.ZodObject | undefined = undefined> =
+  AgentGuardrails & {
+    model?: string;
+    tools?: Tool[];
+    schema?: TSchema;
+    handoffDescription?: string;
+    modelSettings?: ModelSettings;
+    temperature?: number;
+  };
 
 type PausedRun = {
-  state: RunState<unknown, Agent>;
+  state: RunState<any, AnyAgent>;
   interruptions?: RunToolApprovalItem[];
 };
 
@@ -73,9 +85,17 @@ type RejectionChoice = {
   message?: string;
 };
 
+// The guardrail fields for any agent constructor. A list left out becomes the SDK default of none.
+export function guardrailConfig(options?: AgentGuardrails): AgentGuardrails {
+  return {
+    inputGuardrails: options?.inputGuardrails,
+    outputGuardrails: options?.outputGuardrails,
+  };
+}
+
 @Injectable()
 export class OpenaiService implements OnModuleInit {
-  private runner?: Runner;
+  private sharedRunner?: Runner;
   private runnerModel?: string;
   private socketRunner?: Runner;
   private apiClient?: OpenAI;
@@ -97,9 +117,9 @@ export class OpenaiService implements OnModuleInit {
   //2. It applies to every later run in this app, so call it once at startup.
   createRunner(model: string) {
     this.runnerModel = model;
-    this.runner = new Runner({ model });
+    this.sharedRunner = new Runner({ model });
     this.socketRunner = undefined;
-    return this.runner;
+    return this.sharedRunner;
   }
 
   // A notebook for one chat. Pass the same session on every later message.
@@ -111,12 +131,13 @@ export class OpenaiService implements OnModuleInit {
   // modelSettings is optional. Leave it out to use the model's own reasoning effort.
   // temperature is optional. Leave it out unless the model accepts it.
   // inputGuardrails and outputGuardrails are optional. Leave them out when nothing needs a check.
-  createAgent(
+  // The agent's output type is the schema when one is passed, and text otherwise.
+  createAgent<TSchema extends z.ZodObject | undefined = undefined>(
     name: string,
     instructions: string,
-    options?: CreateAgentOptions,
+    options?: CreateAgentOptions<TSchema>,
   ) {
-    const agent = new Agent({
+    return new Agent({
       name,
       instructions,
       modelSettings: this.modelSettings(
@@ -129,14 +150,8 @@ export class OpenaiService implements OnModuleInit {
       ...(options?.handoffDescription && {
         handoffDescription: options.handoffDescription,
       }),
-      ...(options?.inputGuardrails && {
-        inputGuardrails: options.inputGuardrails,
-      }),
-    });
-    if (options?.outputGuardrails) {
-      agent.outputGuardrails = options.outputGuardrails;
-    }
-    return agent;
+      ...guardrailConfig(options),
+    }) as unknown as Agent<unknown, OutputOf<TSchema>>;
   }
 
   //1. Optional check before the agent starts. It runs only when this agent is first.
@@ -156,19 +171,19 @@ export class OpenaiService implements OnModuleInit {
     };
   }
 
-  //1. Optional. The check is another agent. tripwire reads that agent's output.
+  //1. Optional. The check is another agent. tripwire reads that agent's typed output.
   //2. Return true from tripwire when the request should stop.
   //3. runInParallel is optional and follows the same choice as inputGuardrail.
-  agentInputGuardrail(
+  agentInputGuardrail<TAgent extends AnyAgent>(
     name: string,
-    agent: Agent,
-    tripwire: (output: unknown) => boolean,
+    agent: TAgent,
+    tripwire: (output: RunResult<unknown, TAgent>['finalOutput']) => boolean,
     options?: { runInParallel?: boolean },
   ) {
     return this.inputGuardrail(
       name,
       async ({ input, context }) => {
-        const result = await this.executeRun(agent, input, { context });
+        const result = await this.runner().run(agent, input, { context });
         return {
           outputInfo: result.finalOutput,
           tripwireTriggered: tripwire(result.finalOutput),
@@ -239,16 +254,11 @@ export class OpenaiService implements OnModuleInit {
     instructions: string,
     handoffs: Agent['handoffs'],
     handoffDescription: string,
-    options?: Pick<
-      CreateAgentOptions,
-      | 'model'
-      | 'modelSettings'
-      | 'temperature'
-      | 'inputGuardrails'
-      | 'outputGuardrails'
-    >,
+    options?: AgentGuardrails &
+      Pick<CreateAgentOptions, 'model' | 'modelSettings' | 'temperature'>,
   ) {
-    const agent = Agent.create({
+    // Explicit types keep the guardrail list from changing the triage agent's text output.
+    return Agent.create<TextOutput, Agent['handoffs']>({
       name,
       instructions,
       handoffs,
@@ -258,21 +268,15 @@ export class OpenaiService implements OnModuleInit {
         options?.temperature,
       ),
       ...(options?.model && { model: options.model }),
-      ...(options?.inputGuardrails && {
-        inputGuardrails: options.inputGuardrails,
-      }),
+      ...guardrailConfig(options),
     });
-    if (options?.outputGuardrails) {
-      agent.outputGuardrails = options.outputGuardrails;
-    }
-    return agent;
   }
 
   //1. Turn an agent into a tool. The manager keeps the reply and calls this agent for one job.
   //2. toolName, toolDescription, needsApproval, and runConfig are optional.
   //3. The agent name is used when toolName is left out. needsApproval pauses before the tool runs.
   //4. runConfig is how SandboxService passes the workspace.
-  asTool(agent: Agent, options?: AsToolOptions) {
+  asTool(agent: AnyAgent, options?: AsToolOptions) {
     return agent.asTool({ ...options });
   }
 
@@ -293,20 +297,30 @@ export class OpenaiService implements OnModuleInit {
   //3. context is optional data for your code. The model does not see it.
   //4. session is optional. Reuse one session to continue a chat.
   //5. websocket is optional. Turn it on when this run will call the model many times.
-  //6. stream is optional. Wait for completed, then approve or reject the same state.
+  //6. stream is optional. stream: true returns a streamed result. Wait for completed, then approve or reject.
   //7. outputGuardrailBlockedMessage is optional. It replaces a blocked tool result.
   //8. When a tool pauses, the result carries interruptions. approve or reject, then resumeAgent.
-  async runAgent<TContext>(
+  runAgent<TAgent extends AnyAgent, TContext = undefined>(
     prompt: string,
-    agent: Agent,
-    options?: RunAgentOptions<TContext>,
+    agent: TAgent,
+    options: RunAgentOptions<TContext> & Streamed,
+  ): Promise<StreamedRunResult<TContext, TAgent>>;
+  runAgent<TAgent extends AnyAgent, TContext = undefined>(
+    prompt: string,
+    agent: TAgent,
+    options?: RunAgentOptions<TContext> & NotStreamed,
+  ): Promise<RunResult<TContext, TAgent>>;
+  async runAgent(
+    prompt: string,
+    agent: AnyAgent,
+    options?: RunAgentOptions<unknown> & { stream?: boolean },
   ) {
     return await this.executeRun(agent, prompt, options);
   }
 
   //1. Optional. Call this after a handoff when the same specialist should answer the next message.
   //2. fallback is required here. It is used when the run has no last agent.
-  nextAgent(result: { lastAgent?: Agent }, fallback: Agent) {
+  nextAgent(result: { lastAgent?: AnyAgent }, fallback: AnyAgent) {
     return result.lastAgent ?? fallback;
   }
 
@@ -314,46 +328,39 @@ export class OpenaiService implements OnModuleInit {
   //2. Leave interruptions out to approve every pause on the result.
   //3. alwaysApprove is optional. It allows that tool for the rest of this run.
   approve(result: PausedRun, options?: ApprovalChoice) {
-    for (const interruption of this.approvalItems(
-      result,
-      options?.interruptions,
-    )) {
-      result.state.approve(interruption, {
-        ...(options?.alwaysApprove !== undefined && {
-          alwaysApprove: options.alwaysApprove,
-        }),
-      });
-    }
-    return result.state;
+    return this.decide(result, options?.interruptions, (item) =>
+      result.state.approve(item, { alwaysApprove: options?.alwaysApprove }),
+    );
   }
 
   //1. Optional. Reject a paused tool call, then pass the returned state to resumeAgent.
   //2. Leave interruptions out to reject every pause on the result.
   //3. message and alwaysReject are optional.
   reject(result: PausedRun, options?: RejectionChoice) {
-    for (const interruption of this.approvalItems(
-      result,
-      options?.interruptions,
-    )) {
-      result.state.reject(interruption, {
-        ...(options?.alwaysReject !== undefined && {
-          alwaysReject: options.alwaysReject,
-        }),
-        ...(options?.message !== undefined && { message: options.message }),
-      });
-    }
-    return result.state;
+    return this.decide(result, options?.interruptions, (item) =>
+      result.state.reject(item, {
+        alwaysReject: options?.alwaysReject,
+        message: options?.message,
+      }),
+    );
   }
 
   // Continue a paused run from the state approve or reject returned.
   // websocket, stream, and outputGuardrailBlockedMessage are optional.
-  async resumeAgent<TContext>(
-    agent: Agent,
+  resumeAgent<TAgent extends AnyAgent>(
+    agent: TAgent,
     state: PausedRun['state'],
-    options?: Pick<
-      RunAgentOptions<TContext>,
-      'websocket' | 'stream' | 'outputGuardrailBlockedMessage'
-    >,
+    options: ResumeOptions & Streamed,
+  ): Promise<StreamedRunResult<unknown, TAgent>>;
+  resumeAgent<TAgent extends AnyAgent>(
+    agent: TAgent,
+    state: PausedRun['state'],
+    options?: ResumeOptions & NotStreamed,
+  ): Promise<RunResult<unknown, TAgent>>;
+  async resumeAgent(
+    agent: AnyAgent,
+    state: PausedRun['state'],
+    options?: ResumeOptions & { stream?: boolean },
   ) {
     return await this.executeRun(agent, state, options);
   }
@@ -364,38 +371,46 @@ export class OpenaiService implements OnModuleInit {
   }
 
   // Load a string from saveRun. Pass the same agent that started the run.
-  async loadRun(agent: Agent, saved: string) {
+  async loadRun(agent: AnyAgent, saved: string) {
     return RunState.fromString(agent, saved);
   }
 
-  private approvalItems(result: PausedRun, chosen?: RunToolApprovalItem[]) {
-    if (chosen) return chosen;
-    if (result.interruptions) return result.interruptions;
-    return result.state.getInterruptions();
+  //1. Approve or reject each chosen pause, then hand back the state to resume.
+  //2. Without a choice, every pause on the result is decided.
+  private decide(
+    result: PausedRun,
+    chosen: RunToolApprovalItem[] | undefined,
+    apply: (item: RunToolApprovalItem) => void,
+  ) {
+    const items =
+      chosen ?? result.interruptions ?? result.state.getInterruptions();
+    for (const item of items) apply(item);
+    return result.state;
   }
 
   private async executeRun(
-    agent: Agent,
-    input: Parameters<typeof run>[1],
-    options?: RunAgentOptions<unknown>,
+    agent: AnyAgent,
+    input: string | RunState<any, AnyAgent>,
+    options?: RunAgentOptions<unknown> & { stream?: boolean },
   ) {
     const runOptions = {
-      ...(options?.context !== undefined && { context: options.context }),
-      ...(options?.session && { session: options.session }),
-      ...(options?.outputGuardrailBlockedMessage !== undefined && {
-        outputGuardrailBlockedMessage: options.outputGuardrailBlockedMessage,
-      }),
+      context: options?.context,
+      session: options?.session,
+      outputGuardrailBlockedMessage: options?.outputGuardrailBlockedMessage,
     };
-    const runner = options?.websocket ? this.webSocketRunner() : this.runner;
+    const runner = this.runner(options?.websocket);
 
     if (options?.stream) {
-      const streamed = { ...runOptions, stream: true as const };
-      if (runner) return await runner.run(agent, input, streamed);
-      return await run(agent, input, streamed);
+      return await runner.run(agent, input, { ...runOptions, stream: true });
     }
+    return await runner.run(agent, input, runOptions);
+  }
 
-    if (runner) return await runner.run(agent, input, runOptions);
-    return await run(agent, input, runOptions);
+  // The socket runner, the shared runner from createRunner, or the SDK's plain default.
+  private runner(websocket?: boolean) {
+    if (websocket) return this.webSocketRunner();
+    this.sharedRunner ??= new Runner();
+    return this.sharedRunner;
   }
 
   // Built once and reused, so later runs share the same socket provider.

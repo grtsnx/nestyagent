@@ -9,7 +9,7 @@ import { HttpExceptionFilter, ResponseInterceptor } from '@/middleware';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import { LibModule } from '@/lib/lib.module.js';
-import { v1Module } from '@/modules/v1.module.js';
+import { V1Module } from '@/modules/v1.module.js';
 
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
 
@@ -36,7 +36,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     }),
     TerminusModule,
     LibModule,
-    v1Module,
+    V1Module,
   ],
   controllers: [AppController],
   providers: [
