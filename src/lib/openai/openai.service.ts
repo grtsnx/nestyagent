@@ -446,7 +446,8 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   // The agent's output type is the schema when one is passed, and text otherwise.
   createAgent<TSchema extends z.ZodObject | undefined = undefined>(
     name: string,
-    instructions: string,
+    // Text, or a function such as InstructionsService.forAgent that reads the latest text.
+    instructions: string | (() => string | Promise<string>),
     options?: CreateAgentOptions<TSchema>,
   ) {
     return new Agent({

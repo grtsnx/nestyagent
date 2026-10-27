@@ -145,6 +145,7 @@ type FakeDb = {
   hostedWebhook: Table;
   chatHistoryOperation: Table;
   expiredEnvironment: Table;
+  instruction: Table;
   $queryRaw(sql: TemplateStringsArray, chatId: string): Promise<Row[]>;
   $transaction<T>(
     work: ((tx: FakeDb) => Promise<T>) | Promise<unknown>[],
@@ -186,6 +187,11 @@ export function fakePrisma() {
       updatedAt: new Date(),
     })),
     chatHistoryOperation: new Table([]),
+    instruction: new Table(['name'], () => ({
+      version: 1,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })),
     expiredEnvironment: new Table(['environmentId'], () => ({
       expiredAt: new Date(),
     })),
@@ -210,6 +216,7 @@ export function fakePrisma() {
         db.hostedWebhook,
         db.chatHistoryOperation,
         db.expiredEnvironment,
+        db.instruction,
       ];
       const saved = tables.map((table) =>
         table.rows.map((row) => ({ ...row })),

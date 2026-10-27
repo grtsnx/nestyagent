@@ -72,6 +72,7 @@ The app checks these values before it starts. A bad port, a bad true/false value
 | `OBSERVE_APP_KEY`, `OBSERVE_APP_SECRET`, `OBSERVE_SERVICE_ID`     | empty                 | NestJS Observe login. Needed when `OBSERVE_ENABLED` is on.                                                    |
 | `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` | empty                 | Self-hosted Langfuse. Set all three to record traces there. Leave them empty to stay on the OpenAI dashboard. |
 | `COMPOSIO_API_KEY`                                                | empty                 | Composio project key. Empty leaves Gmail, Slack, and other connected apps off. The app starts without it.     |
+| `ADMIN_API_KEY`                                                   | empty                 | Admin key for editing helper instructions. At least 32 characters. Empty keeps those routes off.              |
 | `OPENAI_API_KEY`                                                  | required              | Your OpenAI key. Every helper uses it. The app does not start without it.                                     |
 | `DATABASE_URL`                                                    | empty                 | Your Postgres address. The app starts without it. Chats, saved approvals, and the webhook need it.            |
 | `OPENAI_HOSTED_MODEL`                                             | `gpt-6-astra`         | The model for a self-hosted session when you do not pick one.                                                 |
@@ -92,16 +93,17 @@ The AWS, DigitalOcean, Databricks, OCI, and Cloudflare settings are in `.env.exa
 
 The app uses Postgres through Prisma. The database keeps durable workflow records shared by every app replica:
 
-| Table                     | What it keeps                                                       | Key                                        |
-| ------------------------- | ------------------------------------------------------------------- | ------------------------------------------ |
-| `chats`                   | One row per chat, with when it started and when it last moved.      | The chat id you pick, like `chat-c-42`     |
-| `chat_items`              | Every chat message, so a helper remembers the chat.                 | A counter, so messages stay in exact order |
-| `paused_runs`             | Approval checkpoints, execution status, owner, and recovery notes.  | A Prisma-generated UUIDv7                  |
-| `remote_machines`         | Which self-hosted machine belongs to which session.                 | OpenAI's session id                        |
-| `hosted_webhooks`         | Verified events, retries, worker leases, and terminal records.      | OpenAI event id                            |
-| `chat_history_operations` | Completed SDK history operations and their content digest.          | Chat id + operation id                     |
-| `execution_locks`         | Which worker is running a chat, a saved run, or a machine change.   | The lock name, like `chat:chat-c-42`       |
-| `expired_environments`    | Environments OpenAI said are gone, so they are never started again. | OpenAI's environment id                    |
+| Table                     | What it keeps                                                                       | Key                                        |
+| ------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------ |
+| `chats`                   | One row per chat, with when it started and when it last moved.                      | The chat id you pick, like `chat-c-42`     |
+| `chat_items`              | Every chat message, so a helper remembers the chat.                                 | A counter, so messages stay in exact order |
+| `paused_runs`             | Approval checkpoints, execution status, owner, and recovery notes.                  | A Prisma-generated UUIDv7                  |
+| `remote_machines`         | Which self-hosted machine belongs to which session.                                 | OpenAI's session id                        |
+| `hosted_webhooks`         | Verified events, retries, worker leases, and terminal records.                      | OpenAI event id                            |
+| `chat_history_operations` | Completed SDK history operations and their content digest.                          | Chat id + operation id                     |
+| `execution_locks`         | Which worker is running a chat, a saved run, or a machine change.                   | The lock name, like `chat:chat-c-42`       |
+| `expired_environments`    | Environments OpenAI said are gone, so they are never started again.                 | OpenAI's environment id                    |
+| `instructions`            | Custom instructions saved through the API. Without a row, the default file is used. | The helper name, like `mssuzie`            |
 
 How the tables are built:
 
@@ -184,24 +186,6 @@ const menuHelper = this.openai.createAgent(
 ```
 
 Keep your own tools in `src/config/tools`. `sample.tool.ts` there is a starting template.
-
-### Connected apps
-
-`ComposioService` gives a helper the account owner's Gmail, Slack, and the other apps Composio hosts. Leave `COMPOSIO_API_KEY` empty and it stays off. Inject `ComposioService` the same way you inject `OpenaiService`.
-
-```typescript
-const connected = await this.composio.tools(ownerId, {
-  sessionId: savedSessionId,
-});
-
-const helper = this.openai.createAgent(
-  'Front desk',
-  'Help the owner. When an app needs permission, share the Connect Link and wait.',
-  { tools: connected.tools },
-);
-```
-
-`ownerId` is a stable id for that account, the same kind of id you pass as `ownerId` on an approval. Store `connected.sessionId` with that account. Pass it back as `sessionId` on the next message so the same connections continue. Leave `sessionId` out the first time.
 
 ### See the run
 
@@ -587,6 +571,117 @@ await this.openai.runAgent('Two croissants for Saturday, please.', frontDesk);
 ```
 
 `toolName` and `toolDescription` are optional. Without `toolName`, the tool is named after the helper: `this.openai.asTool(orderReader)`.
+
+</details>
+
+<details>
+<summary><h2>🔗 Connected apps</h2></summary>
+
+`ComposioService` lets a helper use the account owner's Gmail, Slack, and the other apps Composio hosts. Leave `COMPOSIO_API_KEY` empty and connected apps stay off. The app still starts.
+
+Put the project key in `.env` and restart:
+
+```bash
+COMPOSIO_API_KEY=your-project-key
+```
+
+Inject `ComposioService` the same way you inject `OpenaiService`. The user id is a stable account id, the same kind of id you pass as `ownerId` on an approval. `default` is rejected.
+
+### The first message
+
+Leave `sessionId` out. Composio opens a session for that owner and returns tools for `createAgent`.
+
+```typescript
+const connected = await this.composio.tools('owner-c-42');
+
+const helper = this.openai.createAgent(
+  'Front desk',
+  'Help the Sunny Bakery owner with mail and messages. When an app needs permission, share the Connect Link and wait.',
+  { tools: connected.tools },
+);
+
+const chat = this.openai.createSession('chat-owner-c-42');
+
+await this.openai.runAgent('What came in on email today?', helper, {
+  session: chat,
+});
+```
+
+Store `connected.sessionId` with `owner-c-42`. That id is how the next message keeps the same Gmail and Slack connections.
+
+### The next message
+
+Pass the stored session id. The helper remembers the chat because you pass the same chat id too.
+
+```typescript
+const connected = await this.composio.tools('owner-c-42', {
+  sessionId: savedSessionId,
+});
+
+const helper = this.openai.createAgent(
+  'Front desk',
+  'Help the Sunny Bakery owner with mail and messages. When an app needs permission, share the Connect Link and wait.',
+  { tools: connected.tools },
+);
+
+await this.openai.runAgent(
+  'Reply to the cake order and say it is ready.',
+  helper,
+  {
+    session: this.openai.createSession('chat-owner-c-42'),
+  },
+);
+```
+
+When Gmail or Slack is not connected yet, the helper gets a Connect Link. Show that link to the owner and wait. The next message on this session can use the app.
+
+### Your own tools beside the connected ones
+
+Spread the Composio tools into the same list as a tool you wrote.
+
+```typescript
+const connected = await this.composio.tools('owner-c-42', {
+  sessionId: savedSessionId,
+});
+
+const helper = this.openai.createAgent(
+  'Front desk',
+  'Help the Sunny Bakery owner. Use bakery_hours for opening times, and the connected apps for mail and messages.',
+  { tools: [bakeryHours, ...connected.tools] },
+);
+```
+
+</details>
+
+<details>
+<summary><h2>📝 Instructions</h2></summary>
+
+A helper's instructions can be changed from Swagger or Scalar without a deploy. The built-in text lives in `src/config/instructions`, one Markdown file per helper, and MsSuzie's is `mssuzie.md`. A saved custom version replaces it. Delete the custom version and the built-in text comes back.
+
+Set `ADMIN_API_KEY` to turn the routes on. Every request sends it in the `x-admin-key` header. In Swagger, click **Authorize** and paste the key once. Without the key set, the routes answer 403 and nothing can be changed.
+
+| Route                           | What it does                                                 |
+| ------------------------------- | ------------------------------------------------------------ |
+| `GET /v1/instructions`          | Lists each helper and whether it uses custom or default text |
+| `GET /v1/instructions/:name`    | Shows the text in use now                                    |
+| `POST /v1/instructions/:name`   | Saves a custom version                                       |
+| `PUT /v1/instructions/:name`    | Replaces the custom version                                  |
+| `DELETE /v1/instructions/:name` | Deletes the custom version, so the default is used again     |
+
+**Two people editing at once.** Every reply carries a `version`. Send that number back with `PUT` (in the body) or `DELETE` (as `?version=2`). If someone saved since you read it, you get 409 and their change is kept. Reload, then try again.
+
+**Use it in a helper.** Pass `forAgent` instead of fixed text. The helper reads the latest text before each model call, so a change applies to the next message.
+
+```typescript
+const frontDesk = this.openai.createAgent(
+  'MsSuzie',
+  this.instructions.forAgent('mssuzie'),
+);
+```
+
+Each server keeps the text in memory for 5 seconds, so another server sees an edit within that time. If the database is down, the helper keeps the last text it saw, then the built-in file. Saving needs `DATABASE_URL`.
+
+To add a helper, add `src/config/instructions/<name>.md` and list it in `src/config/instructions/index.ts`. Only names with a built-in file can be used with `forAgent`, so a helper is never left without instructions.
 
 </details>
 

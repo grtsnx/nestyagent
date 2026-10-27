@@ -2,6 +2,8 @@ import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'node:crypto';
 import { PrismaService } from '@/lib/prisma/prisma.service.js';
 import { DatabaseSession, OpenaiService } from '@/lib/openai/openai.service.js';
+import { InstructionsService } from '@/lib/instructions/instructions.service.js';
+import { defaultInstructions } from '@/config/instructions/index.js';
 import {
   Agent,
   Model,
@@ -265,6 +267,40 @@ describe('Postgres persistence', () => {
       { role: 'user', content: 'Bake 4 cakes.' },
       ...steps,
     ]);
+  });
+
+  it('lets only one of two editors save from the same version', async () => {
+    const config = new ConfigService({ DATABASE_URL: databaseUrl });
+    const a = new InstructionsService(first, config);
+    const b = new InstructionsService(second, config);
+    const name = `test-${randomUUID().slice(0, 8)}`;
+    try {
+      await a.create(name, 'Version one.');
+      const saves = await Promise.allSettled([
+        a.update(name, 'Editor A.', 1),
+        b.update(name, 'Editor B.', 1),
+      ]);
+      expect(saves.filter((save) => save.status === 'fulfilled')).toHaveLength(
+        1,
+      );
+      await expect(b.get(name)).resolves.toMatchObject({ version: 2 });
+      await expect(a.remove(name, 2)).resolves.toBeUndefined();
+    } finally {
+      await first.db.instruction.deleteMany({ where: { name } });
+    }
+  });
+
+  it('falls back to the default after the custom version is deleted', async () => {
+    const instructions = new InstructionsService(
+      first,
+      new ConfigService({ DATABASE_URL: databaseUrl }),
+    );
+    await first.db.instruction.deleteMany({ where: { name: 'mssuzie' } });
+    await instructions.create('mssuzie', 'Custom.');
+    await expect(instructions.remove('mssuzie', 1)).resolves.toMatchObject({
+      source: 'default',
+      content: defaultInstructions.mssuzie,
+    });
   });
 
   it('rolls back a suffix rewrite when the expected history changed', async () => {

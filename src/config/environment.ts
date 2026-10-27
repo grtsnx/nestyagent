@@ -98,6 +98,15 @@ const environmentSchema = z
     LANGFUSE_SECRET_KEY: optionalString(),
     LANGFUSE_BASE_URL: optionalString(),
     COMPOSIO_API_KEY: optionalString(),
+    // Admin secret for editing helper instructions. Long, so it cannot be guessed.
+    ADMIN_API_KEY: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z
+        .string()
+        .trim()
+        .min(32, 'ADMIN_API_KEY must be at least 32 characters')
+        .optional(),
+    ),
     TRACE_PAYLOADS: z.preprocess(
       (value) => (value === '' ? undefined : value),
       booleanValue('TRACE_PAYLOADS').optional(),

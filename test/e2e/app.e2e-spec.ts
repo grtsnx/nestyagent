@@ -132,6 +132,16 @@ describe('AppController (e2e)', () => {
     ]);
   });
 
+  it('keeps instruction editing off without ADMIN_API_KEY', async () => {
+    const response = await request(app.getHttpServer())
+      .get('/v1/instructions')
+      .set('x-admin-key', 'anything')
+      .expect(403);
+    expect(response.body.message).toBe(
+      'Admin routes are off. Set ADMIN_API_KEY to turn them on.',
+    );
+  });
+
   it('serves populated, version-specific OpenAPI documents', async () => {
     const v1 = await request(app.getHttpServer())
       .get('/api/v1-json')

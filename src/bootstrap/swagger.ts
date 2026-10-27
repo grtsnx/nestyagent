@@ -33,6 +33,11 @@ export function configureSwagger(
         'These routes report whether the server is reachable, running, and ready to take traffic.',
       )
       .addTag(
+        'Instructions',
+        'These routes let an admin read, change, and reset what each helper is told to do.',
+      )
+      .addApiKey({ type: 'apiKey', in: 'header', name: 'x-admin-key' }, 'admin')
+      .addTag(
         'Webhook',
         'These routes receive signed OpenAI events that start and delete self-hosted machines.',
       )

@@ -153,3 +153,15 @@ model ExpiredEnvironment {
 
   @@map("expired_environments")
 }
+
+// A helper's instructions, edited through the API. Without a row, the default file in
+// src/config/instructions is used. version guards against two people editing at once.
+model Instruction {
+  name      String   @id
+  content   String
+  version   Int      @default(1)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("instructions")
+}
