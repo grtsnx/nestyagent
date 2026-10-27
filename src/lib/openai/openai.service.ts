@@ -17,6 +17,7 @@ import {
   defineToolInputGuardrail,
   defineToolOutputGuardrail,
   getCurrentTrace,
+  getDefaultModel,
   getOrCreateTrace,
   hostedMcpTool,
   InputGuardrail,
@@ -47,7 +48,8 @@ import {
 import type { MCPServer } from '@openai/agents';
 import type { SandboxRunConfig } from '@openai/agents/sandbox';
 import type { Prisma } from '@/generated/prisma/client.js';
-import { LangfuseService, requestStore } from '../langfuse/langfuse.service.js';
+import { requestStore } from '@/middleware';
+import { LangfuseService } from '../langfuse/langfuse.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 
 const RUN_GONE = 'This paused run was already taken or does not exist.';
@@ -977,8 +979,11 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
       const sessionId =
         policy.groupId ?? (session ? await session.getSessionId() : undefined);
       const requestId = requestStore.getStore()?.requestId;
+      // The model this run really uses, so Langfuse can price it. The SDK default comes last.
       const model =
-        typeof agent.model === 'string' ? agent.model : this.runnerModel;
+        (typeof agent.model === 'string' && agent.model) ||
+        this.runnerModel ||
+        getDefaultModel();
       const traceMetadata: Record<string, string> = {
         agent: agent.name,
         ...(requestId && { request_id: requestId }),

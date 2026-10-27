@@ -1,5 +1,13 @@
+import { ConfigService } from '@nestjs/config';
+import { setLangfuseTracerProvider } from '@langfuse/tracing';
+import {
+  BasicTracerProvider,
+  InMemorySpanExporter,
+  SimpleSpanProcessor,
+} from '@opentelemetry/sdk-trace-base';
 import { describe, expect, it } from 'vitest';
 import {
+  LangfuseService,
   planObservations,
   type AgentTraceItem,
 } from '@/lib/langfuse/langfuse.service.js';
@@ -11,6 +19,48 @@ const trace = {
   groupId: 'chat-c-42',
   metadata: { agent: 'Menu helper', model: 'gpt-6-astra', request_id: 'req-1' },
 };
+
+describe('LangfuseService', () => {
+  it('keeps the real duration and parent of each step', async () => {
+    const exporter = new InMemorySpanExporter();
+    const provider = new BasicTracerProvider({
+      spanProcessors: [new SimpleSpanProcessor(exporter)],
+    });
+    setLangfuseTracerProvider(provider);
+    const service = new LangfuseService(new ConfigService({}));
+    try {
+      await service.onSpanEnd({
+        ...span('span_task', null, { type: 'task', name: 'run' }),
+        startedAt: '2026-10-27T09:00:00.000Z',
+        endedAt: '2026-10-27T09:00:03.000Z',
+      } as never);
+      await service.onSpanEnd({
+        ...span('span_tool', 'span_task', {
+          type: 'function',
+          name: 'checkOven',
+          input: '',
+          output: '',
+        }),
+        startedAt: '2026-10-27T09:00:01.000Z',
+        endedAt: '2026-10-27T09:00:01.250Z',
+      } as never);
+      await service.onTraceEnd(trace as never);
+      await service.forceFlush();
+
+      const spans = exporter.getFinishedSpans();
+      const tool = spans.find((item) => item.name === 'checkOven');
+      const task = spans.find((item) => item.name === 'run-agent');
+      const millis = (time: [number, number]) =>
+        time[0] * 1_000 + time[1] / 1e6;
+      expect(millis(tool!.endTime) - millis(tool!.startTime)).toBe(250);
+      expect(millis(task!.endTime) - millis(task!.startTime)).toBe(3_000);
+      expect(tool!.parentSpanContext?.spanId).toBe(task!.spanContext().spanId);
+    } finally {
+      await provider.shutdown();
+      setLangfuseTracerProvider(null);
+    }
+  });
+});
 
 describe('planObservations', () => {
   it('records one agent turn with a generation, a tool, and the chat session', () => {
@@ -175,5 +225,7 @@ function span(
     parentId,
     spanData,
     error: null,
+    startedAt: '2026-10-27T09:00:00.000Z',
+    endedAt: '2026-10-27T09:00:02.500Z',
   };
 }

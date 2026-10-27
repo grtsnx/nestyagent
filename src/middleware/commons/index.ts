@@ -1,4 +1,4 @@
-export { RequestIdMiddleware } from './request-id.middleware.js';
+export { RequestIdMiddleware, requestStore } from './request-id.middleware.js';
 export {
   describeException,
   httpResponse,

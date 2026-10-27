@@ -1,10 +1,10 @@
-import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   Injectable,
   type OnModuleDestroy,
   type OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import type { SpanContext } from '@opentelemetry/api';
 import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
 import {
   addTraceProcessor,
@@ -19,9 +19,6 @@ import {
   setLangfuseTracerProvider,
   startObservation,
 } from '@langfuse/tracing';
-
-// The HTTP request id, when this run is inside an API call.
-export const requestStore = new AsyncLocalStorage<{ requestId: string }>();
 
 // One Agents SDK trace or span, reduced to the fields the Langfuse plan reads.
 export type AgentTraceItem =
@@ -39,6 +36,8 @@ export type AgentTraceItem =
       parentId: string | null;
       spanData: SpanData;
       error: { message: string } | null;
+      startedAt: string | null;
+      endedAt: string | null;
     };
 
 // What one customer turn should show, without tool arguments or model payloads.
@@ -76,6 +75,8 @@ export type PlannedObservation = {
   tags?: string[];
   level?: 'ERROR';
   statusMessage?: string;
+  startTime?: Date;
+  endTime?: Date;
 };
 
 //1. One Agents SDK trace becomes one Langfuse trace.
@@ -111,6 +112,9 @@ export function planObservations(
       ...mapped,
       traceId: item.traceId,
       spanId: item.spanId,
+      // The SDK's own times, so Langfuse shows how long each step really took.
+      ...(item.startedAt && { startTime: new Date(item.startedAt) }),
+      ...(item.endedAt && { endTime: new Date(item.endedAt) }),
       ...(parentId && byId.has(parentId) ? { parentSpanId: parentId } : {}),
     });
   }
@@ -136,7 +140,12 @@ function mapSpan(
   trace: Extract<AgentTraceItem, { type: 'trace' }> | undefined,
   note: TurnNote | undefined,
   seenGenerations: Map<string, number>,
-): Omit<PlannedObservation, 'traceId' | 'spanId' | 'parentSpanId'> | undefined {
+):
+  | Omit<
+      PlannedObservation,
+      'traceId' | 'spanId' | 'parentSpanId' | 'startTime' | 'endTime'
+    >
+  | undefined {
   const data = item.spanData;
   const metadata = stringMetadata(trace?.metadata);
   if (note?.requestId) metadata.request_id = note.requestId;
@@ -292,13 +301,11 @@ function stringMetadata(value: Record<string, unknown> | undefined) {
 }
 
 type Opened = {
-  otelSpan: { setAttribute(key: string, value: string | string[]): void };
-  end(): void;
-  startObservation(
-    name: string,
-    attributes: Record<string, unknown>,
-    options: { asType: ObservationType },
-  ): Opened;
+  otelSpan: {
+    setAttribute(key: string, value: string | string[]): void;
+    spanContext(): SpanContext;
+  };
+  end(endTime?: Date): void;
 };
 
 //1. Off until the public key, secret, and base URL are all set.
@@ -367,6 +374,8 @@ export class LangfuseService
       parentId: span.parentId,
       spanData: span.spanData,
       error: span.error,
+      startedAt: span.startedAt,
+      endedAt: span.endedAt,
     });
   }
 
@@ -386,7 +395,8 @@ export class LangfuseService
   }
 
   async forceFlush() {
-    for (const traceId of [...this.pending.keys()]) this.publish(traceId);
+    // Deleting the current key while iterating a Map is safe.
+    for (const traceId of this.pending.keys()) this.publish(traceId);
     await this.processor?.forceFlush();
   }
 
@@ -456,7 +466,7 @@ export class LangfuseService
             );
         }
       }
-      created.end();
+      created.end(observation.endTime);
       opened.set(observation.spanId, created);
     }
     this.notes.delete(traceId);
@@ -478,10 +488,22 @@ function openObservation(
     }),
     metadata: observation.metadata,
   };
-  const start = parent
-    ? parent.startObservation.bind(parent)
-    : (startObservation as Opened['startObservation']);
-  return start(observation.name, attributes, { asType: observation.asType });
+  // The top-level call is the one that takes a start time, so the parent is linked by context.
+  return (
+    startObservation as (
+      name: string,
+      attributes: Record<string, unknown>,
+      options: {
+        asType: ObservationType;
+        startTime?: Date;
+        parentSpanContext?: SpanContext;
+      },
+    ) => Opened
+  )(observation.name, attributes, {
+    asType: observation.asType,
+    ...(observation.startTime && { startTime: observation.startTime }),
+    ...(parent && { parentSpanContext: parent.otelSpan.spanContext() }),
+  });
 }
 
 function maskSecrets(data: unknown): unknown {

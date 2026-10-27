@@ -3,6 +3,7 @@ export {
   ApiRateLimited,
   ApiSuccess,
   RequestIdMiddleware,
+  requestStore,
   describeException,
   httpResponse,
   statusType,

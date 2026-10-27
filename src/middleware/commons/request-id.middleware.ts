@@ -1,6 +1,9 @@
 import { Injectable, type NestMiddleware } from '@nestjs/common';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import { requestStore } from '@/lib/langfuse/langfuse.service.js';
+
+// The HTTP request id, readable anywhere inside that request, for example in a trace.
+export const requestStore = new AsyncLocalStorage<{ requestId: string }>();
 
 const validRequestId = /^[A-Za-z0-9._-]{1,64}$/;
 

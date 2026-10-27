@@ -9,6 +9,7 @@ import {
   OutputGuardrailTripwireTriggered,
   Runner,
   RunConfig,
+  getDefaultModel,
   RunState,
   RunToolApprovalItem,
   ToolInputGuardrailTripwireTriggered,
@@ -932,6 +933,21 @@ describe('OpenaiService storage and limits', () => {
           user_id: 'user-7',
           model: 'gpt-6-astra',
         },
+      });
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it('names the SDK default model when the helper has none', async () => {
+    const agent = new Agent({ name: 'Menu helper', instructions: 'Menu.' });
+    const run = vi
+      .spyOn(Runner.prototype, 'run')
+      .mockResolvedValue({ interruptions: [] } as never);
+    try {
+      await service().runAgent('Any cakes?', agent);
+      expect(run.mock.calls[0]?.[2]).toMatchObject({
+        traceMetadata: { model: getDefaultModel() },
       });
     } finally {
       run.mockRestore();
