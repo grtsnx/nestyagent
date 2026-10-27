@@ -7,7 +7,5 @@
   "env": {
     "node": true
   },
-  "ignorePatterns": [
-    "src/generated/**"
-  ]
+  "ignorePatterns": ["src/generated/**"]
 }

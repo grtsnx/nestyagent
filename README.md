@@ -17,22 +17,24 @@ Every example in this guide is about one shop: **Sunny Bakery**.
 
 A few words you will see a lot:
 
-| Word         | Meaning                                                      |
-| ------------ | ------------------------------------------------------------ |
-| Agent        | A helper with one job.                                       |
-| Instructions | The helper's job description. You write it once.             |
-| Prompt       | The customer's message for one run.                          |
-| Tool         | Something a helper can do, like look up the opening hours.   |
-| Schema       | A form. The helper fills it in instead of writing free text. |
-| Session      | The chat history, so the helper remembers earlier messages.  |
-| Guardrail    | A safety check on a message, an answer, or a tool.           |
-| Approval     | A pause where a person says yes or no before a tool runs.    |
-| Workspace    | A small computer the helper can use for files and commands.  |
+| Word         | Meaning                                                                         |
+| ------------ | ------------------------------------------------------------------------------- |
+| Agent        | A helper with one job.                                                          |
+| Instructions | The helper's job description. You write it once.                                |
+| Prompt       | The customer's message for one run.                                             |
+| Tool         | Something a helper can do, like look up the opening hours.                      |
+| Schema       | A form. The helper fills it in instead of writing free text.                    |
+| Session      | The chat history, so the helper remembers earlier messages.                     |
+| Guardrail    | A safety check on a message, an answer, or a tool.                              |
+| Approval     | A pause where a person says yes or no before a tool runs.                       |
+| Workspace    | A small computer the helper can use for files and commands.                     |
+| Database     | Postgres. It keeps chats, waiting approvals, and machines safe across restarts. |
 
 ## 📋 Requirements
 
 - Bun 1.3.14
 - Node.js 24 or later to run in production
+- Postgres 14 or later for chats, approvals, and self-hosted machines
 - Docker, or another OCI container runtime, to deploy
 
 <details>
@@ -41,7 +43,14 @@ A few words you will see a lot:
 ```bash
 cp .env.example .env
 bun install --frozen-lockfile
+bun run db:migrate
 bun run start:dev
+```
+
+`bun install` also builds the database client. `bun run db:migrate` creates the tables. It needs Postgres running at `DATABASE_URL`. For a quick local one:
+
+```bash
+docker run -d --name agentic-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=agentic -p 5432:5432 postgres:17-alpine
 ```
 
 Swagger UI opens at `http://localhost:3000/api`. Scalar opens at `http://localhost:3000/docs`. The raw API documents are at `/api/v1-json` and `/api/v2-json`. The app prints every docs link when it starts.
@@ -63,6 +72,7 @@ The app checks these values before it starts. A bad port, a bad true/false value
 | `OBSERVE_ENABLED`                                             | `false`               | Turns on NestJS Observe.                                                                                 |
 | `OBSERVE_APP_KEY`, `OBSERVE_APP_SECRET`, `OBSERVE_SERVICE_ID` | empty                 | NestJS Observe login. Needed when `OBSERVE_ENABLED` is on.                                               |
 | `OPENAI_API_KEY`                                              | required              | Your OpenAI key. Every helper uses it. The app does not start without it.                                |
+| `DATABASE_URL`                                                | empty                 | Your Postgres address. The app starts without it. Chats, saved approvals, and the webhook need it.       |
 | `OPENAI_HOSTED_MODEL`                                         | `gpt-6-astra`         | The model for a self-hosted session when you do not pick one.                                            |
 | `ACCOUNT_PASSWORD`                                            | empty                 | One login password the helper can use inside its computer. Empty means no password.                      |
 | `OPENAI_EXECUTOR_API_KEY`                                     | empty                 | The small key for a self-hosted computer. See Self-hosted.                                               |
@@ -73,6 +83,29 @@ The AWS, DigitalOcean, Databricks, OCI, and Cloudflare settings are in `.env.exa
 
 > [!CAUTION]
 > Never put `*` in `CORS_ORIGINS`. Write each full site address, like `https://sunnybakery.example`.
+
+</details>
+
+<details>
+<summary><h2>🗄️ Database</h2></summary>
+
+The app uses Postgres through Prisma. The database keeps three things, so they survive a restart and every copy of the app sees the same data:
+
+| Table             | What it keeps                                       |
+| ----------------- | --------------------------------------------------- |
+| `chat_items`      | Every chat message, so a helper remembers the chat. |
+| `paused_runs`     | Runs waiting for a person to say yes or no.         |
+| `remote_machines` | Which self-hosted machine belongs to which session. |
+
+The app only connects the first time one of these is used. Without `DATABASE_URL`, everything else still works.
+
+| Command               | When to run it                                                    |
+| --------------------- | ----------------------------------------------------------------- |
+| `bun run db:migrate`  | On your machine, after you change `prisma/schema.prisma`.         |
+| `bun run db:deploy`   | Before a new release starts. It applies new tables in production. |
+| `bun run db:generate` | Rebuilds the database client. `bun install` already does this.    |
+
+The production image does not include the Prisma command line tool. Run `bun run db:deploy` from your release step, with `DATABASE_URL` pointing at production.
 
 </details>
 
@@ -178,10 +211,10 @@ const result = await this.openai.runAgent('Where is my order?', orderHelper, {
 
 ### Remember the chat
 
-`createSession` makes a chat history. Pass the same one on every message, and the helper remembers what was said. It lives in memory and is gone when the app stops.
+`createSession` makes a chat history. Pass the same one on every message, and the helper remembers what was said. It is kept in Postgres, so it survives a restart and works on every copy of the app.
 
 ```typescript
-const chat = this.openai.createSession();
+const chat = this.openai.createSession('chat-c-42');
 
 await this.openai.runAgent('I ordered a birthday cake.', orderHelper, {
   session: chat,
@@ -195,6 +228,8 @@ const result = await this.openai.runAgent(
 ```
 
 The second message works because the helper remembers the cake.
+
+Give each chat its own id, like the customer's chat id, and store it. Pass that id again tomorrow and the chat carries on. With no id, `createSession()` makes a new random one, which you can read with `await chat.getSessionId()`.
 
 ### Pick the model
 
@@ -237,6 +272,20 @@ const menuHelper = this.openai.createAgent(
 
 > [!WARNING]
 > `gpt-6-astra` does not accept `temperature`. Leave it out for that model.
+
+### Stop a run, or limit its steps
+
+`signal` stops a run, for example when the customer closes the page. `maxTurns` stops a helper that goes round in circles. Both are optional, and `resumeAgent` takes them too.
+
+```typescript
+const controller = new AbortController();
+request.on('close', () => controller.abort());
+
+const result = await this.openai.runAgent('Where is my order?', orderHelper, {
+  signal: controller.signal,
+  maxTurns: 5,
+});
+```
 
 ### Faster long jobs
 
@@ -408,7 +457,6 @@ const bakeryOnly = this.openai.inputGuardrail(
     const offTopic = text.includes('homework');
     return { tripwireTriggered: offTopic, outputInfo: { offTopic } };
   },
-  { runInParallel: false },
 );
 
 const frontDesk = this.openai.createTriageAgent(
@@ -421,7 +469,8 @@ const frontDesk = this.openai.createTriageAgent(
 ```
 
 - `tripwireTriggered: true` means stop.
-- `runInParallel: false` makes the helper wait for the check. Leave it out to run both at the same time, which is faster but may waste work.
+- The helper waits for the check. So a stopped message never reaches a tool like `cancelOrder`.
+- `runInParallel: true` runs the check and the helper at the same time. It is faster, but the helper may already have used a tool when the check says stop. Only use it for helpers whose tools change nothing.
 - A message check only runs on the **first** helper. Put it on `frontDesk`, not on `menuHelper`.
 - `createAgent` and `createSandboxAgent` take the same `inputGuardrails` list.
 
@@ -440,7 +489,6 @@ const bakeryOnly = this.openai.agentInputGuardrail(
   'Bakery only',
   topicChecker,
   (answer) => answer?.aboutBakery === false,
-  { runInParallel: false },
 );
 ```
 
@@ -553,20 +601,25 @@ Options, all optional:
 - `alwaysApprove: true` says yes to that tool for the rest of the run.
 - `alwaysReject: true` says no to that tool for the rest of the run.
 
+> [!TIP]
+> Make tools that change things safe to run twice. Cancelling order 123 when it is already cancelled should do nothing. Then a retry can never cancel two things.
+
 ### Decide later
 
-A person may not answer right away. Save the paused run as text, store it, and load it later. It is still the same run.
+A person may not answer right away. `saveRun` keeps the paused run in Postgres and gives you an id. Load it later with that id. It is still the same run, even after a restart.
 
 ```typescript
-const saved = this.openai.saveRun(result); // store this string
+const runId = await this.openai.saveRun(result); // keep this id
 
 // later, maybe in another request
-const state = await this.openai.loadRun(orderHelper, saved);
+const state = await this.openai.loadRun(orderHelper, runId);
 this.openai.approve({ state });
 const finished = await this.openai.resumeAgent(orderHelper, state);
 ```
 
-Load it with the same helper that started the run.
+- Load it with the same helper that started the run.
+- A run can be loaded **once**. If the owner clicks "Yes" twice, the second load throws, so the order is never cancelled twice.
+- If the run does not fit the helper, nothing is taken. It stays waiting.
 
 ### Streaming
 
@@ -584,6 +637,9 @@ if (streamed.interruptions?.length) {
   await this.openai.resumeAgent(orderHelper, state);
 }
 ```
+
+> [!WARNING]
+> With `stream: true`, the customer sees words as they are written. An answer check only runs at the end. So the customer may see words the check later stops. Do not stream from a helper whose answer check matters, like `keepRecipeSecret`.
 
 `outputGuardrailBlockedMessage` is optional on `runAgent` and `resumeAgent`. When an answer check blocks a tool's result, the SDK keeps a short note in its place. This option sets that note's text.
 
@@ -756,6 +812,9 @@ const again = await this.sandbox.resumeSandbox(saved, {
 ```
 
 Give `saveSandbox` and `resumeSandbox` the **same** options you gave `openSandbox`: the same `computer`, `client`, and `snapshotDir`. A Modal computer saved without `computer: 'modal'` cannot come back.
+
+> [!WARNING]
+> `snapshotDir` is a folder on this machine. The production container has a read-only disk and an empty `/tmp` after each restart, so snapshots there are lost. In production, mount a lasting volume for `snapshotDir`, or use a cloud computer such as Modal or E2B, which keeps its own snapshots.
 
 ### Quick one-off job
 
@@ -1122,13 +1181,15 @@ OpenAI can call this app when a session needs a computer. The app then makes one
 | `databricks`   | `DATABRICKS_HOST` (an `https` address) and `DATABRICKS_TOKEN`. The computer is named after the session, so a retry reuses it.                                                             |
 | `oci`          | Run `oci session authenticate --profile-name Sandbox --region <region>`. Then set `OCI_SANDBOX_PROJECT_ID`, `OCI_SANDBOX_TOKEN`, and `OCI_SANDBOX_CREATE_URL` from the current OCI guide. |
 
+The webhook needs `DATABASE_URL`. It keeps one row per session in the `remote_machines` table.
+
 Safe if things go wrong:
 
-- **Same webhook twice, or two servers:** the app writes a "taken" note on the session first and reads it back. Only one machine gets made.
-- **The machine fails to start:** the note is removed and the app answers with an error, so OpenAI tries again.
+- **Same webhook twice, or two servers:** each tries to add the session's row. The database lets only one add it, so only one machine gets made.
+- **The machine fails to start:** the row is removed and the app answers with an error, so OpenAI tries again.
 - **The machine id cannot be saved:** the machine is deleted, so nothing runs that nobody knows about.
-- **A note older than ten minutes:** it belongs to a crash. The next webhook takes over.
-- **An expired computer:** the app looks for its session among the 500 newest sessions.
+- **A row with no machine, older than ten minutes:** it belongs to a crash. One later webhook takes it over.
+- **A failed session or an expired computer:** the machine is deleted first, then its row. If the delete fails, the row stays, so the next event tries again.
 
 </details>
 
@@ -1191,9 +1252,17 @@ git push origin v1.0.0
 <summary><h2>🛡️ Reliability and state</h2></summary>
 
 > [!IMPORTANT]
-> The app keeps no data of its own. A sandbox computer lasts while it is open, until you save and resume it, or until a new one starts from its snapshot. The webhook stores each self-hosted machine id on the OpenAI session, not in this app.
+> Everything that must survive a restart lives in Postgres: chats, waiting approvals, and self-hosted machines. The app itself keeps nothing in memory that matters, so you can start, stop, or roll back copies of it at any time.
 
-Because the app keeps nothing, you can start, stop, or roll back copies of it at any time. Add your own database before you add work that must survive a restart.
+How the database stays correct when two things happen at once:
+
+| Action                         | Why it cannot happen twice                                                     |
+| ------------------------------ | ------------------------------------------------------------------------------ |
+| Loading a saved approval       | One update marks it taken, inside a transaction. A second load finds it taken. |
+| Creating a self-hosted machine | The session id is the row's key, so only one insert can win.                   |
+| Removing a chat message        | One delete with `SKIP LOCKED`, so two removals take two different messages.    |
+
+A sandbox computer lasts while it is open, until you save and resume it, or until a new one starts from its snapshot. See the `snapshotDir` warning in the Sandbox section.
 
 The app shuts down cleanly. Its error handler also catches errors from middleware, gives every request a safe id, logs unexpected errors, and never shows internal details to callers.
 

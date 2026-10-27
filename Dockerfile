@@ -30,12 +30,17 @@ RUN apk upgrade --no-cache \
   && rm -f /usr/local/bin/npm /usr/local/bin/npx
 
 COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules
+# Download the migration engine for this exact OS, so migrate deploy runs at start.
+RUN node node_modules/@prisma/engines/scripts/postinstall.js
 COPY --from=build --chown=node:node /app/dist ./dist
-COPY --chown=node:node package.json ./package.json
+COPY --chown=node:node package.json prisma.config.ts ./
+COPY --chown=node:node prisma ./prisma
 
 USER node
 EXPOSE 3000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/v1/health/live').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 
-CMD ["node", "--enable-source-maps", "dist/main.js"]
+# With DATABASE_URL set, apply new migrations first; a failed migration stops the start.
+# migrate deploy holds a Postgres lock, so replicas starting together wait their turn.
+CMD ["sh", "-c", "if [ -n \"$DATABASE_URL\" ]; then node_modules/.bin/prisma migrate deploy || exit 1; fi; exec node --enable-source-maps dist/main.js"]
