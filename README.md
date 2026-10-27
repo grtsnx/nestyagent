@@ -61,23 +61,23 @@ Swagger UI opens at `http://localhost:3000/api`. Scalar opens at `http://localho
 
 The app checks these values before it starts. A bad port, a bad true/false value, or a bad CORS origin stops it.
 
-| Variable                                                      | Default               | What it does                                                                                             |
-| ------------------------------------------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------- |
-| `NODE_ENV`                                                    | `development`         | Picks development, test, or production behavior.                                                         |
-| `PORT`                                                        | `3000`                | The HTTP port.                                                                                           |
-| `PLATFORM_NAME`                                               | `Agentic`             | The name shown on the API docs.                                                                          |
-| `CORS_ORIGINS`                                                | empty                 | Browser sites allowed to call the API, separated by commas. Empty allows none.                           |
-| `SWAGGER_ENABLED`                                             | on outside production | Turns the API docs on. Set it yourself in production.                                                    |
-| `OBSERVE_ENABLED`                                             | `false`               | Turns on NestJS Observe.                                                                                 |
-| `OBSERVE_APP_KEY`, `OBSERVE_APP_SECRET`, `OBSERVE_SERVICE_ID` | empty                 | NestJS Observe login. Needed when `OBSERVE_ENABLED` is on.                                               |
-| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` | empty            | Self-hosted Langfuse. Set all three to record traces there. Leave them empty to stay on the OpenAI dashboard. |
-| `OPENAI_API_KEY`                                              | required              | Your OpenAI key. Every helper uses it. The app does not start without it.                                |
-| `DATABASE_URL`                                                | empty                 | Your Postgres address. The app starts without it. Chats, saved approvals, and the webhook need it.       |
-| `OPENAI_HOSTED_MODEL`                                         | `gpt-6-astra`         | The model for a self-hosted session when you do not pick one.                                            |
-| `ACCOUNT_PASSWORD`                                            | empty                 | One login password the helper can use inside its computer. Empty means no password.                      |
-| `OPENAI_EXECUTOR_API_KEY`                                     | empty                 | The small key for a self-hosted computer. See Self-hosted.                                               |
-| `OPENAI_WEBHOOK_SECRET`                                       | empty                 | Proves a webhook really came from OpenAI. Empty rejects every webhook.                                   |
-| `REMOTE_MACHINE_PROVIDER`                                     | `local`               | Where the webhook starts a self-hosted computer: `local`, `aws`, `digitalocean`, `databricks`, or `oci`. |
+| Variable                                                          | Default               | What it does                                                                                                  |
+| ----------------------------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `NODE_ENV`                                                        | `development`         | Picks development, test, or production behavior.                                                              |
+| `PORT`                                                            | `3000`                | The HTTP port.                                                                                                |
+| `PLATFORM_NAME`                                                   | `Agentic`             | The name shown on the API docs.                                                                               |
+| `CORS_ORIGINS`                                                    | empty                 | Browser sites allowed to call the API, separated by commas. Empty allows none.                                |
+| `SWAGGER_ENABLED`                                                 | on outside production | Turns the API docs on. Set it yourself in production.                                                         |
+| `OBSERVE_ENABLED`                                                 | `false`               | Turns on NestJS Observe.                                                                                      |
+| `OBSERVE_APP_KEY`, `OBSERVE_APP_SECRET`, `OBSERVE_SERVICE_ID`     | empty                 | NestJS Observe login. Needed when `OBSERVE_ENABLED` is on.                                                    |
+| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` | empty                 | Self-hosted Langfuse. Set all three to record traces there. Leave them empty to stay on the OpenAI dashboard. |
+| `OPENAI_API_KEY`                                                  | required              | Your OpenAI key. Every helper uses it. The app does not start without it.                                     |
+| `DATABASE_URL`                                                    | empty                 | Your Postgres address. The app starts without it. Chats, saved approvals, and the webhook need it.            |
+| `OPENAI_HOSTED_MODEL`                                             | `gpt-6-astra`         | The model for a self-hosted session when you do not pick one.                                                 |
+| `ACCOUNT_PASSWORD`                                                | empty                 | One login password the helper can use inside its computer. Empty means no password.                           |
+| `OPENAI_EXECUTOR_API_KEY`                                         | empty                 | The small key for a self-hosted computer. See Self-hosted.                                                    |
+| `OPENAI_WEBHOOK_SECRET`                                           | empty                 | Proves a webhook really came from OpenAI. Empty rejects every webhook.                                        |
+| `REMOTE_MACHINE_PROVIDER`                                         | `local`               | Where the webhook starts a self-hosted computer: `local`, `aws`, `digitalocean`, `databricks`, or `oci`.      |
 
 The AWS, DigitalOcean, Databricks, OCI, and Cloudflare settings are in `.env.example`. The Self-hosted and Choose the computer sections say when you need them.
 
@@ -212,9 +212,20 @@ await this.openai.useMcp([files], async (servers) => {
 
 ### See the run
 
-Each customer message is a trace named `agent-turn`. A chat id groups those traces into one session. Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` to send that record to your Langfuse. Leave them empty and the same traces stay on the OpenAI dashboard, still without model and tool payloads.
+Each customer message is a trace named `agent-turn`. A chat id groups those traces into one session. Traces always go to the OpenAI dashboard, without model and tool payloads.
+
+Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` to also send each trace to your self-hosted Langfuse. Langfuse gets more than the OpenAI dashboard: the customer's message, the final answer, the chat id, the user id, the request id, the model, and token use. API keys in that text are masked. Tool inputs and outputs still stay out. Turn Langfuse on only where storing customer messages is allowed.
 
 `traceWorkflow` puts several runs in one trace. `span` records a step the helper does not already record.
+
+### Check the answers (evals)
+
+The OpenAI guide says to debug with traces first, then grade them. Langfuse does both on the traces above. Each trace has the customer's message and the helper's answer, so in Langfuse you can:
+
+1. Score traces by hand, or with an LLM-as-a-judge evaluator, for example "Did the helper give the right cake price?"
+2. Save good traces to a dataset, then run the dataset again after you change a prompt, tool, or model, and compare the scores.
+
+Pass `userId` on `runAgent` or `reply` to filter scores by customer.
 
 ### Get a filled-in form back
 
@@ -372,6 +383,21 @@ const result = await this.openai.runAgent(
   { session: chat, websocket: true },
 );
 ```
+
+### Cheaper repeat questions (prompt caching)
+
+OpenAI caches the start of a prompt it has seen recently, so a long chat costs less and answers faster. It works on its own. A helper in a saved chat also sends the chat id as its cache key, so each chat gets its own cache. One customer cannot probe another's cache, and Langfuse shows cached tokens per chat.
+
+Pass your own key to share a cache across one customer's chats:
+
+```typescript
+await this.openai.runAgent('Any cakes today?', menuHelper, {
+  session: chat,
+  promptCacheKey: 'customer-c-42',
+});
+```
+
+Keep the helper's instructions and tools the same between messages, because a cache only matches an unchanged start. A very long chat that drops old turns starts a new cache.
 
 ### A front desk that passes work on
 
