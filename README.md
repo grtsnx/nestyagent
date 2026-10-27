@@ -513,15 +513,20 @@ const agent = this.sandbox.createSandboxAgent(
 
 ### Account password
 
-`ACCOUNT_PASSWORD` is one server secret. Put it in `.env` once:
+The SDK does not ask a person for a password and does not fetch one. This NestJS app supplies one secret, and `openSandbox` copies it into the computer. The app is the process started with `bun run start:dev`. It is not OpenAI, and it is not the website the agent logs into.
+
+1. Put the password in `.env`:
 
 ```bash
 ACCOUNT_PASSWORD=the-login-secret
 ```
 
-`openSandbox` reads that value and places it in the workspace environment. The agent can use it from the computer when a site asks for a password. Leave the variable empty and the workspace starts without it.
+2. Restart this app. Startup keeps the value only when it is not blank.
+3. Call `openSandbox`. The service reads `ACCOUNT_PASSWORD` from the validated environment.
+4. The workspace starts with that name set in its environment.
+5. The agent reads `$ACCOUNT_PASSWORD` inside the computer when a login form needs it.
 
-A person does not type it on each message, and it is not written into the prompt. Every workspace this server opens receives the same secret.
+Leave the variable empty and step 3 skips it. The workspace starts without a password. The value is not written into the prompt, and a person does not type it on each message. Every workspace this app opens receives the same secret.
 
 </details>
 
