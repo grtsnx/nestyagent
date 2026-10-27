@@ -34,7 +34,8 @@ The application validates configuration before it starts. Invalid ports, boolean
 
 Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS origins without paths.
 
-## OpenAI agents
+<details>
+<summary><h2>OpenAI agents</h2></summary>
 
 `OpenaiService` is global. Inject it where you create or run an agent. `OPENAI_API_KEY` is registered once at startup and is shared by every agent.
 
@@ -231,6 +232,8 @@ const result = await this.openai.runAgent(
   { userId: '123' },
 );
 ```
+
+</details>
 
 ## Health checks
 
