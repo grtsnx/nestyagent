@@ -96,23 +96,24 @@ The AWS, DigitalOcean, Databricks, OCI, and Cloudflare settings are in `.env.exa
 
 The app uses Postgres through Prisma. The database keeps durable workflow records shared by every app replica:
 
-| Table                     | What it keeps                                                                         | Key                                           |
-| ------------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------- |
-| `chats`                   | One row per chat, with when it started and when it last moved.                        | The chat id you pick, like `chat-c-42`        |
-| `chat_items`              | Every chat message, so a helper remembers the chat.                                   | A counter, so messages stay in exact order    |
-| `paused_runs`             | Approval checkpoints, execution status, owner, and recovery notes.                    | A stable UUID assigned before saving          |
-| `remote_machines`         | Which self-hosted machine belongs to which session.                                   | OpenAI's session id                           |
-| `hosted_webhooks`         | Verified events, retries, worker leases, and terminal records.                        | OpenAI event id                               |
-| `chat_history_operations` | Completed SDK history operations and their content digest.                            | Chat id + operation id                        |
-| `execution_locks`         | Which worker is running a chat, a saved run, or a machine change.                     | The lock name, like `chat:chat-c-42`          |
-| `expired_environments`    | Environments OpenAI said are gone, so they are never started again.                   | OpenAI's environment id                       |
-| `system_prompts`          | Custom system prompts saved through the API. Without a row, the default file is used. | The helper name, like `mssuzie`               |
-| `composio_sessions`       | Each user's Composio session, so a session id never comes from a request.             | The user id                                   |
-| `agent_runs`              | One row per invocation: token deltas, time, result, and trace id. No message text.    | A UUID the database makes                     |
-| `chatkit_threads`         | Each ChatKit chat, in ChatKit's own JSON shape, with its owner.                       | ChatKit's thread id, like `thr_…`             |
-| `chatkit_items`           | Every message, widget, and step in a ChatKit chat.                                    | Thread id + item id, with a counter for order |
-| `chatkit_attachments`     | Uploaded files: name, type, owner, and the bytes.                                     | ChatKit's attachment id, like `atc_…`         |
-| `chatkit_feedback`        | Thumbs up or down on a ChatKit answer, for evals.                                     | A UUID the database makes                     |
+| Table                        | What it keeps                                                                         | Key                                           |
+| ---------------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `chats`                      | One row per chat, with when it started and when it last moved.                        | The chat id you pick, like `chat-c-42`        |
+| `chat_items`                 | Every chat message, so a helper remembers the chat.                                   | A counter, so messages stay in exact order    |
+| `paused_runs`                | Approval checkpoints, execution status, owner, and recovery notes.                    | A stable UUID assigned before saving          |
+| `remote_machines`            | Which self-hosted machine belongs to which session.                                   | OpenAI's session id                           |
+| `hosted_webhooks`            | Verified events, retries, worker leases, and terminal records.                        | OpenAI event id                               |
+| `chat_history_operations`    | Completed SDK history operations and their content digest.                            | Chat id + operation id                        |
+| `execution_locks`            | Which worker is running a chat, a saved run, or a machine change.                     | The lock name, like `chat:chat-c-42`          |
+| `expired_environments`       | Environments OpenAI said are gone, so they are never started again.                   | OpenAI's environment id                       |
+| `system_prompts`             | Custom system prompts saved through the API. Without a row, the default file is used. | The helper name, like `mssuzie`               |
+| `composio_sessions`          | Each user's Composio session, so a session id never comes from a request.             | The user id                                   |
+| `agent_runs`                 | One row per invocation: token deltas, time, result, and trace id. No message text.    | A UUID the database makes                     |
+| `chatkit_threads`            | Each ChatKit chat, in ChatKit's own JSON shape, with its owner.                       | ChatKit's thread id, like `thr_…`             |
+| `chatkit_items`              | Every message, widget, and step in a ChatKit chat.                                    | Thread id + item id, with a counter for order |
+| `chatkit_attachments`        | Uploaded files: name, type, owner, and the bytes.                                     | ChatKit's attachment id, like `atc_…`         |
+| `chatkit_feedback`           | Thumbs up or down on a ChatKit answer, for evals.                                     | A UUID the database makes                     |
+| `chatkit_operation_receipts` | Every accepted ChatKit retry id, so a replayed request never runs twice.              | Thread id + request key                       |
 
 How the tables are built:
 
@@ -974,6 +975,9 @@ When MsSuzie calls a tool that needs a yes, like `cancelOrder`, the run pauses a
 - Runs also save `AGENT_VERSION` from `src/modules/chatkit/chatkit.service.ts`. Change it when MsSuzie's tools change in a way an old run cannot handle. A card saved before that change closes as "This request expired after an update. Please ask again." when clicked, and nothing runs.
 - The card changes to "Approved." or "Declined." only after the saved run is claimed.
 - **A new message means no.** If the customer types instead of clicking, the waiting request is cancelled without running, its card shows "Declined.", and MsSuzie answers the new message.
+  - The checkpoint and the "Declined." card are saved in one database transaction. If that write fails, neither changes and the message is refused, so the customer can send it again.
+  - The open window gets the new card right away (`thread.item.replaced`), only after it was saved.
+  - The decline is saved before the new message. If saving the message itself then fails, the decline stays and the customer sends the message again.
 - **An interrupted action pauses the chat.** If a server stops while an approved action runs, nobody knows whether it happened. The chat shows "This chat is paused while the team checks an earlier action. Please try again later." until an admin checks it (see below).
 - Deleting the thread deletes its live approval checkpoints. Another thread cannot resume them. A second click cannot execute a completed checkpoint again.
 
@@ -1010,7 +1014,7 @@ The wire protocol carries a result without a tool-call id. Keep browser tools se
 
 Accepted results and continuation markers commit together. An explicitly retryable failure can continue from the saved result; an uncertain failure or a worker restart leaves the operation blocked for reconciliation. Duplicate completed results do not rerun the completed continuation. Retry deletion follows the same durable operation lifecycle. Only an explicit `CustomStreamError(message, true)` certifies that the application can safely retry before committing output; generic stream failures require reconciliation.
 
-For custom clients, set `metadata.client_tool_call_id` on every tool-result request to the pending item's `call_id`. The first call accepts the stock request shape; later new calls require this identity so a delayed earlier result cannot be assigned to the wrong tool. An identical retry of the currently completed result does nothing. Custom clients that use multiple browser tools must supply this field through their request adapter. Set `metadata.operation_id` to a new id for each deliberate retry, preserving it on network retries. Without that id, repeating a successful retry for the same message does nothing. These fields resolve ambiguities in the stock request shape.
+For custom clients, set `metadata.client_tool_call_id` on every tool-result request to the pending item's `call_id`. The first call accepts the stock request shape; later new calls require this identity so a delayed earlier result cannot be assigned to the wrong tool. An identical retry of the currently completed result does nothing. Custom clients that use multiple browser tools must supply this field through their request adapter. Set `metadata.operation_id` to a new id for each deliberate retry, preserving it on network retries. Without that id, repeating a successful retry for the same message does nothing. Every accepted id is kept in `chatkit_operation_receipts` for as long as the chat exists, so an old id replayed after many newer ones still does nothing. These fields resolve ambiguities in the stock request shape.
 
 **Unpause a chat.** An admin first checks the real system, for example whether order 42 was really cancelled, then calls one of these with the admin key. Both take the same thread lock as chat requests and check the owner. Neither undoes an action, so check first.
 
@@ -1030,7 +1034,7 @@ curl -X POST https://api.sunnybakery.example/v1/chatkit/threads/thr_…/approval
   -d '{"userId": "customer-42", "version": 1, "note": "Checked: order 42 was not cancelled."}'
 ```
 
-The new card is saved with a new version, and the customer sees it when the chat reloads. Older cards stay invalid. A chat with nothing to recover answers 400, and another user's chat or run answers 404. The migration upgrades the latest legacy waiting card so existing threads can still answer their approvals. Historical usage rows without thread identity cannot be linked retrospectively.
+The new card is saved with a new version, and the customer sees it when the chat reloads. Older cards stay invalid. Both routes validate the same way: a blank note answers 400, and a run id that is not a UUID answers 400. A chat with nothing to recover answers 400. A `version` that no longer matches, because the run moved on since the admin checked it, answers 409; reload `GET /v1/admin/approvals` and check again. Another user's chat or run answers 404. The migration upgrades the latest legacy waiting card so existing threads can still answer their approvals. Historical usage rows without thread identity cannot be linked retrospectively.
 
 ### @-mentions (entities)
 
@@ -1048,14 +1052,15 @@ With `entities.onTagSearch` on the page, a user can type `@` and pick something,
 
 ### Tables
 
-| Table                 | What it keeps                                               |
-| --------------------- | ----------------------------------------------------------- |
-| `chatkit_threads`     | Each chat in ChatKit's own JSON shape, with its owner.      |
-| `chatkit_items`       | Messages, widgets, steps, and hidden notes, in exact order. |
-| `chatkit_attachments` | Uploaded files, their owner, and their bytes.               |
-| `chatkit_feedback`    | Thumbs up and down, with the items they are about.          |
+| Table                        | What it keeps                                               |
+| ---------------------------- | ----------------------------------------------------------- |
+| `chatkit_threads`            | Each chat in ChatKit's own JSON shape, with its owner.      |
+| `chatkit_items`              | Messages, widgets, steps, and hidden notes, in exact order. |
+| `chatkit_attachments`        | Uploaded files, their owner, and their bytes.               |
+| `chatkit_feedback`           | Thumbs up and down, with the items they are about.          |
+| `chatkit_operation_receipts` | Every accepted retry id and its last state.                 |
 
-Items are stored as ChatKit JSON; structural database changes still require migrations. Deleting a chat deletes its items, files, and bound approval checkpoints. Responses streaming and Chat Completions final messages share the same persisted assistant-message format. Hidden events stay server-side, and opaque JSON payloads retain explicit `null` values.
+Items are stored as ChatKit JSON; structural database changes still require migrations. Deleting a chat deletes its items, files, retry receipts, and bound approval checkpoints. Responses streaming and Chat Completions final messages share the same persisted assistant-message format. Hidden events stay server-side, and opaque JSON payloads retain explicit `null` values.
 
 </details>
 
@@ -1357,7 +1362,7 @@ const finished = await this.openai.resumeAgent(orderHelper, state);
 
 ### Nobody answers
 
-While a question waits, that chat takes no new messages. If the customer never answers, `cancelRun` settles the waiting checkpoint and its chat history in one database transaction. It removes unexecuted approval placeholders and adds a cancellation message without calling a model or tool. The checkpoint becomes `completed` with recovery note `cancelled`, and the method returns `{ id, status: 'cancelled' }`. Repeating cancellation returns the same receipt; a stale resume is rejected. Interrupted actions must be reconciled before cancellation.
+While a question waits, that chat takes no new messages. If the customer never answers, `cancelRun` settles the waiting checkpoint and its chat history in one database transaction. It removes unexecuted approval placeholders and adds a cancellation message without calling a model or tool. The placeholders are found in the saved checkpoint data alone. The agent is never rebuilt, so cancelling works even after a tool was removed or the agent changed, and no agent callback runs. The checkpoint becomes `completed` with recovery note `cancelled`, and the method returns `{ id, status: 'cancelled' }`. Repeating cancellation returns the same receipt; a stale resume is rejected. Interrupted actions must be reconciled before cancellation.
 
 ```typescript
 const receipt = await this.openai.cancelRun(orderHelper, runId, {

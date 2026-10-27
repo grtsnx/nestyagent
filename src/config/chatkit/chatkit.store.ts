@@ -12,6 +12,7 @@ import {
   type Page,
   type ThreadItem,
   type ThreadMetadata,
+  type ThreadOperation,
 } from '@/lib/chatkit/chatkit.service.js';
 import {
   isUniqueViolation,
@@ -192,6 +193,39 @@ export class ChatKitStore extends Store<ChatKitContext> {
       await this.loadThread(threadId, context);
       await this.prisma.connection.chatkitItem.deleteMany({
         where: { threadId, id: itemId, thread: { userId: context.userId } },
+      });
+    });
+  }
+
+  async loadOperationReceipt(
+    threadId: string,
+    requestKey: string,
+    context: ChatKitContext,
+  ) {
+    const row = await this.prisma.connection.chatkitOperationReceipt.findFirst({
+      where: { threadId, requestKey, thread: { userId: context.userId } },
+      select: { data: true },
+    });
+    return row?.data as unknown as ThreadOperation | undefined;
+  }
+
+  async saveOperationReceipt(
+    threadId: string,
+    operation: ThreadOperation & { requestKey: string },
+    context: ChatKitContext,
+  ) {
+    return await this.prisma.transaction(async () => {
+      await this.loadThread(threadId, context);
+      await this.prisma.connection.chatkitOperationReceipt.upsert({
+        where: {
+          threadId_requestKey: { threadId, requestKey: operation.requestKey },
+        },
+        create: {
+          threadId,
+          requestKey: operation.requestKey,
+          data: json(operation),
+        },
+        update: { data: json(operation) },
       });
     });
   }

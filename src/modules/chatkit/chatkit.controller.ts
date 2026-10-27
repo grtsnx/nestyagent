@@ -395,9 +395,15 @@ export class ChatKitController {
     '/v1/chatkit/threads/thr_1/approvals/0192f1e2-0000-7000-8000-000000000001/recover',
   )
   @ApiFailure(
+    HttpStatus.BAD_REQUEST,
+    'The run id is not a UUID, or the note is blank.',
+    'The run id must be a UUID.',
+    '/v1/chatkit/threads/thr_1/approvals/not-a-uuid/recover',
+  )
+  @ApiFailure(
     HttpStatus.CONFLICT,
-    'The approval is not interrupted, or it changed since the admin checked it.',
-    'Only an interrupted run can be recovered.',
+    'The approval is not interrupted, or its version changed since the admin checked it.',
+    'This approval changed since it was checked. Reload the approvals list.',
     '/v1/chatkit/threads/thr_1/approvals/0192f1e2-0000-7000-8000-000000000001/recover',
   )
   @UseGuards(AdminKeyGuard)

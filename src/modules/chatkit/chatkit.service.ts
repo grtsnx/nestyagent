@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { ConflictException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RunState, type Agent, type StreamedRunResult } from '@openai/agents';
 import { toFile } from 'openai';
@@ -9,7 +9,9 @@ import {
   AgentContext,
   ChatKitService,
   CustomStreamError,
+  InvalidRequestError,
   NotFoundError,
+  requireRecoveryNote,
   streamAgentResponse,
   ThreadItemConverter,
   type Action,
@@ -135,6 +137,9 @@ export class MsSuzieChatKitService extends ChatKitService<ChatKitContext> {
     recovery: { version: number; note: string },
     context: ChatKitContext,
   ): Promise<WidgetItem> {
+    if (!z.uuid().safeParse(runId).success)
+      throw new InvalidRequestError('The run id must be a UUID.');
+    requireRecoveryNote(recovery.note);
     return this.prisma.withLock(`chatkit:${threadId}`, async () => {
       const thread = await this.store.loadThread(threadId, context);
       const owned = await this.prisma.connection.pausedRun.findFirst({
@@ -143,9 +148,13 @@ export class MsSuzieChatKitService extends ChatKitService<ChatKitContext> {
           chatkitThreadId: threadId,
           ownerId: context.userId,
         },
-        select: { id: true },
+        select: { version: true },
       });
       if (!owned) throw new NotFoundError('Approval not found.');
+      if (owned.version !== recovery.version)
+        throw new ConflictException(
+          'This approval changed since it was checked. Reload the approvals list.',
+        );
       const { agent, agentVersion } = await this.configuredAgent();
       const checkpoint = this.checkpointCard(thread, context);
       await this.openai.recoverRun(agent, runId, {
@@ -177,8 +186,18 @@ export class MsSuzieChatKitService extends ChatKitService<ChatKitContext> {
     });
     if (open.some((run) => run.status !== 'waiting'))
       throw new CustomStreamError(CHAT_PAUSED);
-    for (const run of open)
-      await this.closeApproval(thread.id, run, DECLINED, context);
+    // Sent after each commit, so the open window shows "Declined." at once.
+    const events: ThreadStreamEvent[] = [];
+    for (const run of open) {
+      const closed = await this.closeApproval(
+        thread.id,
+        run,
+        DECLINED,
+        context,
+      );
+      if (closed) events.push({ type: 'thread.item.replaced', item: closed });
+    }
+    return events;
   }
 
   async *respond(
@@ -340,22 +359,27 @@ export class MsSuzieChatKitService extends ChatKitService<ChatKitContext> {
     context: ChatKitContext,
   ) {
     // The card belongs to the version being closed; cancelling moves the version on.
-    const cardId = approvalItemId(run.id, run.version);
+    const card = await this.store
+      .loadItem(threadId, approvalItemId(run.id, run.version), context)
+      .catch((error: unknown) => {
+        // A card deleted with its message is fine; the run is still cancelled.
+        if (error instanceof NotFoundError) return undefined;
+        throw error;
+      });
+    const closed: WidgetItem | undefined =
+      card?.type === 'widget'
+        ? { ...card, widget: answeredCard(outcome) }
+        : undefined;
+    // The checkpoint and its card commit together, or neither changes.
     await this.openai.cancelRun(this.agent(), run.id, {
       ownerId: context.userId,
       chatkitThreadId: threadId,
+      version: run.version,
+      ...(closed && {
+        onCancel: () => this.store.saveItem(threadId, closed, context),
+      }),
     });
-    try {
-      const card = await this.store.loadItem(threadId, cardId, context);
-      if (card.type !== 'widget') return undefined;
-      const closed = { ...card, widget: answeredCard(outcome) };
-      await this.store.saveItem(threadId, closed, context);
-      return closed;
-    } catch (error) {
-      // The card was deleted with its message; the run is still cancelled.
-      if (error instanceof NotFoundError) return undefined;
-      throw error;
-    }
+    return closed;
   }
 
   private checkpointCard(thread: ThreadMetadata, context: ChatKitContext) {

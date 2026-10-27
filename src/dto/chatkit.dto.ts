@@ -5,6 +5,7 @@ import {
   IsOptional,
   IsString,
   Length,
+  Matches,
   Max,
   Min,
 } from 'class-validator';
@@ -68,6 +69,7 @@ class ChatKitRecoveryDto {
   })
   @IsString()
   @Length(1, 1000)
+  @Matches(/\S/, { message: 'note must not be blank' })
   note: string;
 }
 

@@ -192,6 +192,123 @@ describe('Durable ChatKit approvals in Postgres', () => {
     };
   }
 
+  it('keeps the approval untouched when its declined card cannot be stored', async () => {
+    const f = await fixture([
+      { call: { name: 'effect' } },
+      { text: 'Sure, what else?' },
+    ]);
+    const paused = await f.create();
+    const before = await prisma.db.pausedRun.findFirstOrThrow({
+      where: { ownerId: f.context.userId },
+    });
+    const save = f.store.saveItem.bind(f.store);
+    const write = vi
+      .spyOn(f.store, 'saveItem')
+      .mockImplementation(async (id, item, context) => {
+        if (item.type === 'widget') throw new Error('Card write failed.');
+        return save(id, item, context);
+      });
+    const message = {
+      type: 'threads.add_user_message',
+      params: { thread_id: paused.threadId, input },
+    };
+    await expect(f.send(message)).rejects.toThrow('Card write failed.');
+    // Checkpoint, card, and history are exactly as before: nothing half-done.
+    expect(
+      await prisma.db.pausedRun.findUniqueOrThrow({ where: { id: before.id } }),
+    ).toMatchObject({ status: 'waiting', version: before.version });
+    expect(
+      JSON.stringify(
+        await f.store.loadItem(paused.threadId, paused.card.id, f.context),
+      ),
+    ).not.toContain('Declined.');
+    const users = async () =>
+      (
+        await f.store.loadThreadItems(
+          paused.threadId,
+          null,
+          50,
+          'asc',
+          f.context,
+        )
+      ).data.filter((item) => item.type === 'user_message');
+    expect(await users()).toHaveLength(1);
+
+    // Once the store works again, the same message declines the card and is answered.
+    write.mockRestore();
+    const events = await f.send(message);
+    const stored = await f.store.loadItem(
+      paused.threadId,
+      paused.card.id,
+      f.context,
+    );
+    expect(JSON.stringify(stored)).toContain('Declined.');
+    expect(events).toContainEqual({
+      type: 'thread.item.replaced',
+      item: stored,
+    });
+    expect(
+      await prisma.db.pausedRun.findUniqueOrThrow({ where: { id: before.id } }),
+    ).toMatchObject({ status: 'completed', recoveryNote: 'cancelled' });
+    expect(await users()).toHaveLength(2);
+    expect(f.effect).not.toHaveBeenCalled();
+  });
+
+  it('moves retry receipts out of thread metadata without losing any', async () => {
+    const client = new Client({ connectionString: databaseUrl });
+    await client.connect();
+    const schema = `receipts_${randomUUID().replaceAll('-', '')}`;
+    const receipt = { id: 'request-0', kind: 'retry', status: 'completed' };
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}"`);
+      await client.query(
+        'CREATE TABLE chatkit_threads(id text PRIMARY KEY, data jsonb)',
+      );
+      await client.query(
+        "INSERT INTO chatkit_threads VALUES ('thr_old', $1), ('thr_plain', $2)",
+        [
+          {
+            id: 'thr_old',
+            metadata: {
+              keep: true,
+              _chatkit_retry_receipts: { 'request:request-0': receipt },
+            },
+          },
+          { id: 'thr_plain', metadata: {} },
+        ],
+      );
+      // The test owns the transaction, so it can roll the whole schema back.
+      await client.query(
+        readFileSync(
+          new URL(
+            '../../prisma/migrations/20261028020000_chatkit_operation_receipts/migration.sql',
+            import.meta.url,
+          ),
+          'utf8',
+        ).replace(/^(BEGIN|COMMIT);$/gm, ''),
+      );
+      const receipts = await client.query(
+        'SELECT thread_id, request_key, data FROM chatkit_operation_receipts',
+      );
+      expect(receipts.rows).toEqual([
+        {
+          thread_id: 'thr_old',
+          request_key: 'request:request-0',
+          data: receipt,
+        },
+      ]);
+      const threads = await client.query(
+        "SELECT data FROM chatkit_threads WHERE id = 'thr_old'",
+      );
+      expect(threads.rows[0].data.metadata).toEqual({ keep: true });
+    } finally {
+      await client.query('ROLLBACK');
+      await client.end();
+    }
+  });
+
   it('rolls back the initial checkpoint when its approval card cannot be stored', async () => {
     const f = await fixture();
     const add = f.store.addThreadItem.bind(f.store);

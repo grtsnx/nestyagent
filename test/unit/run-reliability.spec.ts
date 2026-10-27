@@ -2,6 +2,7 @@ import { ConfigService } from '@nestjs/config';
 import {
   Agent,
   OpenAIProvider,
+  RunState,
   Usage,
   handoff,
   setTracingDisabled,
@@ -180,6 +181,40 @@ describe('runtime reliability with the real SDK', () => {
       }
     },
   );
+
+  it('cancels from saved data alone, even after the paused tool was removed', async () => {
+    const { db, openai } = fixture();
+    const execute = vi.fn(async () => 'confirmed');
+    const respond = vi.fn<Model['getResponse']>(async () => call());
+    const agent = new Agent({
+      name: 'Orders',
+      model: model(respond),
+      tools: [approval(execute)],
+    });
+    const session = openai.createSession('cancel-updated');
+    const paused = await openai.runAgent('Confirm.', agent, { session });
+    const id = await openai.saveRun(paused);
+    // An update removed the tool. Restoring the run would fail with "Tool not found".
+    const updated = new Agent({ name: 'Orders', model: model(respond) });
+    const restore = vi.spyOn(RunState, 'fromString');
+    await expect(openai.cancelRun(updated, id)).resolves.toEqual({
+      id,
+      status: 'cancelled',
+    });
+    // Nothing is rebuilt, so no model, tool, or agent callback can run.
+    expect(restore).not.toHaveBeenCalled();
+    expect(respond).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
+    expect(await session.getItems()).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'function_call' }),
+      ]),
+    );
+    expect(db.pausedRun.rows[0]).toMatchObject({
+      status: 'completed',
+      recoveryNote: 'cancelled',
+    });
+  });
 
   it('cancels atomically without invoking the model or tools again, then admits the next turn', async () => {
     const { db, openai } = fixture();

@@ -3,6 +3,8 @@ import { Test } from '@nestjs/testing';
 import { OpenAIProvider, setTracingDisabled } from '@openai/agents';
 import request from 'supertest';
 import { vi } from 'vitest';
+import { randomUUID } from 'node:crypto';
+import { PrismaService } from '@/lib/prisma/prisma.service.js';
 import { scriptedModel } from '../unit/chatkit-model.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -292,5 +294,37 @@ describe('ChatKit over HTTP', () => {
       .set('x-admin-key', ADMIN_KEY)
       .send({ userId, version: 0, note: 'Checked.' })
       .expect(404);
+
+    // An interrupted approval in this chat, at version 2.
+    const runId = randomUUID();
+    await app.get(PrismaService).db.pausedRun.create({
+      data: {
+        id: runId,
+        state: '{}',
+        status: 'recovery_required',
+        version: 2,
+        chatkitThreadId: threadId,
+        ownerId: userId,
+        agentName: 'MsSuzie',
+      },
+    });
+    const approval = `/v1/chatkit/threads/${threadId}/approvals/${runId}/recover`;
+    const checked = { userId, version: 2, note: 'Checked: nothing ran.' };
+    const recover = (path: string, payload: object) =>
+      http().post(path).set('x-admin-key', ADMIN_KEY).send(payload);
+
+    // Expected client mistakes are client errors, never 500.
+    await recover(approval, { ...checked, version: 1 }).expect(409);
+    await recover(approval, { ...checked, note: '   ' }).expect(400);
+    await recover(`/v1/chatkit/threads/${threadId}/recover`, {
+      ...body,
+      note: '   ',
+    }).expect(400);
+    await recover(
+      `/v1/chatkit/threads/${threadId}/approvals/not-a-uuid/recover`,
+      checked,
+    ).expect(400);
+    await recover(approval, { ...checked, userId: 'someone-else' }).expect(404);
+    await http().post(approval).send(checked).expect(401);
   });
 });

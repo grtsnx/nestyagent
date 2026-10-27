@@ -592,21 +592,10 @@ export type ThreadOperation = {
 };
 
 const key = '_chatkit_operation';
-const receiptsKey = '_chatkit_retry_receipts';
-// Enough to answer a delayed duplicate retry; older receipts are dropped so the thread stays small.
-const MAX_RECEIPTS = 50;
 const clientResultsKey = '_chatkit_has_client_result';
-const retryKey = (itemId: string, requestId?: string) =>
+// Receipts live in the store, not in thread metadata, so they never need pruning.
+export const retryKey = (itemId: string, requestId?: string) =>
   requestId ? `request:${requestId}` : `item:${itemId}`;
-export function retryReceipt(
-  thread: ThreadMetadata,
-  itemId: string,
-  requestId?: string,
-) {
-  const receipts = thread.metadata[receiptsKey] as
-    Record<string, ThreadOperation> | undefined;
-  return receipts?.[retryKey(itemId, requestId)];
-}
 export function hasClientResult(thread: ThreadMetadata) {
   return thread.metadata[clientResultsKey] === true;
 }
@@ -620,16 +609,6 @@ export function setOperation(
   thread.metadata[key] = operation;
   if (operation.kind === 'client_output')
     thread.metadata[clientResultsKey] = true;
-  if (operation.requestKey) {
-    const receipts = Object.entries(
-      (thread.metadata[receiptsKey] as
-        Record<string, ThreadOperation> | undefined) ?? {},
-    ).filter(([requestKey]) => requestKey !== operation.requestKey);
-    receipts.push([operation.requestKey, { ...operation }]);
-    thread.metadata[receiptsKey] = Object.fromEntries(
-      receipts.slice(-MAX_RECEIPTS),
-    );
-  }
 }
 export function clearOperation(thread: ThreadMetadata) {
   delete thread.metadata[key];
@@ -763,6 +742,20 @@ export abstract class Store<TContext> {
     itemId: string,
     context: TContext,
   ): Promise<void>;
+
+  //1. Every accepted retry id, kept as long as its thread, so a replay never runs twice.
+  //2. Saved in the same transaction as the thread's current operation.
+  abstract loadOperationReceipt(
+    threadId: string,
+    requestKey: string,
+    context: TContext,
+  ): Promise<ThreadOperation | undefined>;
+
+  abstract saveOperationReceipt(
+    threadId: string,
+    operation: ThreadOperation & { requestKey: string },
+    context: TContext,
+  ): Promise<void>;
 }
 
 // File bytes. Required for attachments; ChatKitService calls it before Store.deleteAttachment.
@@ -792,6 +785,7 @@ export abstract class AttachmentStore<TContext> {
 export class MemoryStore<TContext = unknown> extends Store<TContext> {
   private readonly threads = new Map<string, ThreadMetadata>();
   private readonly items = new Map<string, ThreadItem[]>();
+  private readonly receipts = new Map<string, Map<string, ThreadOperation>>();
   private readonly attachments = new Map<string, Attachment>();
   private readonly transactions = new AsyncLocalStorage<{
     active: boolean;
@@ -911,8 +905,32 @@ export class MemoryStore<TContext = unknown> extends Store<TContext> {
     return this.transact(async () => {
       this.remember(this.threads, threadId);
       this.remember(this.items, threadId);
+      this.remember(this.receipts, threadId);
       this.threads.delete(threadId);
       this.items.delete(threadId);
+      this.receipts.delete(threadId);
+    });
+  }
+
+  loadOperationReceipt(
+    threadId: string,
+    requestKey: string,
+    _context?: TContext,
+  ) {
+    const receipt = this.receipts.get(threadId)?.get(requestKey);
+    return Promise.resolve(receipt && structuredClone(receipt));
+  }
+
+  saveOperationReceipt(
+    threadId: string,
+    operation: ThreadOperation & { requestKey: string },
+    _context?: TContext,
+  ) {
+    return this.transact(async () => {
+      this.remember(this.receipts, threadId);
+      const receipts = this.receipts.get(threadId) ?? new Map();
+      receipts.set(operation.requestKey, structuredClone(operation));
+      this.receipts.set(threadId, receipts);
     });
   }
 
@@ -1155,6 +1173,12 @@ export class InvalidRequestError extends Error {
   }
 }
 
+// Every recovery records what the admin checked. A blank note is a client error.
+export function requireRecoveryNote(note: string) {
+  if (!note.trim())
+    throw new InvalidRequestError('A reconciliation note is required.');
+}
+
 // Shown while an interrupted action waits for an admin check.
 export const CHAT_PAUSED =
   'This chat is paused while the team checks an earlier action. Please try again later.';
@@ -1177,12 +1201,13 @@ export abstract class ChatKitService<TContext> {
     context: TContext,
   ): AsyncIterable<ThreadStreamEvent>;
 
-  // Validate application state before committing a new turn or a retry.
+  //1. Validate application state before committing a new turn or a retry.
+  //2. Returned events describe changes it already committed; they are streamed before the turn.
   prepareRespond(
     _thread: ThreadMetadata,
     _input: UserMessageItem | undefined,
     _context: TContext,
-  ): Promise<void> {
+  ): Promise<ThreadStreamEvent[] | void> {
     return Promise.resolve();
   }
 
@@ -1193,8 +1218,7 @@ export abstract class ChatKitService<TContext> {
     recovery: { decision: 'retry' | 'cancel'; note: string },
     context: TContext,
   ) {
-    if (!recovery.note.trim())
-      throw new InvalidRequestError('A reconciliation note is required.');
+    requireRecoveryNote(recovery.note);
     await this.store.transaction(threadId, context, async (store) => {
       const thread = await store.loadThread(threadId, context);
       const operation = operationOf(thread);
@@ -1225,8 +1249,26 @@ export abstract class ChatKitService<TContext> {
       operation.status =
         recovery.decision === 'retry' ? 'pending' : 'completed';
       operation.recoveryNote = recovery.note;
-      setOperation(thread, operation);
-      await store.saveThread(thread, context);
+      await this.saveOperation(thread, operation, context, store);
+    });
+  }
+
+  // The thread's current operation and its retry receipt commit together.
+  private async saveOperation(
+    thread: ThreadMetadata,
+    operation: ThreadOperation,
+    context: TContext,
+    store: Store<TContext> = this.store,
+  ) {
+    setOperation(thread, operation);
+    await store.transaction(thread.id, context, async (tx) => {
+      if (operation.requestKey)
+        await tx.saveOperationReceipt(
+          thread.id,
+          { ...operation, requestKey: operation.requestKey },
+          context,
+        );
+      await tx.saveThread(thread, context);
     });
   }
 
@@ -1563,15 +1605,14 @@ export abstract class ChatKitService<TContext> {
             request.params.result,
           );
           operation.callId = call.call_id;
-          await this.prepareRespond(thread, undefined, context);
+          yield* (await this.prepareRespond(thread, undefined, context)) ?? [];
           await this.store.transaction(thread.id, context, async (store) => {
             await store.saveItem(
               thread.id,
               { ...call, output: request.params.result, status: 'completed' },
               context,
             );
-            setOperation(thread, operation);
-            await store.saveThread(thread, context);
+            await this.saveOperation(thread, operation, context, store);
           });
         }
         yield* this.processEvents(
@@ -1598,7 +1639,7 @@ export abstract class ChatKitService<TContext> {
             `Item ${request.params.item_id} is not a structured input.`,
           );
         this.assertOperationReady(thread);
-        await this.prepareRespond(thread, undefined, context);
+        yield* (await this.prepareRespond(thread, undefined, context)) ?? [];
         const answered = this.applyStructuredInput(item, request.params.input);
         const respond = this.respond.bind(this);
         yield* this.processEvents(
@@ -1621,7 +1662,11 @@ export abstract class ChatKitService<TContext> {
         const requestId = this.operationIdentity(
           request.metadata?.operation_id,
         );
-        const receipt = retryReceipt(thread, request.params.item_id, requestId);
+        const receipt = await this.store.loadOperationReceipt(
+          thread.id,
+          retryKey(request.params.item_id, requestId),
+          context,
+        );
         if (receipt && receipt.itemId !== request.params.item_id)
           throw new InvalidRequestError(
             'The operation id was already used for a different request.',
@@ -1652,12 +1697,11 @@ export abstract class ChatKitService<TContext> {
         }
         if (!message)
           throw new InvalidRequestError('Retry target was not found.');
-        await this.prepareRespond(thread, message, context);
+        yield* (await this.prepareRespond(thread, message, context)) ?? [];
         await this.store.transaction(thread.id, context, async (store) => {
           for (const item of removed)
             await store.deleteThreadItem(thread.id, item.id, context);
-          setOperation(thread, operation);
-          await store.saveThread(thread, context);
+          await this.saveOperation(thread, operation, context, store);
         });
         const retried = message;
         yield* this.processEvents(
@@ -1776,7 +1820,7 @@ export abstract class ChatKitService<TContext> {
           'Complete the pending browser tool before starting another turn.',
         );
     }
-    await this.prepareRespond(thread, message, context);
+    yield* (await this.prepareRespond(thread, message, context)) ?? [];
     // The message and all its attachment bindings share one commit.
     await this.store.transaction(thread.id, context, async (store) => {
       for (const attachment of message.attachments)
@@ -1824,8 +1868,7 @@ export abstract class ChatKitService<TContext> {
       signal?.throwIfAborted();
       if (operation) {
         operation.status = 'running';
-        setOperation(thread, operation);
-        await this.store.saveThread(thread, context);
+        await this.saveOperation(thread, operation, context, this.store);
         saved = JSON.stringify(thread);
       }
       responseStarted = true;
@@ -1864,8 +1907,7 @@ export abstract class ChatKitService<TContext> {
       signal?.throwIfAborted();
       if (operation) {
         operation.status = 'completed';
-        setOperation(thread, operation);
-        await this.store.saveThread(thread, context);
+        await this.saveOperation(thread, operation, context, this.store);
       }
       operationSettled = true;
     } catch (error) {
@@ -1881,8 +1923,7 @@ export abstract class ChatKitService<TContext> {
           !responseStarted || (retryable && !signal?.aborted)
             ? 'pending'
             : 'recovery_required';
-        setOperation(thread, operation);
-        await this.store.saveThread(thread, context);
+        await this.saveOperation(thread, operation, context, this.store);
       }
       if (signal?.aborted) {
         await this.handleStreamCancelled(
@@ -1925,8 +1966,7 @@ export abstract class ChatKitService<TContext> {
       // once execution began, a disconnected consumer cannot attest its outcome.
       if (operation && responseStarted && !operationSettled) {
         operation.status = 'recovery_required';
-        setOperation(thread, operation);
-        await this.store.saveThread(thread, context);
+        await this.saveOperation(thread, operation, context, this.store);
       }
     }
     if (await threadChanged())

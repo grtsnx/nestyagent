@@ -64,20 +64,20 @@ enum PausedRunStatus {
 
 // A versioned approval checkpoint. Interrupted execution requires reconciliation.
 model PausedRun {
-  id           String          @id @default(uuid(7)) @db.Uuid
-  state        String
-  status       PausedRunStatus @default(waiting)
-  version      Int             @default(0)
-  chatId       String?         @map("chat_id")
-  chatkitThreadId String?      @map("chatkit_thread_id")
-  chatkitThread ChatkitThread? @relation(fields: [chatkitThreadId], references: [id], onDelete: Cascade)
-  agentName    String?         @map("agent_name")
-  agentVersion String?         @map("agent_version")
-  ownerId      String?         @map("owner_id")
-  runOptions   Json?           @map("run_options")
-  recoveryNote String?         @map("recovery_note")
-  createdAt    DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt    DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  id              String          @id @default(uuid(7)) @db.Uuid
+  state           String
+  status          PausedRunStatus @default(waiting)
+  version         Int             @default(0)
+  chatId          String?         @map("chat_id")
+  chatkitThreadId String?         @map("chatkit_thread_id")
+  chatkitThread   ChatkitThread?  @relation(fields: [chatkitThreadId], references: [id], onDelete: Cascade)
+  agentName       String?         @map("agent_name")
+  agentVersion    String?         @map("agent_version")
+  ownerId         String?         @map("owner_id")
+  runOptions      Json?           @map("run_options")
+  recoveryNote    String?         @map("recovery_note")
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   @@index([chatkitThreadId, status])
   @@map("paused_runs")
@@ -194,22 +194,22 @@ enum ConversationType {
 // One helper run, for the admin monitoring routes: tokens, time, result, and its trace.
 // It holds no message text, only numbers and ids.
 model AgentRun {
-  id           String         @id @default(uuid(7)) @db.Uuid
-  chatId       String?        @map("chat_id")
+  id               String           @id @default(uuid(7)) @db.Uuid
+  chatId           String?          @map("chat_id")
   conversationType ConversationType @default(chat) @map("conversation_type")
-  agent        String
-  model        String?
-  userId       String?        @map("user_id")
-  status       AgentRunStatus
-  error        String?
-  requests     Int            @default(0)
-  inputTokens  Int            @default(0) @map("input_tokens")
-  outputTokens Int            @default(0) @map("output_tokens")
-  cachedTokens Int            @default(0) @map("cached_tokens")
-  durationMs   Int            @map("duration_ms")
-  traceId      String?        @map("trace_id")
-  requestId    String?        @map("request_id")
-  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  agent            String
+  model            String?
+  userId           String?          @map("user_id")
+  status           AgentRunStatus
+  error            String?
+  requests         Int              @default(0)
+  inputTokens      Int              @default(0) @map("input_tokens")
+  outputTokens     Int              @default(0) @map("output_tokens")
+  cachedTokens     Int              @default(0) @map("cached_tokens")
+  durationMs       Int              @map("duration_ms")
+  traceId          String?          @map("trace_id")
+  requestId        String?          @map("request_id")
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
 
   // Usage by day and recent runs read by time; one chat's runs read by chat.
   @@index([createdAt])
@@ -221,18 +221,32 @@ model AgentRun {
 // A ChatKit conversation. data holds ChatKit's own thread shape as JSON, so a ChatKit
 // update needs no migration. Every row belongs to one user, and every query checks it.
 model ChatkitThread {
-  id          String              @id
-  userId      String              @map("user_id")
+  id          String                    @id
+  userId      String                    @map("user_id")
   data        Json
-  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt   DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt   DateTime                  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime                  @updatedAt @map("updated_at") @db.Timestamptz(3)
   items       ChatkitItem[]
   attachments ChatkitAttachment[]
   pausedRuns  PausedRun[]
+  receipts    ChatkitOperationReceipt[]
 
   // A user's threads, newest first.
   @@index([userId, createdAt])
   @@map("chatkit_threads")
+}
+
+// An accepted retry id and its last state, kept as long as the thread, so a replay never runs twice.
+model ChatkitOperationReceipt {
+  threadId   String        @map("thread_id")
+  requestKey String        @map("request_key")
+  data       Json
+  createdAt  DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  thread     ChatkitThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@id([threadId, requestKey])
+  @@map("chatkit_operation_receipts")
 }
 
 // One ChatKit thread item as JSON. seq keeps items in the exact order they were added.

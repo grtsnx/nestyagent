@@ -968,7 +968,11 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   async cancelRun(
     agent: AnyAgent,
     id: string,
-    options?: RunAccess & { message?: string },
+    options?: RunAccess & {
+      message?: string;
+      // Runs inside the cancellation transaction; use for associated durable UI state only.
+      onCancel?: () => Promise<void>;
+    },
   ) {
     // A run saved by an older agent version can still be cancelled: nothing executes.
     const row = await this.readRun(agent, id, options ?? {}, false);
@@ -986,7 +990,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
         );
       // Only a database chat needs the saved state, to remove the unanswered turn.
       const discarded = current.chatId
-        ? await discardedHistory(agent, current.state)
+        ? discardedHistory(current.state)
         : new Map<string, number>();
       await this.prisma.transaction(async (tx) => {
         const changed = await tx.pausedRun.updateMany({
@@ -1001,6 +1005,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
           throw new ConflictException(
             'The checkpoint changed before cancellation.',
           );
+        await options?.onCancel?.();
         if (current.chatId) {
           const rows = await tx.chatItem.findMany({
             where: { chatId: current.chatId },
@@ -1646,20 +1651,55 @@ function serializeState(state: RunState<any, any>) {
   }
 }
 
-// History items a cancelled run added, counted by key, so exactly those are removed.
-async function discardedHistory(agent: AnyAgent, saved: string) {
-  const state = await RunState.fromString(agent, saved);
-  const result = new RunResult(state);
-  const retained = new Set(result.history.map(historyItemKey));
+// A call's result type, mirroring the SDK's continuation rule for unanswered calls.
+const CALL_RESULT_TYPES: Readonly<Record<string, string>> = {
+  function_call: 'function_call_result',
+  computer_call: 'computer_call_result',
+  shell_call: 'shell_call_output',
+  apply_patch_call: 'apply_patch_call_output',
+  program: 'program_output',
+};
+
+type SavedItem = { type?: unknown; callId?: unknown; status?: unknown };
+type SavedState = {
+  generatedItems?: Array<{ type?: unknown; rawItem?: SavedItem }>;
+  currentStep?: { data?: { interruptions?: Array<{ rawItem?: SavedItem }> } };
+};
+
+//1. History items a cancelled run added that must go: calls left without a result, and the
+//   calls waiting for approval. Counted by key, so exactly those rows are removed.
+//2. Read from the saved JSON only. Restoring RunState would rebuild the agent and can run
+//   its callbacks, or fail when a tool was removed since the run paused.
+function discardedHistory(saved: string) {
+  const state = JSON.parse(saved) as SavedState;
+  const generated = (state.generatedItems ?? [])
+    .filter((item) => item.type !== 'tool_approval_item')
+    .map((item) => item.rawItem)
+    .filter((item): item is SavedItem => !!item && typeof item === 'object');
+  const answered = new Set(
+    generated
+      .filter((item) =>
+        Object.values(CALL_RESULT_TYPES).includes(item.type as string),
+      )
+      .map((item) => `${String(item.type)}:${String(item.callId)}`),
+  );
   const discarded = new Map<string, number>();
-  for (const item of result.newItems) {
-    if (item.type === 'tool_approval_item') continue;
-    const key = historyItemKey(item.rawItem);
-    if (!retained.has(key)) discarded.set(key, (discarded.get(key) ?? 0) + 1);
+  for (const item of generated) {
+    const resultType = CALL_RESULT_TYPES[item.type as string];
+    if (!resultType || typeof item.callId !== 'string') continue;
+    // The SDK keeps a hosted shell call that is still running.
+    if (
+      item.type === 'shell_call' &&
+      (item.status ?? 'in_progress') === 'in_progress'
+    )
+      continue;
+    if (answered.has(`${resultType}:${item.callId}`)) continue;
+    const key = historyItemKey(item);
+    discarded.set(key, (discarded.get(key) ?? 0) + 1);
   }
   // Hosted approvals may be retained by the SDK's ordinary continuation history.
-  for (const item of state.getInterruptions()) {
-    const key = historyItemKey(item.rawItem);
+  for (const { rawItem } of state.currentStep?.data?.interruptions ?? []) {
+    const key = historyItemKey(rawItem);
     if (!discarded.has(key)) discarded.set(key, 1);
   }
   return discarded;

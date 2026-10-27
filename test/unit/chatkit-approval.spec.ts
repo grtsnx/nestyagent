@@ -151,9 +151,20 @@ describe('ChatKit approval binding', () => {
       status: 'completed',
       recoveryNote: 'cancelled',
     });
-    expect(
-      JSON.stringify(await f.store.loadItem(f.threadId, f.card.id)),
-    ).toContain('Declined.');
+    const stored = await f.store.loadItem(f.threadId, f.card.id);
+    expect(JSON.stringify(stored)).toContain('Declined.');
+    // The open window is told at once, with exactly what was saved, before the new message.
+    const replaced = events.findIndex(
+      (event) => event.type === 'thread.item.replaced',
+    );
+    expect(events[replaced].item).toEqual(stored);
+    expect(replaced).toBeLessThan(
+      events.findIndex(
+        (event) =>
+          event.type === 'thread.item.done' &&
+          event.item.type === 'user_message',
+      ),
+    );
     // The old card's button now finds nothing to run.
     await f.answer();
     expect(f.effect).not.toHaveBeenCalled();

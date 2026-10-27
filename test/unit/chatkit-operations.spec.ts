@@ -140,6 +140,39 @@ describe('ChatKit durable operations', () => {
     });
     expect(server.calls).toBe(2);
   });
+  it('never forgets an accepted retry id, however many follow', async () => {
+    const { server } = await fixture();
+    await send(server, 'threads.add_user_message', {
+      thread_id: thread.id,
+      input: { content: [{ type: 'input_text', text: 'first' }] },
+    });
+    const first = (
+      await server.store.loadThreadItems(thread.id, null, 1, 'asc', undefined)
+    ).data[0];
+    const params = { thread_id: thread.id, item_id: first.id };
+    for (let index = 0; index < 60; index++)
+      await send(server, 'threads.retry_after_item', params, {
+        operation_id: `request-${index}`,
+      });
+    const calls = server.calls;
+    // The first id is older than any fixed window. Replaying it must not run again.
+    await send(server, 'threads.retry_after_item', params, {
+      operation_id: 'request-0',
+    });
+    expect(server.calls).toBe(calls);
+    expect(
+      await server.store.loadOperationReceipt(
+        thread.id,
+        'request:request-0',
+        undefined,
+      ),
+    ).toMatchObject({ status: 'completed' });
+    // Receipts are stored apart, so the thread itself stays small.
+    expect(
+      (await server.store.loadThread(thread.id, undefined)).metadata,
+    ).not.toHaveProperty('_chatkit_retry_receipts');
+  });
+
   it('retains completed retry receipts across new user turns', async () => {
     const { server } = await fixture();
     await send(server, 'threads.add_user_message', {
