@@ -168,7 +168,41 @@ Leave the third argument out when the run has no local data.
 const result = await this.openai.runAgent(
   'Who was the first Roman emperor?',
   historyTutor,
-  { userId: '123' },
+  { context: { userId: '123' } },
+);
+```
+
+### Continue a chat
+
+`createSession` starts a notebook for one chat. Pass that same session on every later message. A one-off question can leave it out. The notebook lives in memory and is cleared when the process stops.
+
+```typescript
+const chat = this.openai.createSession();
+
+await this.openai.runAgent('Who was the first Roman emperor?', historyTutor, {
+  session: chat,
+});
+
+const result = await this.openai.runAgent(
+  'How long did he rule?',
+  historyTutor,
+  {
+    session: chat,
+  },
+);
+```
+
+The second question can mention the first answer because both runs share `chat`.
+
+### WebSocket
+
+Turn `websocket` on when one request will make the agent call the model several times, such as a tool, then another model call, then another tool. A single question and answer can leave it off.
+
+```typescript
+const result = await this.openai.runAgent(
+  'Find three sources and save a summary.',
+  researcher,
+  { session: chat, websocket: true },
 );
 ```
 
@@ -205,7 +239,7 @@ const triage = this.openai.createTriageAgent(
 const result = await this.openai.runAgent(
   'Who was the first Roman emperor?',
   triage,
-  { userId: '123' },
+  { context: { userId: '123' } },
 );
 ```
 
@@ -229,7 +263,7 @@ const historyTutor = this.openai.createAgent(
 const result = await this.openai.runAgent(
   'Who was the first Roman emperor?',
   historyTutor,
-  { userId: '123' },
+  { context: { userId: '123' } },
 );
 ```
 

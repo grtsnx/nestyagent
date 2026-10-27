@@ -3,12 +3,21 @@ import { ConfigService } from '@nestjs/config';
 import { z } from 'zod';
 import {
   Agent,
+  MemorySession,
   ModelSettings,
+  OpenAIProvider,
   run,
   Runner,
+  Session,
   setDefaultOpenAIKey,
   Tool,
 } from '@openai/agents';
+
+type RunAgentOptions<TContext> = {
+  context?: TContext;
+  session?: Session;
+  websocket?: boolean;
+};
 
 type CreateAgentOptions = {
   model?: string;
@@ -22,6 +31,7 @@ type CreateAgentOptions = {
 @Injectable()
 export class OpenaiService implements OnModuleInit {
   private runner?: Runner;
+  private runnerModel?: string;
 
   constructor(private readonly configService: ConfigService) {}
 
@@ -35,8 +45,14 @@ export class OpenaiService implements OnModuleInit {
 
   // Optional shared fallback. Agents that set their own model keep that model.
   createRunner(model: string) {
+    this.runnerModel = model;
     this.runner = new Runner({ model });
     return this.runner;
+  }
+
+  // A notebook for one chat. Pass the same session on every later message.
+  createSession() {
+    return new MemorySession();
   }
 
   // Create a new agent. Leave model out to use the runner model.
@@ -107,13 +123,27 @@ export class OpenaiService implements OnModuleInit {
   //1. Run a prompt on an agent. For triage, pass the agent from createTriageAgent.
   //2. That agent reads the prompt and hands it to one specialist in its handoffs.
   //3. context is optional data for your code. The model does not see it.
-  async runAgent<TContext>(prompt: string, agent: Agent, context?: TContext) {
-    if (context === undefined) {
-      if (this.runner) return await this.runner.run(agent, prompt);
-      return await run(agent, prompt);
-    }
+  //4. session is optional. Reuse one session to continue a chat.
+  //5. websocket is optional. Turn it on when this run will call the model many times.
+  async runAgent<TContext>(
+    prompt: string,
+    agent: Agent,
+    options?: RunAgentOptions<TContext>,
+  ) {
+    const runOptions = {
+      ...(options?.context !== undefined && { context: options.context }),
+      ...(options?.session && { session: options.session }),
+    };
+    const runner = options?.websocket ? this.webSocketRunner() : this.runner;
 
-    if (this.runner) return await this.runner.run(agent, prompt, { context });
-    return await run(agent, prompt, { context });
+    if (runner) return await runner.run(agent, prompt, runOptions);
+    return await run(agent, prompt, runOptions);
+  }
+
+  private webSocketRunner() {
+    return new Runner({
+      ...(this.runnerModel && { model: this.runnerModel }),
+      modelProvider: new OpenAIProvider({ useResponsesWebSocket: true }),
+    });
   }
 }
