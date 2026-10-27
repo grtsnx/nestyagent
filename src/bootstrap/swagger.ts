@@ -19,11 +19,11 @@ export function configureSwagger(
       .setVersion(`v${version}`)
       .addTag(
         'Server',
-        'Core server status, health, and connectivity endpoints.',
+        'These routes report whether the server is reachable, running, and ready to take traffic.',
       )
       .addTag(
         'Webhook',
-        'Signed webhooks. The sandbox webhook creates and deletes a remote machine.',
+        'These routes receive signed OpenAI events that start and delete self-hosted machines.',
       )
       .build();
     const document = SwaggerModule.createDocument(app, options);
@@ -164,8 +164,7 @@ export function configureSwagger(
           "style-src 'self' 'unsafe-inline'",
           "img-src 'self' data: blob:",
           "font-src 'self' data:",
-          // The developer tools share the docs through Scalar's registry.
-          "connect-src 'self' https://*.scalar.com",
+          "connect-src 'self'",
           "worker-src 'self' blob:",
           "object-src 'none'",
           "base-uri 'self'",
@@ -181,6 +180,11 @@ export function configureSwagger(
       hideDarkModeToggle: true,
       pageTitle: `${environment.PLATFORM_NAME} API Reference`,
       showDeveloperTools: 'always',
+      // Scalar has no setting for these, so hide the toolbar's Share and Deploy buttons by position.
+      customCss: [
+        '.api-reference-toolbar > div > div.contents:nth-child(4),',
+        '.api-reference-toolbar > div > div.contents:nth-child(6) { display: none !important; }',
+      ].join('\n'),
       sources: apiVersions.map((version, index) => ({
         default: index === 0,
         slug: `v${version}`,

@@ -41,7 +41,7 @@ export function ApiFailure(
 export function ApiRateLimited(path: string) {
   return ApiFailure(
     HttpStatus.TOO_MANY_REQUESTS,
-    'Rate limit exceeded: over 100 requests per minute from this address.',
+    'This address sent more than 100 requests in one minute, so it must wait before trying again.',
     'ThrottlerException: Too Many Requests',
     path,
   );

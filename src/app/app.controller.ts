@@ -22,9 +22,13 @@ export class AppController {
 
   @ApiOperation({
     summary: 'Ping the server',
-    description: 'Returns a fixed greeting to confirm the API is reachable.',
+    description:
+      'This route returns a fixed greeting to confirm that the API is reachable.',
   })
-  @ApiSuccess('Server is reachable.', 'Hello World!')
+  @ApiSuccess(
+    'The server is reachable and answered the request.',
+    'Hello World!',
+  )
   @ApiRateLimited('/v1')
   @Get()
   getHello(): string {
@@ -34,9 +38,9 @@ export class AppController {
   @ApiOperation({
     summary: 'Liveness check',
     description:
-      'Process liveness for container health checks. Does not check the database.',
+      'This route tells your container platform whether the server process is running, without checking the database.',
   })
-  @ApiSuccess('Process is running.', { status: 'ok' })
+  @ApiSuccess('The server process is running.', { status: 'ok' })
   @SkipThrottle()
   @Get('health/live')
   live(): { status: 'ok' } {
@@ -46,16 +50,19 @@ export class AppController {
   @ApiOperation({
     summary: 'Readiness check',
     description:
-      'Traffic readiness for load balancers: database connectivity and memory usage.',
+      'This route tells your load balancer whether the server can take traffic by checking the database connection and memory usage.',
   })
-  @ApiSuccess('Database is reachable and memory usage is within limits.', {
-    database: { status: 'up' },
-    memory_heap: { status: 'up' },
-    memory_rss: { status: 'up' },
-  })
+  @ApiSuccess(
+    'The database is reachable and memory usage is within its limits.',
+    {
+      database: { status: 'up' },
+      memory_heap: { status: 'up' },
+      memory_rss: { status: 'up' },
+    },
+  )
   @ApiFailure(
     HttpStatus.SERVICE_UNAVAILABLE,
-    'Database is unreachable or memory usage is over its limit.',
+    'The database is unreachable or memory usage is over its limit, so traffic should wait.',
     'Internal server error',
     '/v1/health/ready',
   )

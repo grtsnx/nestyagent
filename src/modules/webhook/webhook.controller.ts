@@ -28,35 +28,30 @@ export class WebhookController {
 
   // OpenAI calls this when a self-hosted session needs a machine, and when that session fails.
   @ApiOperation({
-    summary: 'OpenAI webhook for self-hosted environments',
-    description: [
-      'Signed OpenAI events that start and delete self-hosted machines. Called by OpenAI, not by clients.',
-      '',
-      '- `agent.session.action_required`: machine start for a session that needs one.',
-      '- `agent.session.failed`: machine deletion for a failed session.',
-      '- `agent.environment.expired`: permanent machine deletion for an expired environment.',
-      '',
-      'Events are verified with `OPENAI_WEBHOOK_SECRET`, stored before the reply, and processed by a background worker. Repeat deliveries are processed once; other event types are accepted and ignored.',
-    ].join('\n'),
+    summary: 'OpenAI self-hosted webhook',
+    description:
+      'OpenAI calls this route to start a self-hosted machine when a session needs one and to delete it when the session fails or its environment expires.',
   })
   @ApiConsumes('application/json')
   @ApiHeader({
     name: 'webhook-id',
     required: true,
-    description: 'Delivery id. Repeat deliveries keep the same id.',
+    description:
+      'This is the delivery id, which stays the same when OpenAI repeats a delivery.',
   })
   @ApiHeader({
     name: 'webhook-timestamp',
     required: true,
-    description: 'Send time, in Unix seconds.',
+    description: 'This is the time OpenAI sent the event, in Unix seconds.',
   })
   @ApiHeader({
     name: 'webhook-signature',
     required: true,
-    description: 'OpenAI signature, verified with OPENAI_WEBHOOK_SECRET.',
+    description:
+      'This is the OpenAI signature, which the server verifies with OPENAI_WEBHOOK_SECRET.',
   })
   @ApiBody({
-    description: 'OpenAI event payload.',
+    description: 'This is the event exactly as OpenAI sends it.',
     schema: {
       type: 'object',
       example: {
@@ -71,12 +66,15 @@ export class WebhookController {
       },
     },
   })
-  @ApiSuccess('Event stored, or a repeat or ignored event.', {
-    accepted: true,
-  })
+  @ApiSuccess(
+    'The event was stored, or it was a repeat or an event type this server ignores.',
+    {
+      accepted: true,
+    },
+  )
   @ApiFailure(
     HttpStatus.UNAUTHORIZED,
-    'Invalid signature or missing OPENAI_WEBHOOK_SECRET. OpenAI retries the delivery.',
+    'The signature is invalid or OPENAI_WEBHOOK_SECRET is missing, so OpenAI will retry the delivery.',
     'Webhook signature was rejected.',
     '/v1/webhook',
   )
