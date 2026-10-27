@@ -33,6 +33,7 @@ type MountSpec =
       accessKeyId?: string;
       secretAccessKey?: string;
       sessionToken?: string;
+      readOnly?: boolean;
     }
   | {
       provider: 'gcs';
@@ -41,6 +42,7 @@ type MountSpec =
       accessId?: string;
       secretAccessKey?: string;
       serviceAccountFile?: string;
+      readOnly?: boolean;
     }
   | {
       provider: 'r2';
@@ -49,6 +51,7 @@ type MountSpec =
       prefix?: string;
       accessKeyId?: string;
       secretAccessKey?: string;
+      readOnly?: boolean;
     }
   | {
       provider: 'azure';
@@ -56,12 +59,14 @@ type MountSpec =
       accountName?: string;
       accountKey?: string;
       prefix?: string;
+      readOnly?: boolean;
     }
   | {
       provider: 'box';
       clientId?: string;
       clientSecret?: string;
       accessToken?: string;
+      readOnly?: boolean;
     }
   | {
       provider: 'github' | 'gitlab' | 'bitbucket';
@@ -72,6 +77,7 @@ type MountSpec =
       provider: 'google-drive';
       remote?: string;
       configFile?: string;
+      readOnly?: boolean;
     };
 
 type CreateManifestOptions = {
@@ -138,54 +144,68 @@ export function createManifest(options?: CreateManifestOptions) {
 
 // A mount is ephemeral, so a snapshot keeps the workspace files and skips the remote storage.
 function mountEntry(spec: MountSpec) {
-  const ephemeral = true;
-
   switch (spec.provider) {
     case 's3':
-      return s3Mount({
-        ephemeral,
-        bucket: spec.bucket,
-        ...(spec.region && { region: spec.region }),
-        ...(spec.prefix && { prefix: spec.prefix }),
-        ...(spec.accessKeyId && { accessKeyId: spec.accessKeyId }),
-        ...(spec.secretAccessKey && { secretAccessKey: spec.secretAccessKey }),
-        ...(spec.sessionToken && { sessionToken: spec.sessionToken }),
-      });
-    case 'gcs':
-      return gcsMount({
-        ephemeral,
-        bucket: spec.bucket,
-        ...(spec.prefix && { prefix: spec.prefix }),
-        ...(spec.accessId && { accessId: spec.accessId }),
-        ...(spec.secretAccessKey && { secretAccessKey: spec.secretAccessKey }),
-        ...(spec.serviceAccountFile && {
-          serviceAccountFile: spec.serviceAccountFile,
+      return attached(
+        s3Mount({
+          bucket: spec.bucket,
+          ...(spec.region && { region: spec.region }),
+          ...(spec.prefix && { prefix: spec.prefix }),
+          ...(spec.accessKeyId && { accessKeyId: spec.accessKeyId }),
+          ...(spec.secretAccessKey && {
+            secretAccessKey: spec.secretAccessKey,
+          }),
+          ...(spec.sessionToken && { sessionToken: spec.sessionToken }),
         }),
-      });
+        spec.readOnly,
+      );
+    case 'gcs':
+      return attached(
+        gcsMount({
+          bucket: spec.bucket,
+          ...(spec.prefix && { prefix: spec.prefix }),
+          ...(spec.accessId && { accessId: spec.accessId }),
+          ...(spec.secretAccessKey && {
+            secretAccessKey: spec.secretAccessKey,
+          }),
+          ...(spec.serviceAccountFile && {
+            serviceAccountFile: spec.serviceAccountFile,
+          }),
+        }),
+        spec.readOnly,
+      );
     case 'r2':
-      return r2Mount({
-        ephemeral,
-        bucket: spec.bucket,
-        accountId: spec.accountId,
-        ...(spec.prefix && { prefix: spec.prefix }),
-        ...(spec.accessKeyId && { accessKeyId: spec.accessKeyId }),
-        ...(spec.secretAccessKey && { secretAccessKey: spec.secretAccessKey }),
-      });
+      return attached(
+        r2Mount({
+          bucket: spec.bucket,
+          accountId: spec.accountId,
+          ...(spec.prefix && { prefix: spec.prefix }),
+          ...(spec.accessKeyId && { accessKeyId: spec.accessKeyId }),
+          ...(spec.secretAccessKey && {
+            secretAccessKey: spec.secretAccessKey,
+          }),
+        }),
+        spec.readOnly,
+      );
     case 'azure':
-      return azureBlobMount({
-        ephemeral,
-        container: spec.container,
-        ...(spec.accountName && { accountName: spec.accountName }),
-        ...(spec.accountKey && { accountKey: spec.accountKey }),
-        ...(spec.prefix && { prefix: spec.prefix }),
-      });
+      return attached(
+        azureBlobMount({
+          container: spec.container,
+          ...(spec.accountName && { accountName: spec.accountName }),
+          ...(spec.accountKey && { accountKey: spec.accountKey }),
+          ...(spec.prefix && { prefix: spec.prefix }),
+        }),
+        spec.readOnly,
+      );
     case 'box':
-      return boxMount({
-        ephemeral,
-        ...(spec.clientId && { clientId: spec.clientId }),
-        ...(spec.clientSecret && { clientSecret: spec.clientSecret }),
-        ...(spec.accessToken && { accessToken: spec.accessToken }),
-      });
+      return attached(
+        boxMount({
+          ...(spec.clientId && { clientId: spec.clientId }),
+          ...(spec.clientSecret && { clientSecret: spec.clientSecret }),
+          ...(spec.accessToken && { accessToken: spec.accessToken }),
+        }),
+        spec.readOnly,
+      );
     case 'github':
     case 'gitlab':
     case 'bitbucket': {
@@ -197,8 +217,8 @@ function mountEntry(spec: MountSpec) {
     }
     case 'google-drive':
       return mount({
-        ephemeral,
-        readOnly: true,
+        ephemeral: true,
+        readOnly: spec.readOnly ?? true,
         mountStrategy: inContainerMountStrategy({
           pattern: {
             type: 'rclone',
@@ -208,6 +228,16 @@ function mountEntry(spec: MountSpec) {
         }),
       });
   }
+}
+
+// Docker attaches cloud storage only with an in-container strategy. Leave readOnly on unless the agent should write back.
+function attached<T extends object>(entry: T, readOnly?: boolean) {
+  return {
+    ...entry,
+    ephemeral: true,
+    readOnly: readOnly ?? true,
+    mountStrategy: inContainerMountStrategy(),
+  };
 }
 
 // Turn a Git host link into a cloned folder. path and ref override the folder name and branch.

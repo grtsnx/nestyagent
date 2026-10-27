@@ -18,8 +18,7 @@ bun run start:dev
 
 Swagger UI runs at `http://localhost:3000/api`, and Scalar runs at `http://localhost:3000/docs`. Both use the version-specific OpenAPI documents at `/api/v1-json` and `/api/v2-json`. The application prints every enabled documentation URL when it starts.
 
-<details>
-<summary><h2>Configuration</h2></summary>
+## Configuration
 
 The application validates configuration before it starts. Invalid ports, booleans, and CORS origins stop startup.
 
@@ -37,10 +36,7 @@ The application validates configuration before it starts. Invalid ports, boolean
 
 Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS origins without paths.
 
-</details>
-
-<details>
-<summary><h2>OpenAI agents</h2></summary>
+## OpenAI agents
 
 `OpenaiService` is global. Inject it where you create or run an agent. `OPENAI_API_KEY` is registered once at startup and is shared by every agent.
 
@@ -272,10 +268,7 @@ const result = await this.openai.runAgent(
 );
 ```
 
-</details>
-
-<details>
-<summary><h2>Sandbox</h2></summary>
+## Sandbox
 
 `SandboxService` opens a workspace computer. The chat stays in `OpenaiService`. A workspace is where files, commands, and a logged-in browser live.
 
@@ -746,6 +739,98 @@ const workspace = await this.sandbox.openSandbox(
 );
 ```
 
+Cloud and Drive mounts attach only when the computer is Docker. `node:latest` does not include `git`, `rclone`, or FUSE, so build an image that does and pass it as `image`. Git hosts use `git`. Drive, S3, GCS, R2, Azure, and Box use `rclone`.
+
+```dockerfile
+FROM node:latest
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends git rclone fuse3 ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+```
+
+```typescript
+const workspace = await this.sandbox.openSandbox(createManifest(), {
+  computer: 'docker',
+  image: 'agentic-sandbox',
+});
+```
+
+Build that file with `docker build --tag agentic-sandbox .` before the call. A mount stays read-only. Pass `readOnly: false` only when the agent should write back to that bucket. Credentials stay on the mount or in the rclone config. Do not put them in the prompt.
+
+### GitHub
+
+1. For a public repo, paste the `https://github.com/owner/name` link. Add `/tree/<branch>` when the branch is not the default.
+2. For a private repo, this app has no token field. On the machine that runs Docker, run `gh auth login` or add an SSH key that can read the repo.
+3. Pass the `git@github.com:owner/name.git` address when you use SSH.
+4. Open the workspace with the image above. The folder name is the repo name unless you set `path` on `repo`.
+
+### GitLab
+
+1. In the GitLab project, open Settings, then Access Tokens. Create a token with `read_repository`. For SSH, add your key under Preferences, then SSH Keys.
+2. Copy the HTTPS or SSH clone URL. A branch link looks like `https://gitlab.com/group/api/-/tree/main`. Nested groups stay in the URL.
+3. Pass it with `provider: 'gitlab'`.
+4. For a private HTTPS clone, store the token in the git credential helper on the Docker host before `openSandbox`. The token does not go in the manifest.
+
+### Bitbucket
+
+1. In Bitbucket, open Personal settings, then App passwords. Create one with Repositories: Read. For SSH, add a key under SSH keys.
+2. Copy the clone URL. A branch link looks like `https://bitbucket.org/owner/web/src/main`.
+3. Pass it with `provider: 'bitbucket'`.
+4. Use the SSH URL when the app password is not in the host git credentials.
+
+### GitBucket
+
+1. GitBucket uses the same `/tree/<branch>` shape as GitHub. Pass that URL with `provider: 'github'`.
+2. The host in the URL is your GitBucket server, for example `https://gitbucket.example.com/owner/starter/tree/main`.
+3. Add that host to the machine's SSH known hosts or git credentials before the clone.
+
+### Google Drive
+
+1. On this Mac, install rclone: `brew install rclone`.
+2. Run `rclone config`. Choose a new remote, name it `gdrive`, and choose Google Drive.
+3. Follow the browser login. Leave the root folder empty unless you want one folder only.
+4. The token is written to `~/.config/rclone/rclone.conf`. Pass that path as `configFile`. The file must be visible to the container.
+5. Set `remote` to `gdrive:` for the whole drive, or `gdrive:client-notes` for one folder.
+6. Open with `computer: 'docker'` and the image that contains rclone and fuse3.
+
+### Amazon S3
+
+1. In the AWS console, open IAM and create a user or role that can `s3:ListBucket` and `s3:GetObject` on one bucket. Add `s3:PutObject` only when `readOnly` is false.
+2. Create an access key for that user. Copy the access key id and the secret.
+3. Put them in the environment of this app, not in source. Pass `bucket`, `region`, `prefix`, `accessKeyId`, and `secretAccessKey` on the mount.
+4. For a temporary STS key, also pass `sessionToken`.
+5. Open with the Docker image from above.
+
+### Google Cloud Storage
+
+1. In Google Cloud, open IAM and create a service account. Grant it Storage Object Viewer on the bucket. Grant Storage Object Admin only when the agent should write.
+2. Create a JSON key and save it outside the repo, for example `/Users/me/gcs.json`.
+3. Pass `bucket` and `serviceAccountFile` with that path. The file must be visible to the container.
+4. The other way is an HMAC key: pass `accessId` and `secretAccessKey` instead of the JSON file.
+5. Open with the Docker image from above.
+
+### Cloudflare R2
+
+1. In the Cloudflare dashboard, open R2, then Overview, and copy the Account ID.
+2. Open Manage R2 API Tokens and create a token that can read the bucket. Allow write only when `readOnly` is false.
+3. Copy the access key id and the secret.
+4. Pass `accountId`, `bucket`, `accessKeyId`, and `secretAccessKey`.
+5. Open with the Docker image from above.
+
+### Azure Blob
+
+1. In the Azure portal, open the storage account, then Access keys. Copy the storage account name and one key.
+2. Open Containers and copy the container name. Create the container first if it does not exist.
+3. Pass `provider: 'azure'`, `container`, `accountName`, and `accountKey`.
+4. Open with the Docker image from above.
+
+### Box
+
+1. In the Box Developer Console, create an app and copy the client id and client secret. For a short test, the console can also issue a developer token.
+2. Pass `accessToken` for that token, or pass `clientId` and `clientSecret`.
+3. A developer token expires quickly. Create a new one when the mount starts failing.
+4. Open with the Docker image from above.
+
 ### Choose the computer
 
 Unix is the default. Docker uses `node:latest`, so a new Node release arrives with the image and this file stays as it is. Pass `image` when a workspace needs a fixed tag.
@@ -831,20 +916,14 @@ Store `session.sessionId` with the chat. One session needs its own executor. Use
 
 On this Mac, `startHostedExecutor` runs the executor. On Lambda, Databricks, DigitalOcean, OCI, or another host, that machine runs `hostedExecutorCommand(session)` after it is up. When OpenAI posts `agent.session.created` for a self-hosted session, pass the event to `onHostedSessionCreated` to start the executor on this Mac. A webhook that creates or deletes a remote machine belongs to that provider.
 
-</details>
-
-<details>
-<summary><h2>Health checks</h2></summary>
+## Health checks
 
 - `GET /v1/health/live` proves that the process can answer requests.
 - `GET /v1/health/ready` checks the process's memory limits.
 
 Both routes also support API version 2. The checks do not depend on external websites, databases, or Redis.
 
-</details>
-
-<details>
-<summary><h2>Verification</h2></summary>
+## Verification
 
 All tests live under `test/`.
 
@@ -858,10 +937,7 @@ bun run test:cov
 bun run build
 ```
 
-</details>
-
-<details>
-<summary><h2>Container deployment</h2></summary>
+## Container deployment
 
 Build and run the same OCI image on Docker, Kubernetes, Nomad, ECS, Cloud Run, Fly.io, Railway, Render, or any compatible platform:
 
@@ -872,10 +948,7 @@ docker run --rm --read-only --tmpfs /tmp --publish 3000:3000 agentic:local
 
 The image uses pinned Bun and Node digests, contains production dependencies only, and runs as the unprivileged `node` user.
 
-</details>
-
-<details>
-<summary><h2>CI/CD</h2></summary>
+## CI/CD
 
 `.github/workflows/ci.yml` installs the lockfile exactly, checks formatting and types, runs all tests, audits dependencies, builds the application and container, and scans the runtime image. Every external action is pinned to a full commit SHA.
 
@@ -890,8 +963,6 @@ git push origin v1.0.0
 
 The workflow delivers a portable image. Each hosting platform can deploy that immutable image digest with its own native rollout and rollback controls.
 
-</details>
-
 ## Reliability and state
 
 The HTTP API owns no durable state. A sandbox workspace lasts only while it stays open, until you save and resume it, or until a new workspace starts from its snapshot. Add workflow and idempotency modules only with a shared production store and tested transaction boundaries. Until then, replicas can start, stop, and roll back without losing application-owned state because the application owns none.
@@ -901,3 +972,13 @@ The application enables graceful NestJS shutdown hooks. Its global exception fil
 ## NestJS guidance applied
 
 This project follows the current NestJS guidance for [exception filters](https://docs.nestjs.com/exception-filters), [security headers](https://docs.nestjs.com/techniques/security/cors), [CSRF protection](https://docs.nestjs.com/security/csrf), [validation](https://docs.nestjs.com/application/validation), [rate limiting](https://docs.nestjs.com/security/rate-limiting), and [shutdown hooks](https://docs.nestjs.com/fundamentals/lifecycle-events).
+
+## Acknowledgments
+
+This Nestjs-OpenAI Agents SDK boilerplate was created by [Abolade Greatness](https://github.com/grtsnx).
+
+Follow on [GitHub](https://github.com/grtsnx) and star [nestyagent](https://github.com/grtsnx/nestyagent).
+
+- [X](https://x.com/grtsnx)
+- [LinkedIn](https://www.linkedin.com/in/grtsnx)
+- [grtsnx.com](https://grtsnx.com)

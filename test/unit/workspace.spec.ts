@@ -47,6 +47,27 @@ describe('createManifest', () => {
     });
   });
 
+  it('attaches cloud storage inside the container and keeps it read-only', () => {
+    const manifest = createManifest({
+      mounts: {
+        room: {
+          provider: 's3',
+          bucket: 'account-files',
+          region: 'us-east-1',
+        },
+      },
+    });
+
+    expect(manifest.entries.room).toMatchObject({
+      type: 's3_mount',
+      bucket: 'account-files',
+      region: 'us-east-1',
+      ephemeral: true,
+      readOnly: true,
+      mountStrategy: { type: 'in_container' },
+    });
+  });
+
   it('keeps sandbox users and groups', () => {
     const manifest = createManifest({
       users: ['agent'],
