@@ -161,8 +161,8 @@ describe('SystemPromptsService', () => {
     const { systemPrompts } = service();
     await systemPrompts.create('menu', 'Answer about cakes.');
     expect((await systemPrompts.list()).map((item) => item.name)).toEqual([
-      'menu',
       'agentic',
+      'menu',
     ]);
     await expect(systemPrompts.remove('menu', 1)).resolves.toBeUndefined();
     await expect(systemPrompts.get('menu')).rejects.toThrow(
