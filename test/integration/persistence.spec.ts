@@ -301,13 +301,13 @@ describe('Postgres persistence', () => {
       first,
       new ConfigService({ DATABASE_URL: databaseUrl }),
     );
-    await first.db.systemPrompt.deleteMany({ where: { name: 'mssuzie' } });
-    const created = await systemPrompts.create('mssuzie', 'Custom.');
+    await first.db.systemPrompt.deleteMany({ where: { name: 'agentic' } });
+    const created = await systemPrompts.create('agentic', 'Custom.');
     await expect(
-      systemPrompts.remove('mssuzie', created.version!),
+      systemPrompts.remove('agentic', created.version!),
     ).resolves.toMatchObject({
       source: 'default',
-      content: defaultSystemPrompts.mssuzie,
+      content: defaultSystemPrompts.agentic,
     });
   });
 

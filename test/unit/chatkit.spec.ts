@@ -603,7 +603,7 @@ describe('ChatKit Agents SDK bridge', () => {
       requestContext: context,
     });
     const agent = new Agent({
-      name: 'MsSuzie',
+      name: 'Agentic',
       model: streamingModel('Hello there'),
     });
     const result = await run(agent, 'Hi', {
@@ -703,7 +703,7 @@ describe('ChatKit Agents SDK bridge', () => {
       },
     });
     const result = await run(
-      new Agent({ name: 'MsSuzie', model, tools: [showPlans] }),
+      new Agent({ name: 'Agentic', model, tools: [showPlans] }),
       'Plans?',
       {
         stream: true,
@@ -766,7 +766,7 @@ describe('ChatKit Agents SDK bridge', () => {
       parameters: { properties: { selector: { type: 'string' } } },
     });
     const agent = new Agent({
-      name: 'MsSuzie',
+      name: 'Agentic',
       model,
       tools: [readPage],
       toolUseBehavior: clientToolStopBehavior(['read_page']),

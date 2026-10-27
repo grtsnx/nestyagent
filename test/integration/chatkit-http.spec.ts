@@ -12,7 +12,7 @@ import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { ChatKitStore } from '@/config/chatkit/index.js';
 import { PrismaService } from '@/lib/prisma/prisma.service.js';
-import { MsSuzieChatKitService } from '@/modules/chatkit/chatkit.service.js';
+import { AgenticChatKitService } from '@/modules/chatkit/chatkit.service.js';
 import { scriptedModel } from '../unit/chatkit-model.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -95,9 +95,9 @@ describe('ChatKit over HTTP', () => {
   it('reports a failed message save after the decline was sent, and keeps the decline', async () => {
     const userId = `guardian-${Date.now()}-decline`;
     const effect = vi.fn(async () => 'Cancelled.');
-    vi.spyOn(app.get(MsSuzieChatKitService), 'agent').mockReturnValue(
+    vi.spyOn(app.get(AgenticChatKitService), 'agent').mockReturnValue(
       new Agent({
-        name: 'MsSuzie',
+        name: 'Agentic',
         tools: [
           tool({
             name: 'cancel_session',
@@ -221,7 +221,7 @@ describe('ChatKit over HTTP', () => {
 
   it('streams a reply as server-sent events and keeps each chat private', async () => {
     vi.spyOn(OpenAIProvider.prototype, 'getModel').mockResolvedValue(
-      scriptedModel([{ text: 'Hello from MsSuzie.' }]),
+      scriptedModel([{ text: 'Hello from Agentic.' }]),
     );
     const alice = await tokenFor(`guardian-${Date.now()}-a`);
     const response = await http()
@@ -245,7 +245,7 @@ describe('ChatKit over HTTP', () => {
     const streamed = events(response.text);
     const threadId = streamed[0].thread.id as string;
     expect(streamed.at(-1)?.type).not.toBe('error');
-    expect(response.text).toContain('Hello from MsSuzie.');
+    expect(response.text).toContain('Hello from Agentic.');
 
     const list = await http()
       .post('/v1/chatkit')
@@ -487,7 +487,7 @@ describe('ChatKit over HTTP', () => {
         version: 2,
         chatkitThreadId: threadId,
         ownerId: userId,
-        agentName: 'MsSuzie',
+        agentName: 'Agentic',
       },
     });
     const approval = `/v1/chatkit/threads/${threadId}/approvals/${runId}/recover`;

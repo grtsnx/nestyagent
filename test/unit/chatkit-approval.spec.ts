@@ -14,7 +14,7 @@ import {
   type WidgetItem,
 } from '@/lib/chatkit/chatkit.service.js';
 import { OpenaiService } from '@/lib/openai/openai.service.js';
-import { MsSuzieChatKitService } from '@/modules/chatkit/chatkit.service.js';
+import { AgenticChatKitService } from '@/modules/chatkit/chatkit.service.js';
 import { SystemPromptsService } from '@/modules/system-prompts/system-prompts.service.js';
 import { fakePrisma } from './fake-prisma.js';
 import { scriptedModel, type ScriptStep } from './chatkit-model.js';
@@ -47,7 +47,7 @@ async function fixture(
   cleanup.push(openai);
   const effect = vi.fn(async () => 'Done.');
   const agent = new Agent({
-    name: 'MsSuzie',
+    name: 'Agentic',
     tools: [
       tool({
         name: 'effect',
@@ -58,7 +58,7 @@ async function fixture(
       }),
     ],
   });
-  const server = new MsSuzieChatKitService(
+  const server = new AgenticChatKitService(
     store as never,
     undefined as never,
     openai,
@@ -263,7 +263,7 @@ describe('ChatKit approval binding', () => {
   it('keeps a waiting approval answerable after the system prompt changes', async () => {
     const f = await fixture();
     await f.db.systemPrompt.create({
-      data: { name: 'mssuzie', content: 'Different instructions.' },
+      data: { name: 'agentic', content: 'Different instructions.' },
     });
     await f.answer();
     expect(f.effect).toHaveBeenCalledOnce();
@@ -271,7 +271,7 @@ describe('ChatKit approval binding', () => {
 
   it('closes a card saved before an update to the helper’s tools', async () => {
     const f = await fixture();
-    f.db.pausedRun.rows[0].agentVersion = 'mssuzie-chatkit-v0';
+    f.db.pausedRun.rows[0].agentVersion = 'agentic-chatkit-v0';
     const events = await f.answer();
     expect(f.effect).not.toHaveBeenCalled();
     expect(events).toContainEqual(

@@ -75,7 +75,7 @@ describe('AppController (e2e)', () => {
 
   it('allows the admin key in trusted browser preflights', async () => {
     const response = await request(app.getHttpServer())
-      .options('/v1/system-prompts/mssuzie')
+      .options('/v1/system-prompts/agentic')
       .set('Origin', 'https://app.example.com')
       .set('Access-Control-Request-Method', 'PUT')
       .set('Access-Control-Request-Headers', 'content-type,x-admin-key')

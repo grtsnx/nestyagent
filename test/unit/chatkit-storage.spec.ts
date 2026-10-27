@@ -16,7 +16,7 @@ import {
   type ThreadMetadata,
 } from '@/lib/chatkit/chatkit.service.js';
 import { ChatKitController } from '@/modules/chatkit/chatkit.controller.js';
-import { MsSuzieChatKitService } from '@/modules/chatkit/chatkit.service.js';
+import { AgenticChatKitService } from '@/modules/chatkit/chatkit.service.js';
 import { ChatKitUploadInterceptor } from '@/config/chatkit/chatkit.upload.js';
 import { PrismaService } from '@/lib/prisma/prisma.service.js';
 import { EventEmitter } from 'node:events';
@@ -152,7 +152,7 @@ describe('ChatKit storage boundaries', () => {
         { provide: ChatKitStore, useValue: f.store },
         { provide: PrismaService, useValue: f.prisma },
         {
-          provide: MsSuzieChatKitService,
+          provide: AgenticChatKitService,
           useValue: { chatkitStore: f.store, chatkitAttachments: f.files },
         },
       ],

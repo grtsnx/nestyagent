@@ -3,7 +3,7 @@ import { Type } from 'class-transformer';
 import { IsInt, IsNotEmpty, IsString, MaxLength, Min } from 'class-validator';
 
 const SAMPLE =
-  'You are MsSuzie’s assistant. You speak for MsSuzie, a personal tutoring company.';
+  'You are Agentic’s assistant. You speak for Agentic, a personal tutoring company.';
 
 export class CreateSystemPromptDto {
   @ApiProperty({

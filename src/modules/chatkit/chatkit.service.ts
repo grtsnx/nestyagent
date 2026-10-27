@@ -44,7 +44,7 @@ const TITLE_LENGTH = 60;
 const DEFAULT_TRANSCRIPTION_MODEL = 'gpt-4o-mini-transcribe';
 //1. Bump when the helper's tools or other execution policy changes.
 //2. Editing the system prompt does not change it, so waiting approvals stay answerable.
-const AGENT_VERSION = 'mssuzie-chatkit-v1';
+const AGENT_VERSION = 'agentic-chatkit-v1';
 const APPROVED = 'Approved.';
 const DECLINED = 'Declined.';
 const EXPIRED = 'This request expired after an update. Please ask again.';
@@ -85,11 +85,11 @@ class AttachmentConverter extends ThreadItemConverter {
   }
 }
 
-//1. The MsSuzie helper in the ChatKit window. It reads its editable system prompt each turn.
+//1. The Agentic helper in the ChatKit window. It reads its editable system prompt each turn.
 //2. Replies go through OpenaiService, so usage records, traces, and prompt caching all apply.
 //3. A tool that needs approval pauses the run and shows Approve and Decline buttons.
 @Injectable()
-export class MsSuzieChatKitService extends ChatKitService<ChatKitContext> {
+export class AgenticChatKitService extends ChatKitService<ChatKitContext> {
   private helper?: Agent;
 
   constructor(
@@ -106,14 +106,14 @@ export class MsSuzieChatKitService extends ChatKitService<ChatKitContext> {
   // Build the helper once, then snapshot the editable instructions for each turn.
   agent() {
     this.helper ??= this.openai.createAgent(
-      'MsSuzie',
-      this.systemPrompts.forAgent('mssuzie'),
+      'Agentic',
+      this.systemPrompts.forAgent('agentic'),
     ) as unknown as Agent;
     return this.helper;
   }
 
   private async configuredAgent() {
-    const prompt = await this.systemPrompts.get('mssuzie');
+    const prompt = await this.systemPrompts.get('agentic');
     return {
       agent: this.agent().clone({ instructions: prompt.content }),
       agentVersion: AGENT_VERSION,

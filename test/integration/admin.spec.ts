@@ -33,7 +33,7 @@ describe('AdminService in Postgres', () => {
       data: [
         {
           chatId,
-          agent: 'MsSuzie',
+          agent: 'Agentic',
           model: 'gpt-6-astra',
           status: 'completed',
           inputTokens: 1000,
@@ -43,7 +43,7 @@ describe('AdminService in Postgres', () => {
         },
         {
           chatId,
-          agent: 'MsSuzie',
+          agent: 'Agentic',
           model: 'gpt-6-astra',
           status: 'failed',
           error: 'Error: Model unavailable.',
@@ -55,7 +55,7 @@ describe('AdminService in Postgres', () => {
       ],
     });
     await db.pausedRun.create({
-      data: { state: '{"secret":"run state"}', chatId, agentName: 'MsSuzie' },
+      data: { state: '{"secret":"run state"}', chatId, agentName: 'Agentic' },
     });
     await db.remoteMachine.create({
       data: {

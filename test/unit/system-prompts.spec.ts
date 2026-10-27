@@ -22,28 +22,28 @@ function service(env: Record<string, unknown> = { DATABASE_URL }) {
 describe('SystemPromptsService', () => {
   it('never reuses a deleted prompt revision for stale updates or deletes', async () => {
     const { systemPrompts } = service();
-    const first = await systemPrompts.create('mssuzie', 'Original.');
-    await systemPrompts.remove('mssuzie', first.version!);
-    const replacement = await systemPrompts.create('mssuzie', 'Replacement.');
+    const first = await systemPrompts.create('agentic', 'Original.');
+    await systemPrompts.remove('agentic', first.version!);
+    const replacement = await systemPrompts.create('agentic', 'Replacement.');
     expect(replacement.version).toBeGreaterThan(first.version!);
     await expect(
-      systemPrompts.update('mssuzie', 'Stale edit.', first.version!),
+      systemPrompts.update('agentic', 'Stale edit.', first.version!),
     ).rejects.toThrow(/changed/);
     await expect(
-      systemPrompts.remove('mssuzie', first.version!),
+      systemPrompts.remove('agentic', first.version!),
     ).rejects.toThrow(/changed/);
-    expect((await systemPrompts.get('mssuzie')).content).toBe('Replacement.');
+    expect((await systemPrompts.get('agentic')).content).toBe('Replacement.');
   });
 
   it('returns its own updated row when another writer edits immediately afterward', async () => {
     const { db, systemPrompts } = service();
-    const first = await systemPrompts.create('mssuzie', 'Original.');
+    const first = await systemPrompts.create('agentic', 'Original.');
     let edited = false;
     const editAgain = async () => {
       if (edited) return;
       edited = true;
-      const current = await systemPrompts.get('mssuzie');
-      await systemPrompts.update('mssuzie', 'Writer B.', current.version!);
+      const current = await systemPrompts.get('agentic');
+      await systemPrompts.update('agentic', 'Writer B.', current.version!);
     };
     const update = db.systemPrompt.updateMany.bind(db.systemPrompt);
     vi.spyOn(db.systemPrompt, 'updateMany').mockImplementation(async (args) => {
@@ -59,20 +59,20 @@ describe('SystemPromptsService', () => {
       return result;
     });
     const result = await systemPrompts.update(
-      'mssuzie',
+      'agentic',
       'Writer A.',
       first.version!,
     );
     expect(edited).toBe(true);
     expect(result.content).toBe('Writer A.');
-    expect((await systemPrompts.get('mssuzie')).content).toBe('Writer B.');
+    expect((await systemPrompts.get('agentic')).content).toBe('Writer B.');
   });
 
   it.each(['update', 'remove'] as const)(
     'discards an in-flight stale read after %s',
     async (operation) => {
       const { db, systemPrompts } = service();
-      const first = await systemPrompts.create('mssuzie', 'Old.');
+      const first = await systemPrompts.create('agentic', 'Old.');
       const old = { ...db.systemPrompt.rows[0] };
       let finish!: (row: typeof old) => void;
       vi.spyOn(db.systemPrompt, 'findUnique').mockImplementationOnce(
@@ -81,15 +81,15 @@ describe('SystemPromptsService', () => {
             finish = resolve;
           }),
       );
-      const pending = systemPrompts.content('mssuzie');
+      const pending = systemPrompts.content('agentic');
       if (operation === 'update')
-        await systemPrompts.update('mssuzie', 'New.', first.version!);
-      else await systemPrompts.remove('mssuzie', first.version!);
+        await systemPrompts.update('agentic', 'New.', first.version!);
+      else await systemPrompts.remove('agentic', first.version!);
       finish(old);
       const expected =
-        operation === 'update' ? 'New.' : defaultSystemPrompts.mssuzie;
+        operation === 'update' ? 'New.' : defaultSystemPrompts.agentic;
       expect(await pending).toBe(expected);
-      expect(await systemPrompts.content('mssuzie')).toBe(expected);
+      expect(await systemPrompts.content('agentic')).toBe(expected);
     },
   );
 
@@ -108,12 +108,12 @@ describe('SystemPromptsService', () => {
     ).resolves.toBeUndefined();
   });
 
-  it('ships the MsSuzie prompt as the default', async () => {
+  it('ships the Agentic prompt as the default', async () => {
     const { systemPrompts } = service();
-    expect(defaultSystemPrompts.mssuzie).toContain(
-      'You are MsSuzie’s assistant',
+    expect(defaultSystemPrompts.agentic).toContain(
+      'You are Agentic’s assistant',
     );
-    await expect(systemPrompts.get('mssuzie')).resolves.toMatchObject({
+    await expect(systemPrompts.get('agentic')).resolves.toMatchObject({
       source: 'default',
       version: null,
     });
@@ -121,35 +121,35 @@ describe('SystemPromptsService', () => {
 
   it('creates, updates, and deletes a custom version, then falls back to the default', async () => {
     const { systemPrompts } = service();
-    const run = systemPrompts.forAgent('mssuzie');
+    const run = systemPrompts.forAgent('agentic');
 
-    await systemPrompts.create('mssuzie', 'Be brief.');
+    await systemPrompts.create('agentic', 'Be brief.');
     expect(await run()).toBe('Be brief.');
-    await expect(systemPrompts.get('mssuzie')).resolves.toMatchObject({
+    await expect(systemPrompts.get('agentic')).resolves.toMatchObject({
       source: 'custom',
       version: 1,
     });
 
-    await systemPrompts.update('mssuzie', 'Be kind and brief.', 1);
+    await systemPrompts.update('agentic', 'Be kind and brief.', 1);
     expect(await run()).toBe('Be kind and brief.');
 
-    await expect(systemPrompts.remove('mssuzie', 2)).resolves.toMatchObject({
+    await expect(systemPrompts.remove('agentic', 2)).resolves.toMatchObject({
       source: 'default',
     });
-    expect(await run()).toBe(defaultSystemPrompts.mssuzie);
+    expect(await run()).toBe(defaultSystemPrompts.agentic);
   });
 
   it('refuses a second create and a stale update or delete', async () => {
     const { systemPrompts } = service();
-    await systemPrompts.create('mssuzie', 'One.');
-    await expect(systemPrompts.create('mssuzie', 'Two.')).rejects.toThrow(
+    await systemPrompts.create('agentic', 'One.');
+    await expect(systemPrompts.create('agentic', 'Two.')).rejects.toThrow(
       /already exist/,
     );
-    await systemPrompts.update('mssuzie', 'Two.', 1);
-    await expect(systemPrompts.update('mssuzie', 'Three.', 1)).rejects.toThrow(
+    await systemPrompts.update('agentic', 'Two.', 1);
+    await expect(systemPrompts.update('agentic', 'Three.', 1)).rejects.toThrow(
       'This system prompt changed. Reload version 2 and try again.',
     );
-    await expect(systemPrompts.remove('mssuzie', 1)).rejects.toThrow(
+    await expect(systemPrompts.remove('agentic', 1)).rejects.toThrow(
       /Reload version 2/,
     );
     await expect(systemPrompts.update('menu', 'New.', 1)).rejects.toThrow(
@@ -162,7 +162,7 @@ describe('SystemPromptsService', () => {
     await systemPrompts.create('menu', 'Answer about cakes.');
     expect((await systemPrompts.list()).map((item) => item.name)).toEqual([
       'menu',
-      'mssuzie',
+      'agentic',
     ]);
     await expect(systemPrompts.remove('menu', 1)).resolves.toBeUndefined();
     await expect(systemPrompts.get('menu')).rejects.toThrow(
@@ -180,18 +180,18 @@ describe('SystemPromptsService', () => {
 
   it('uses the default and refuses writes without a database', async () => {
     const { systemPrompts } = service({});
-    expect(await systemPrompts.forAgent('mssuzie')()).toBe(
-      defaultSystemPrompts.mssuzie,
+    expect(await systemPrompts.forAgent('agentic')()).toBe(
+      defaultSystemPrompts.agentic,
     );
-    await expect(systemPrompts.create('mssuzie', 'Hi.')).rejects.toThrow(
+    await expect(systemPrompts.create('agentic', 'Hi.')).rejects.toThrow(
       'Saving a system prompt needs DATABASE_URL.',
     );
   });
 
   it('keeps the last known text when the database is down', async () => {
     const { db, systemPrompts } = service();
-    await systemPrompts.create('mssuzie', 'Saved text.');
-    const run = systemPrompts.forAgent('mssuzie');
+    await systemPrompts.create('agentic', 'Saved text.');
+    const run = systemPrompts.forAgent('agentic');
     expect(await run()).toBe('Saved text.');
 
     vi.useFakeTimers({ now: Date.now() + 10_000 });

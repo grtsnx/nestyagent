@@ -106,7 +106,7 @@ The app uses Postgres through Prisma. The database keeps durable workflow record
 | `chat_history_operations`    | Completed SDK history operations and their content digest.                            | Chat id + operation id                        |
 | `execution_locks`            | Which worker is running a chat, a saved run, or a machine change.                     | The lock name, like `chat:chat-c-42`          |
 | `expired_environments`       | Environments OpenAI said are gone, so they are never started again.                   | OpenAI's environment id                       |
-| `system_prompts`             | Custom system prompts saved through the API. Without a row, the default file is used. | The helper name, like `mssuzie`               |
+| `system_prompts`             | Custom system prompts saved through the API. Without a row, the default file is used. | The helper name, like `agentic`               |
 | `composio_sessions`          | Each user's Composio session, so a session id never comes from a request.             | The user id                                   |
 | `agent_runs`                 | One row per invocation: token deltas, time, result, and trace id. No message text.    | A UUID the database makes                     |
 | `chatkit_threads`            | Each ChatKit chat, in ChatKit's own JSON shape, with its owner.                       | ChatKit's thread id, like `thr_…`             |
@@ -642,7 +642,7 @@ Tool requests receive the run's cancellation signal, the application's shutdown 
 <details>
 <summary><h2>📝 System prompts</h2></summary>
 
-A helper's system prompt can be changed from Swagger or Scalar without a deploy. The built-in text lives in `src/config/system-prompts`, one Markdown file per helper, and MsSuzie's is `mssuzie.md`. A saved custom version replaces it. Delete the custom version and the built-in text comes back.
+A helper's system prompt can be changed from Swagger or Scalar without a deploy. The built-in text lives in `src/config/system-prompts`, one Markdown file per helper, and Agentic's is `agentic.md`. A saved custom version replaces it. Delete the custom version and the built-in text comes back.
 
 Set `ADMIN_API_KEY` to turn the routes on. Every request sends it in the `x-admin-key` header. In Swagger, click **Authorize** and paste the key once. Without the key set, the routes answer 403 and nothing can be changed.
 
@@ -660,8 +660,8 @@ Set `ADMIN_API_KEY` to turn the routes on. Every request sends it in the `x-admi
 
 ```typescript
 const frontDesk = this.openai.createAgent(
-  'MsSuzie',
-  this.systemPrompts.forAgent('mssuzie'),
+  'Agentic',
+  this.systemPrompts.forAgent('agentic'),
 );
 ```
 
@@ -674,10 +674,10 @@ To add a helper, add `src/config/system-prompts/<name>.md` and list it in `src/c
 <details>
 <summary><h2>💬 ChatKit</h2></summary>
 
-[ChatKit](https://developers.openai.com/api/docs/guides/custom-chatkit) is OpenAI's ready-made chat window for websites. This app is its server. A customer on the Sunny Bakery site types "Do you have gluten-free bread?", and MsSuzie answers in the window, with streaming text, cards, buttons, file uploads, and voice input.
+[ChatKit](https://developers.openai.com/api/docs/guides/custom-chatkit) is OpenAI's ready-made chat window for websites. This app is its server. A customer on the Sunny Bakery site types "Do you have gluten-free bread?", and Agentic answers in the window, with streaming text, cards, buttons, file uploads, and voice input.
 
 ```
-Bakery website (ChatKit window)  ──POST /v1/chatkit──▶  this app  ──▶  MsSuzie helper  ──▶  OpenAI
+Bakery website (ChatKit window)  ──POST /v1/chatkit──▶  this app  ──▶  Agentic helper  ──▶  OpenAI
         ▲                                                  │
         └──────────── streamed answer (SSE) ───────────────┘   chats saved in Postgres
 ```
@@ -688,7 +688,7 @@ The code is in three places:
 | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `src/lib/chatkit`     | `chatkit.module.ts` registers the shared providers and is imported/exported by `LibModule`. `chatkit.service.ts` contains the protocol service, types, validation, durable operations, widgets, and SDK bridge. |
 | `src/config/chatkit`  | Sunny Bakery's setup: user tokens and file links (`chatkit.auth.ts`) and the Postgres store (`chatkit.store.ts`).                                                                                               |
-| `src/modules/chatkit` | The routes and `MsSuzieChatKitService`, which extends the library service and answers every message; its module imports the shared ChatKit library module.                                                      |
+| `src/modules/chatkit` | The routes and `AgenticChatKitService`, which extends the library service and answers every message; its module imports the shared ChatKit library module.                                                      |
 
 ### Turn it on
 
@@ -815,7 +815,7 @@ useChatKit({
   },
   history: { enabled: true },
   threadItemActions: { feedback: true, retry: true },
-  disclaimer: { text: 'MsSuzie can make mistakes. Check your order details.' },
+  disclaimer: { text: 'Agentic can make mistakes. Check your order details.' },
   locale: 'en-GB',
   initialThread: savedThreadId, // or null for a new chat
 });
@@ -837,23 +837,23 @@ The window also sends events you can listen to: `chatkit.ready`, `chatkit.error`
 
 ### What the server does with each message
 
-`MsSuzieChatKitService` in `src/modules/chatkit/chatkit.service.ts` answers every message:
+`AgenticChatKitService` in `src/modules/chatkit/chatkit.service.ts` answers every message:
 
 1. A new chat is named after its first message, up to 60 characters.
-2. The last 50 items of the chat go to MsSuzie as history. Images go as pictures, and other files go with their name.
-3. MsSuzie uses her editable system prompt (see System prompts) and runs through `OpenaiService`, so `agent_runs`, traces, and prompt caching all work. Each turn is recorded with workflow `chatkit-turn`, the user's id, the thread id, and conversation type `chatkit`. Admin chat summaries include these conversations.
+2. The last 50 items of the chat go to Agentic as history. Images go as pictures, and other files go with their name.
+3. Agentic uses her editable system prompt (see System prompts) and runs through `OpenaiService`, so `agent_runs`, traces, and prompt caching all work. Each turn is recorded with workflow `chatkit-turn`, the user's id, the thread id, and conversation type `chatkit`. Admin chat summaries include these conversations.
 4. The answer streams back word by word. When it ends, every item is saved in `chatkit_items`.
 
 Only one answer runs per chat at a time, across all servers. The first turn acquires its lock before publishing the new thread id. Every storage mutation checks lease ownership inside its database transaction, so an expired worker cannot overwrite its replacement. SSE writes wait for the browser to drain its buffer.
 
 | What the user does                    | What happens on the server                                                                                              |
 | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Presses stop                          | The run stops. Text that already arrived is kept, and MsSuzie is told the user stopped her.                             |
-| Presses retry (`retry: true`)         | The suffix and a retry marker commit together, then MsSuzie answers again; failed deletion preserves the whole history. |
+| Presses stop                          | The run stops. Text that already arrived is kept, and Agentic is told the user stopped her.                             |
+| Presses retry (`retry: true`)         | The suffix and a retry marker commit together, then Agentic answers again; failed deletion preserves the whole history. |
 | Thumbs up or down (`feedback: true`)  | A row goes into `chatkit_feedback`, for evals. Only on the user's own chat.                                             |
 | Speaks (`dictation`)                  | The audio is turned into text with `CHATKIT_TRANSCRIPTION_MODEL`, and the text lands in the composer.                   |
 | Renames or deletes a chat             | The chat is updated or deleted, with its items and files.                                                               |
-| Picks a tool or model in the composer | It arrives as `input.inference_options` on the message. MsSuzie ignores it until you read it in `respond`.              |
+| Picks a tool or model in the composer | It arrives as `input.inference_options` on the message. Agentic ignores it until you read it in `respond`.              |
 
 > [!NOTE]
 > Voice input arrives as JSON, and the app keeps Nest's normal JSON size limit (100 KB). Base64 encoding counts toward that limit, so the usable audio duration depends on its codec and bitrate. A larger request gets 413.
@@ -912,7 +912,7 @@ const showCakes = tool({
 
 Widgets have two outer shapes, `Card` and `ListView`. Inside them you can use `Box`, `Row`, `Col`, `Text`, `Title`, `Caption`, `Markdown`, `Badge`, `Button`, `Icon`, `Image`, `Divider`, `Spacer`, `Select`, `DatePicker`, `Form`, `ListViewItem`, and `Transition`. `Text` and `Markdown` can stream. Design one in the [Widget Builder](https://widgets.chatkit.studio) and paste its JSON. The types come from `@openai/chatkit`, so a wrong field fails the type check.
 
-MsSuzie's tools go in `agent()` in `src/modules/chatkit/chatkit.service.ts`: `this.openai.createAgent('MsSuzie', …, { tools: [showCakes] })`.
+Agentic's tools go in `agent()` in `src/modules/chatkit/chatkit.service.ts`: `this.openai.createAgent('Agentic', …, { tools: [showCakes] })`.
 
 ### Actions
 
@@ -936,7 +936,7 @@ const cakeOrder = z.object({
 const order = cakeOrder.safeParse(action);
 if (order.success) {
   await this.orders.add(context.userId, order.data.payload.cakeId);
-  // Tell MsSuzie what happened, then let her answer.
+  // Tell Agentic what happened, then let her answer.
   await this.store.addThreadItem(
     thread.id,
     {
@@ -968,14 +968,14 @@ widgets: {
 
 ### Approvals
 
-When MsSuzie calls a tool that needs a yes, like `cancelOrder`, the run pauses and saves itself (see Decide later). The chat shows a card with the tool and its inputs, and **Approve** and **Decline** buttons.
+When Agentic calls a tool that needs a yes, like `cancelOrder`, the run pauses and saves itself (see Decide later). The chat shows a card with the tool and its inputs, and **Approve** and **Decline** buttons.
 
 - Only the user who owns the run can answer it. Anyone else gets "This request was already answered."
 - A checkpoint and its approval card commit together. Each action binds to the user, original thread, card, and checkpoint version. A stale card cannot approve a later pause.
-- Editing MsSuzie's system prompt does not touch waiting cards: they can still be answered, and the next step uses the new prompt.
-- Runs also save `AGENT_VERSION` from `src/modules/chatkit/chatkit.service.ts`. Change it when MsSuzie's tools change in a way an old run cannot handle. A card saved before that change closes as "This request expired after an update. Please ask again." when clicked, and nothing runs.
+- Editing Agentic's system prompt does not touch waiting cards: they can still be answered, and the next step uses the new prompt.
+- Runs also save `AGENT_VERSION` from `src/modules/chatkit/chatkit.service.ts`. Change it when Agentic's tools change in a way an old run cannot handle. A card saved before that change closes as "This request expired after an update. Please ask again." when clicked, and nothing runs.
 - The card changes to "Approved." or "Declined." only after the saved run is claimed.
-- **A new message means no.** If the customer types instead of clicking, the waiting request is cancelled without running, its card shows "Declined.", and MsSuzie answers the new message.
+- **A new message means no.** If the customer types instead of clicking, the waiting request is cancelled without running, its card shows "Declined.", and Agentic answers the new message.
   - The checkpoint and the "Declined." card are saved in one database transaction. If that write fails, neither changes and the message is refused, so the customer can send it again.
   - The open window gets the new card right away (`thread.item.replaced`), only after it was saved.
   - The decline is saved before the new message. If saving the message itself then fails, the decline stays, and the window gets an error event (`stream.error`, with retry allowed) after the "Declined." card. The message was not saved, so the customer sends it again.
@@ -985,7 +985,7 @@ When MsSuzie calls a tool that needs a yes, like `cancelOrder`, the run pauses a
 
 ### Tools the browser runs (client tools)
 
-Some tools only the page can do, like reading the basket. Give MsSuzie a `clientTool` and stop the run there, so the page can answer:
+Some tools only the page can do, like reading the basket. Give Agentic a `clientTool` and stop the run there, so the page can answer:
 
 ```typescript
 import {
@@ -999,14 +999,14 @@ const readBasket = clientTool({
   parameters: { type: 'object', properties: {} },
 });
 
-this.openai.createAgent('MsSuzie', this.systemPrompts.forAgent('mssuzie'), {
+this.openai.createAgent('Agentic', this.systemPrompts.forAgent('agentic'), {
   tools: [readBasket],
   toolUseBehavior: clientToolStopBehavior(['read_basket']),
   modelSettings: { parallelToolCalls: false },
 });
 ```
 
-On the page, answer it with `onClientTool`. What you return goes back to MsSuzie, and she answers again:
+On the page, answer it with `onClientTool`. What you return goes back to Agentic, and she answers again:
 
 ```typescript
 onClientTool: async ({ name }) => (name === 'read_basket' ? { items: basket.items } : {}),
@@ -1049,7 +1049,7 @@ The new card is saved with a new version, and the customer sees it when the chat
 
 ### @-mentions (entities)
 
-With `entities.onTagSearch` on the page, a user can type `@` and pick something, like a cake or an order. MsSuzie sees the tag's text and its `data`. To show more, such as the order's status, extend `ThreadItemConverter.tagToMessageContent` in `src/modules/chatkit/chatkit.service.ts`.
+With `entities.onTagSearch` on the page, a user can type `@` and pick something, like a cake or an order. Agentic sees the tag's text and its `data`. To show more, such as the order's status, extend `ThreadItemConverter.tagToMessageContent` in `src/modules/chatkit/chatkit.service.ts`.
 
 ### Keep it safe
 

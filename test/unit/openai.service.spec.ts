@@ -959,7 +959,7 @@ describe('OpenaiService storage and limits', () => {
     const { db, prisma } = fakePrisma();
     const openai = service(prisma, { DATABASE_URL: 'postgresql://x' });
     const agent = new Agent({
-      name: 'MsSuzie',
+      name: 'Agentic',
       instructions: 'Help.',
       model: 'gpt-6-astra',
     });
@@ -984,7 +984,7 @@ describe('OpenaiService storage and limits', () => {
 
       expect(db.agentRun.rows).toMatchObject([
         {
-          agent: 'MsSuzie',
+          agent: 'Agentic',
           model: 'gpt-6-astra',
           userId: 'guardian-7',
           status: 'completed',
@@ -1009,7 +1009,7 @@ describe('OpenaiService storage and limits', () => {
     try {
       await service(prisma).runAgent(
         'Hi.',
-        new Agent({ name: 'MsSuzie', instructions: 'Help.' }),
+        new Agent({ name: 'Agentic', instructions: 'Help.' }),
       );
       expect(db.agentRun.rows).toEqual([]);
     } finally {

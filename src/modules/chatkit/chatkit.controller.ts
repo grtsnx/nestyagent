@@ -54,7 +54,7 @@ import {
 } from '@/lib/chatkit/chatkit.service.js';
 import { PrismaService } from '@/lib/prisma/prisma.service.js';
 import { AdminKeyGuard, ApiFailure, ApiSuccess, baseUrl } from '@/middleware';
-import { MsSuzieChatKitService } from './chatkit.service.js';
+import { AgenticChatKitService } from './chatkit.service.js';
 
 // Shown inline. Anything else, such as SVG or HTML, downloads, so it can never run as a page.
 const INLINE_TYPES = new Set([
@@ -77,7 +77,7 @@ export class ChatKitController {
   private readonly logger = new Logger(ChatKitController.name);
 
   constructor(
-    private readonly server: MsSuzieChatKitService,
+    private readonly server: AgenticChatKitService,
     private readonly auth: ChatKitAuth,
     private readonly prisma: PrismaService,
   ) {}
@@ -198,7 +198,7 @@ export class ChatKitController {
     name: 'homework.png',
     mime_type: 'image/png',
     preview_url:
-      'https://api.mssuzie.io/v1/chatkit/attachments/atc_0123456789abcdef0123456789abcdef/content?sig=signature',
+      'https://api.agentic.io/v1/chatkit/attachments/atc_0123456789abcdef0123456789abcdef/content?sig=signature',
   })
   @ApiFailure(
     HttpStatus.PAYLOAD_TOO_LARGE,

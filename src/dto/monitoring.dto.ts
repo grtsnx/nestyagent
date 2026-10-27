@@ -34,7 +34,7 @@ export class RunsQueryDto extends ListQueryDto {
 
   @ApiPropertyOptional({
     description: 'This keeps only runs of one helper.',
-    example: 'MsSuzie',
+    example: 'Agentic',
   })
   @IsOptional()
   @IsString()

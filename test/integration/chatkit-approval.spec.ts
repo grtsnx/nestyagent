@@ -13,7 +13,7 @@ import { z } from 'zod';
 import { ChatKitStore, type ChatKitContext } from '@/config/chatkit/index.js';
 import { OpenaiService } from '@/lib/openai/openai.service.js';
 import { PrismaService } from '@/lib/prisma/prisma.service.js';
-import { MsSuzieChatKitService } from '@/modules/chatkit/chatkit.service.js';
+import { AgenticChatKitService } from '@/modules/chatkit/chatkit.service.js';
 import { SystemPromptsService } from '@/modules/system-prompts/system-prompts.service.js';
 import { AdminService } from '@/modules/admin/admin.service.js';
 import { scriptedModel, type ScriptStep } from '../unit/chatkit-model.js';
@@ -135,7 +135,7 @@ describe('Durable ChatKit approvals in Postgres', () => {
     clients.push(openai);
     const effect = vi.fn(async () => 'Done.');
     const agent = new Agent({
-      name: 'MsSuzie',
+      name: 'Agentic',
       tools: [
         tool({
           name: 'effect',
@@ -146,7 +146,7 @@ describe('Durable ChatKit approvals in Postgres', () => {
         }),
       ],
     });
-    const server = new MsSuzieChatKitService(
+    const server = new AgenticChatKitService(
       store,
       undefined as never,
       openai,
@@ -354,7 +354,7 @@ describe('Durable ChatKit approvals in Postgres', () => {
   it('rejects feedback for an item outside the owned thread', async () => {
     const f = await fixture();
     const paused = await f.create();
-    const server = new MsSuzieChatKitService(
+    const server = new AgenticChatKitService(
       f.store,
       undefined as never,
       f.openai,
@@ -494,7 +494,7 @@ describe('Durable ChatKit approvals in Postgres', () => {
         ]),
       );
       const run = await prisma.db.agentRun.findFirstOrThrow({
-        where: { userId: f.context.userId, agent: 'MsSuzie' },
+        where: { userId: f.context.userId, agent: 'Agentic' },
       });
       expect(run).toMatchObject({
         chatId: paused.threadId,

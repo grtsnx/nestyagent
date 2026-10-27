@@ -5,6 +5,6 @@ import { readFileSync } from 'node:fs';
 export const defaultSystemPrompts: Readonly<Record<string, string>> =
   Object.freeze(
     Object.assign(Object.create(null) as Record<string, string>, {
-      mssuzie: readFileSync(new URL('./mssuzie.md', import.meta.url), 'utf8'),
+      agentic: readFileSync(new URL('./agentic.md', import.meta.url), 'utf8'),
     }),
   );

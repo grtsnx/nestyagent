@@ -16,7 +16,7 @@ import {
 } from '@/lib/chatkit/chatkit.service.js';
 import { OpenaiService } from '@/lib/openai/openai.service.js';
 import { PrismaService } from '@/lib/prisma/prisma.service.js';
-import { MsSuzieChatKitService } from '@/modules/chatkit/chatkit.service.js';
+import { AgenticChatKitService } from '@/modules/chatkit/chatkit.service.js';
 import {
   ChatKitAttachmentStore,
   ChatKitAuth,
@@ -45,7 +45,7 @@ describe('ChatKit in Postgres', () => {
   const auth = new ChatKitAuth(config);
   const attachments = new ChatKitAttachmentStore(prisma, auth, config);
   const openai = new OpenaiService(config, prisma);
-  const server = new MsSuzieChatKitService(
+  const server = new AgenticChatKitService(
     store,
     attachments,
     openai,
@@ -55,7 +55,7 @@ describe('ChatKit in Postgres', () => {
   );
   const owner = (): ChatKitContext => ({
     userId: `guardian-${randomUUID()}`,
-    baseUrl: 'https://api.mssuzie.io',
+    baseUrl: 'https://api.agentic.io',
   });
   const thread = (id = `thr_${randomUUID()}`): ThreadMetadata => ({
     id,
@@ -178,7 +178,7 @@ describe('ChatKit in Postgres', () => {
     );
   });
 
-  it('answers a new chat with the MsSuzie helper and records the run', async () => {
+  it('answers a new chat with the Agentic helper and records the run', async () => {
     const alice = owner();
     useModel([{ text: 'Plans start at $89 a month.', id: 'msg_plans' }]);
     const events = (await send(
@@ -223,7 +223,7 @@ describe('ChatKit in Postgres', () => {
       where: { userId: alice.userId },
     });
     expect(run).toMatchObject({
-      agent: 'MsSuzie',
+      agent: 'Agentic',
       userId: alice.userId,
       status: 'completed',
     });
@@ -234,7 +234,7 @@ describe('ChatKit in Postgres', () => {
     const alice = owner();
     const cancelOrder = vi.fn(async () => 'Order 42 is cancelled.');
     const helper = new Agent({
-      name: 'MsSuzie',
+      name: 'Agentic',
       instructions: 'Help.',
       tools: [
         tool({

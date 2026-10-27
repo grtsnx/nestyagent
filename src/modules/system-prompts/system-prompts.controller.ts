@@ -20,17 +20,17 @@ import {
 import { SystemPromptsService } from './system-prompts.service.js';
 import { AdminKeyGuard, ApiFailure, ApiSuccess } from '@/middleware';
 
-const PATH = '/v1/system-prompts/mssuzie';
-const SAMPLE = 'You are MsSuzie’s assistant. You speak for MsSuzie...';
+const PATH = '/v1/system-prompts/agentic';
+const SAMPLE = 'You are Agentic’s assistant. You speak for Agentic...';
 const custom = {
-  name: 'mssuzie',
+  name: 'agentic',
   content: SAMPLE,
   source: 'custom',
   version: 2,
   updatedAt: '2026-10-27T09:00:00.000Z',
 };
 const fallback = {
-  name: 'mssuzie',
+  name: 'agentic',
   content: SAMPLE,
   source: 'default',
   version: null,
@@ -76,7 +76,7 @@ export class SystemPromptsController {
   @ApiFailure(
     HttpStatus.NOT_FOUND,
     'No custom version or default exists for this name.',
-    'No system prompt named mssuzie.',
+    'No system prompt named agentic.',
     PATH,
   )
   @Get(':name')
@@ -97,7 +97,7 @@ export class SystemPromptsController {
   @ApiFailure(
     HttpStatus.CONFLICT,
     'A custom version already exists, so it must be updated instead.',
-    'A custom system prompt named mssuzie already exists. Update it instead.',
+    'A custom system prompt named agentic already exists. Update it instead.',
     PATH,
   )
   @Post(':name')
@@ -120,7 +120,7 @@ export class SystemPromptsController {
   @ApiFailure(
     HttpStatus.NOT_FOUND,
     'No custom version exists yet, so it must be created first.',
-    'No custom system prompt named mssuzie.',
+    'No custom system prompt named agentic.',
     PATH,
   )
   @Put(':name')
