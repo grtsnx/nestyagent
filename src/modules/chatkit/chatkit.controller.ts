@@ -16,7 +16,6 @@ import {
   UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
-import { FileInterceptor } from '@nestjs/platform-express';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -27,26 +26,28 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import type { RawBodyRequest } from '@nestjs/common';
-import type { Request, Response } from 'express';
+import type { Response } from 'express';
 import {
   ChatKitAuth,
   ChatKitAuthGuard,
+  ChatKitUploadGuard,
+  ChatKitUploadInterceptor,
   checkUpload,
   type ChatKitContext,
   type ChatKitRequest,
+  type ChatKitUploadRequest,
 } from '@/config/chatkit/index.js';
 import { ChatKitRequestDto, ChatKitTokenDto } from '@/dto/index.js';
 import {
   InvalidRequestError,
   NotFoundError,
+  parseRequest,
   serialize,
 } from '@/lib/chatkit/chatkit.service.js';
 import { PrismaService } from '@/lib/prisma/prisma.service.js';
 import { AdminKeyGuard, ApiFailure, ApiSuccess, baseUrl } from '@/middleware';
 import { MsSuzieChatKitService } from './chatkit.service.js';
 
-// Files are kept in memory, never on disk. Reading stops past this. The configured limit, at most 50 MB, is checked after.
-const UPLOAD_CEILING = 50 * 1024 * 1024 + 1;
 // Shown inline. Anything else, such as SVG or HTML, downloads, so it can never run as a page.
 const INLINE_TYPES = new Set([
   'image/png',
@@ -116,12 +117,28 @@ export class ChatKitController {
     });
     const body =
       request.rawBody?.toString('utf8') ?? JSON.stringify(request.body ?? {});
-    const threadId = threadIdOf(body);
+    let parsed;
+    try {
+      parsed = parseRequest(body);
+    } catch (error) {
+      rethrow(error);
+    }
+    const createdThreadId =
+      parsed.type === 'threads.create'
+        ? this.server.chatkitStore.generateThreadId(request.chatkit!)
+        : undefined;
+    const threadId =
+      createdThreadId ??
+      ('thread_id' in parsed.params ? parsed.params.thread_id : undefined);
     const run = async (lock?: AbortSignal) => {
       const signal = lock
         ? AbortSignal.any([disconnected.signal, lock])
         : disconnected.signal;
-      const context: ChatKitContext = { ...request.chatkit!, signal };
+      const context: ChatKitContext = {
+        ...request.chatkit!,
+        signal,
+        ...(createdThreadId && { createdThreadId }),
+      };
       const result = await this.server
         .process(body, context, signal)
         .catch(rethrow);
@@ -129,7 +146,9 @@ export class ChatKitController {
         response.status(200).type('application/json').send(result.json);
         return;
       }
-      await this.stream(result.stream, response);
+      await this.stream(result.stream, response, (error) =>
+        disconnected.abort(error),
+      );
     };
     // One reply at a time per thread, across every server, so two messages never interleave.
     if (threadId) await this.prisma.withLock(`chatkit:${threadId}`, run);
@@ -159,12 +178,14 @@ export class ChatKitController {
     preview_url:
       'https://api.mssuzie.io/v1/chatkit/attachments/atc_0123456789abcdef0123456789abcdef/content?sig=signature',
   })
-  @UseGuards(ChatKitAuthGuard)
-  @UseInterceptors(
-    FileInterceptor('file', {
-      limits: { fileSize: UPLOAD_CEILING },
-    }),
+  @ApiFailure(
+    HttpStatus.PAYLOAD_TOO_LARGE,
+    'The uploaded file exceeds the configured upload limit.',
+    'File too large.',
+    '/v1/chatkit/attachments',
   )
+  @UseGuards(ChatKitAuthGuard)
+  @UseInterceptors(ChatKitUploadInterceptor)
   @Post('attachments')
   async upload(
     @Req() request: ChatKitRequest,
@@ -181,12 +202,9 @@ export class ChatKitController {
       part.mimetype,
       context,
     );
-    await store.saveAttachment(attachment, context);
-    const saved = await store.saveAttachmentContent(
-      attachment,
-      part.buffer,
-      context,
-    );
+    const saved = await store
+      .saveUploadedAttachment(attachment, part.buffer, context)
+      .catch(rethrow);
     response.status(200).type('application/json').send(serialize(saved));
   }
 
@@ -212,34 +230,42 @@ export class ChatKitController {
   })
   @ApiFailure(
     HttpStatus.NOT_FOUND,
-    'The link is not valid for this attachment, or the attachment was deleted.',
+    'The upload link is invalid, expired, already used, or its attachment was deleted.',
     'Attachment not found.',
     '/v1/chatkit/attachments/atc_1/upload',
   )
-  @UseInterceptors(
-    FileInterceptor('file', {
-      limits: { fileSize: UPLOAD_CEILING },
-    }),
+  @ApiFailure(
+    HttpStatus.PAYLOAD_TOO_LARGE,
+    'The uploaded file exceeds the configured upload limit.',
+    'File too large.',
+    '/v1/chatkit/attachments/atc_1/upload',
   )
+  @UseGuards(ChatKitUploadGuard)
+  @UseInterceptors(ChatKitUploadInterceptor)
   @Post('attachments/:id/upload')
   async finishUpload(
     @Param('id') id: string,
     @Query('sig') signature: string | undefined,
-    @Req() request: Request,
+    @Req() request: ChatKitUploadRequest,
     @UploadedFile() file: UploadedPart | undefined,
     @Res() response: Response,
   ) {
-    const found = await this.signedAttachment(id, signature);
+    const found = request.upload;
+    if (
+      !found ||
+      found.attachment.id !== id ||
+      typeof signature !== 'string' ||
+      this.auth.verifyUpload(id, signature) !== found.userId
+    )
+      throw new NotFoundException('Attachment not found.');
     const part = this.checkPart(file);
     const context: ChatKitContext = {
       userId: found.userId,
       baseUrl: baseUrl(request),
     };
-    const saved = await this.server.chatkitStore.saveAttachmentContent(
-      found.attachment,
-      part.buffer,
-      context,
-    );
+    const saved = await this.server.chatkitStore
+      .saveAttachmentContent(found.attachment, part.buffer, context)
+      .catch(rethrow);
     response.status(200).type('application/json').send(serialize(saved));
   }
 
@@ -261,7 +287,10 @@ export class ChatKitController {
     @Query('sig') signature: string | undefined,
     @Res() response: Response,
   ) {
-    const { attachment, content } = await this.signedAttachment(id, signature);
+    const allowed = await this.signedAttachment(id, signature);
+    const { attachment, content } = await this.server.chatkitStore
+      .loadAttachmentContent(id, allowed.userId)
+      .catch(rethrow);
     if (!content) throw new NotFoundException('The file was not uploaded yet.');
     const inline = INLINE_TYPES.has(attachment.mime_type);
     response
@@ -310,30 +339,65 @@ export class ChatKitController {
   //1. Waits for the first event before sending headers, so a missing thread is a clean 404.
   //2. After that, errors arrive as ChatKit error events inside the stream.
   //3. A browser that leaves keeps the loop draining, so the cancel path saves what arrived.
-  private async stream(events: AsyncGenerator<string>, response: Response) {
+  private async stream(
+    events: AsyncGenerator<string>,
+    response: Response,
+    cancel: (error: unknown) => void = () => {},
+  ) {
     const first = await events.next().catch(rethrow);
-    response.status(200);
-    response.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    response.setHeader('Cache-Control', 'no-cache, no-transform');
-    response.setHeader('Connection', 'keep-alive');
-    // Stops proxies such as nginx from holding events back.
-    response.setHeader('X-Accel-Buffering', 'no');
-    response.flushHeaders();
     try {
-      if (!first.done) response.write(first.value);
+      response.status(200);
+      response.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      response.setHeader('Cache-Control', 'no-cache, no-transform');
+      response.setHeader('Connection', 'keep-alive');
+      // Stops proxies such as nginx from holding events back.
+      response.setHeader('X-Accel-Buffering', 'no');
+      response.flushHeaders();
+      if (!first.done) await this.writeEvent(response, first.value);
       for (;;) {
         const next = await events.next();
         if (next.done) break;
-        if (!response.writableEnded) response.write(next.value);
+        await this.writeEvent(response, next.value);
       }
     } catch (error) {
+      cancel(error);
       this.logger.error({
         message: 'A ChatKit stream ended with an error.',
         error: error instanceof Error ? error.name : 'Error',
       });
+      // Keep the thread lease through cancellation and partial-history persistence,
+      // even when the socket fails before emitting its close event.
+      try {
+        while (!(await events.next()).done) {}
+      } catch {
+        // The cancelled run may reject after its own cleanup has completed.
+      }
     } finally {
-      if (!response.writableEnded) response.end();
+      await events.return(undefined);
+      if (!response.writableEnded && !response.destroyed) response.end();
     }
+  }
+
+  private async writeEvent(response: Response, value: string) {
+    if (response.writableEnded || response.destroyed || response.write(value))
+      return;
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        response.off('drain', done);
+        response.off('close', done);
+        response.off('error', done);
+        resolve();
+      };
+      response.once('drain', done);
+      response.once('close', done);
+      response.once('error', done);
+      if (
+        response.writableEnded ||
+        response.destroyed ||
+        response.writableNeedDrain === false
+      )
+        done();
+    });
   }
 
   private async signedAttachment(id: string, signature: string | undefined) {
@@ -342,7 +406,7 @@ export class ChatKitController {
         'ChatKit is off. Set CHATKIT_SECRET to turn it on.',
       );
     try {
-      const found = await this.server.chatkitStore.loadAttachmentForLink(id);
+      const found = await this.server.chatkitStore.loadAttachmentInfo(id);
       if (
         !signature ||
         !this.auth.verifyAttachment(id, found.userId, signature)
@@ -368,17 +432,6 @@ export class ChatKitController {
       return rethrow(error);
     }
     return file;
-  }
-}
-
-// The thread a streaming request belongs to, for the per-thread lock.
-function threadIdOf(body: string) {
-  try {
-    const id = (JSON.parse(body) as { params?: { thread_id?: unknown } }).params
-      ?.thread_id;
-    return typeof id === 'string' && id ? id : undefined;
-  } catch {
-    return undefined;
   }
 }
 

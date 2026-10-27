@@ -84,6 +84,9 @@ export async function createApplication(): Promise<{
     OBSERVE_ENABLED: config.getOrThrow<boolean>('OBSERVE_ENABLED'),
     LANGFUSE_ENABLED: config.getOrThrow<boolean>('LANGFUSE_ENABLED'),
     COMPOSIO_ENABLED: config.getOrThrow<boolean>('COMPOSIO_ENABLED'),
+    CHATKIT_MAX_UPLOAD_BYTES: config.getOrThrow<number>(
+      'CHATKIT_MAX_UPLOAD_BYTES',
+    ),
     OBSERVE_APP_KEY: config.get<string>('OBSERVE_APP_KEY'),
     OBSERVE_APP_SECRET: config.get<string>('OBSERVE_APP_SECRET'),
     OBSERVE_SERVICE_ID: config.get<string>('OBSERVE_SERVICE_ID'),

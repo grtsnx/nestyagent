@@ -24,6 +24,8 @@ export class PrismaService implements OnModuleDestroy {
   private readonly locks = new Set<AbortController>();
   private readonly logger = new Logger(PrismaService.name);
   private readonly execution = new AsyncLocalStorage<ExecutionLease[]>();
+  private readonly transactions =
+    new AsyncLocalStorage<Prisma.TransactionClient>();
   // A lock lives this long unless its owner renews it. A crashed owner frees it after this.
   lockTtlMs = 60_000;
   lockRenewMs = 15_000;
@@ -43,6 +45,11 @@ export class PrismaService implements OnModuleDestroy {
       }),
     });
     return this.client;
+  }
+
+  // Composed stores use the same connection, so their writes share one commit.
+  get connection(): Prisma.TransactionClient {
+    return this.transactions.getStore() ?? this.db;
   }
 
   async onModuleDestroy() {
@@ -68,13 +75,17 @@ export class PrismaService implements OnModuleDestroy {
   async transaction<T>(
     work: (tx: Prisma.TransactionClient) => Promise<T>,
   ): Promise<T> {
+    const current = this.transactions.getStore();
+    if (current) return work(current);
     const leases = this.execution.getStore() ?? [];
-    return await this.db.$transaction(async (tx) => {
-      await this.assertOwnership(tx, leases);
-      const result = await work(tx);
-      await this.assertOwnership(tx, leases);
-      return result;
-    });
+    return await this.db.$transaction((tx) =>
+      this.transactions.run(tx, async () => {
+        await this.assertOwnership(tx, leases);
+        const result = await work(tx);
+        await this.assertOwnership(tx, leases);
+        return result;
+      }),
+    );
   }
 
   private async assertOwnership(
@@ -109,6 +120,8 @@ export class PrismaService implements OnModuleDestroy {
     key: string | string[],
     work: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
+    if (this.transactions.getStore())
+      throw new Error('Acquire execution locks before starting a transaction.');
     const keys = [...new Set(Array.isArray(key) ? key : [key])].sort();
     const owner = randomUUID();
     const controller = new AbortController();

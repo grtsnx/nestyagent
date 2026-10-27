@@ -86,6 +86,14 @@ type ResumeOptions = {
   userId?: string;
   workflowName?: string;
   groupId?: string;
+  // Conversation identity is independent of trace grouping and restored with checkpoints.
+  chatkitThreadId?: string;
+  // Runs inside the checkpoint transaction; use for associated durable UI state only.
+  onCheckpoint?: (
+    checkpoint: SavedRunIdentity,
+    result: PausedRun,
+  ) => Promise<void>;
+  onClaim?: () => Promise<void>;
   outputGuardrailBlockedMessage?:
     string | OutputGuardrailBlockedMessageFormatter;
 };
@@ -101,7 +109,12 @@ type RunMetadata = {
   agentName?: string;
   saved?: SavedRunIdentity;
 };
-type RunAccess = { ownerId?: string; agentVersion?: string };
+type RunAccess = {
+  ownerId?: string;
+  agentVersion?: string;
+  chatkitThreadId?: string;
+  version?: number;
+};
 const storedOptionsSchema = z.object({
   websocket: z.boolean().optional(),
   maxTurns: z.number().int().positive().optional(),
@@ -867,14 +880,15 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
       );
     }
     const state = serializeState(result.state);
-    const row = await this.prisma.transaction((tx) =>
-      tx.pausedRun.upsert({
+    const row = await this.prisma.transaction(async (tx) => {
+      const row = await tx.pausedRun.upsert({
         where: { id },
         update: {},
         create: {
           id,
           state,
           chatId: session?.chatId,
+          chatkitThreadId: policy.chatkitThreadId,
           agentName: metadata?.agentName,
           agentVersion: policy.agentVersion,
           ownerId: policy.ownerId,
@@ -899,12 +913,14 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
             ...(session && { historyLimits: session.limits }),
           },
         },
-      }),
-    );
-    if (row.version !== 0 || row.state !== state)
-      throw new ConflictException(
-        'The saved checkpoint changed. Reload the saved run.',
-      );
+      });
+      if (row.version !== 0 || row.state !== state)
+        throw new ConflictException(
+          'The saved checkpoint changed. Reload the saved run.',
+        );
+      await policy.onCheckpoint?.({ id: row.id, version: row.version }, result);
+      return row;
+    });
     this.runMetadata.set(result.state, {
       options: policy,
       agentName: metadata?.agentName,
@@ -932,6 +948,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
       options: {
         ...policy,
         ...access,
+        ...(row.chatkitThreadId && { chatkitThreadId: row.chatkitThreadId }),
         ...(row.chatId && {
           session: this.createSession(row.chatId, historyLimits),
         }),
@@ -1025,7 +1042,10 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   async recoverRun(
     agent: AnyAgent,
     id: string,
-    options: RunAccess & { note: string },
+    options: RunAccess & {
+      note: string;
+      onCheckpoint?: ResumeOptions['onCheckpoint'];
+    },
   ) {
     if (!options.note.trim())
       throw new Error('A reconciliation note is required before retrying.');
@@ -1036,24 +1056,52 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
           'Only an interrupted run can be recovered.',
         );
       }
-      await this.prisma.transaction((tx) =>
-        tx.pausedRun.updateMany({
+      const state = await RunState.fromString(agent, row.state);
+      const nextVersion = row.version + 1;
+      await this.prisma.transaction(async (tx) => {
+        const changed = await tx.pausedRun.updateMany({
           where: { id, version: row.version },
           data: {
             status: 'waiting',
             version: { increment: 1 },
             recoveryNote: options.note,
           },
-        }),
-      );
-      return await this.loadRun(agent, id, options);
+        });
+        if (changed.count !== 1)
+          throw new ConflictException(
+            'The checkpoint changed before recovery.',
+          );
+        await options.onCheckpoint?.(
+          { id, version: nextVersion },
+          { state, interruptions: state.getInterruptions() },
+        );
+      });
+      return await this.loadRun(agent, id, {
+        ...options,
+        version: nextVersion,
+      });
     });
   }
 
   private async readRun(agent: AnyAgent, id: string, access: RunAccess) {
     if (!z.uuid().safeParse(id).success) throw new Error(RUN_GONE);
-    const row = await this.prisma.db.pausedRun.findUnique({ where: { id } });
-    if (!row || (row.ownerId && row.ownerId !== access.ownerId))
+    const row = await this.prisma.connection.pausedRun.findUnique({
+      where: { id },
+    });
+    if (
+      !row ||
+      (row.ownerId && row.ownerId !== access.ownerId) ||
+      (row.chatkitThreadId ?? undefined) !== access.chatkitThreadId ||
+      (access.version !== undefined && row.version !== access.version)
+    )
+      throw new Error(RUN_GONE);
+    if (
+      row.chatkitThreadId &&
+      !(await this.prisma.connection.chatkitThread.findFirst({
+        where: { id: row.chatkitThreadId, userId: access.ownerId },
+        select: { id: true },
+      }))
+    )
       throw new Error(RUN_GONE);
     if (
       (row.agentName && row.agentName !== agent.name) ||
@@ -1072,6 +1120,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
     agent: string;
     started: number;
     chatId?: string;
+    conversationType?: 'chat' | 'chatkit';
     model?: string;
     userId?: string;
     traceId?: string;
@@ -1149,6 +1198,14 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
     };
     const saved = metadata?.saved;
     const session = policy.session;
+    if (saved && policy.chatkitThreadId !== metadata?.options.chatkitThreadId)
+      throw new ConflictException(
+        'A saved run must resume in its original ChatKit thread.',
+      );
+    if (policy.chatkitThreadId && session)
+      throw new Error(
+        'A run cannot use both ChatKit history and a database session.',
+      );
     if (
       saved &&
       metadata?.options.session &&
@@ -1186,10 +1243,25 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
         ...(lockSignal ? [lockSignal] : []),
       ]);
       signal?.throwIfAborted();
-      if (!saved && session instanceof DatabaseSession) {
+      if (policy.chatkitThreadId) {
+        const thread = await this.prisma.db.chatkitThread.findFirst({
+          where: {
+            id: policy.chatkitThreadId,
+            userId: policy.ownerId ?? policy.userId,
+          },
+          select: { id: true },
+        });
+        if (!thread) throw new Error('The ChatKit thread no longer exists.');
+      }
+      if (
+        !saved &&
+        (session instanceof DatabaseSession || policy.chatkitThreadId)
+      ) {
         const pending = await this.prisma.db.pausedRun.findMany({
           where: {
-            chatId: session.chatId,
+            ...(policy.chatkitThreadId
+              ? { chatkitThreadId: policy.chatkitThreadId }
+              : { chatId: (session as DatabaseSession).chatId }),
             status: {
               in: ['waiting', 'running', 'recovery_required', 'taken'],
             },
@@ -1201,7 +1273,9 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
             'This chat has a pending approval or interrupted run. Resume or reconcile it first.',
           );
       }
-      const chatId = session ? await session.getSessionId() : undefined;
+      const chatId =
+        policy.chatkitThreadId ??
+        (session ? await session.getSessionId() : undefined);
       const sessionId = policy.groupId ?? chatId;
       const requestId = requestStore.getStore()?.requestId;
       // The model this run really uses, so Langfuse can price it. The SDK default comes last.
@@ -1244,8 +1318,8 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
           const run = async () => {
             if (saved) {
               await this.span('claim-approval', async () => {
-                const claim = await this.prisma.transaction((tx) =>
-                  tx.pausedRun.updateMany({
+                await this.prisma.transaction(async (tx) => {
+                  const claim = await tx.pausedRun.updateMany({
                     where: {
                       id: saved.id,
                       version: saved.version,
@@ -1256,12 +1330,13 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
                       state: serializeState(input as RunState<any, AnyAgent>),
                       version: { increment: 1 },
                     },
-                  }),
-                );
-                if (claim.count !== 1)
-                  throw new ConflictException(
-                    'This checkpoint is stale or already running. Reload the saved run.',
-                  );
+                  });
+                  if (claim.count !== 1)
+                    throw new ConflictException(
+                      'This checkpoint is stale or already running. Reload the saved run.',
+                    );
+                  await policy.onClaim?.();
+                });
                 claimedVersion = saved.version + 1;
               });
             }
@@ -1316,8 +1391,8 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
                   agentName: agent.name,
                 });
                 if (saved) {
-                  const persisted = await this.prisma.transaction((tx) =>
-                    tx.pausedRun.updateMany({
+                  await this.prisma.transaction(async (tx) => {
+                    const persisted = await tx.pausedRun.updateMany({
                       where: {
                         id: saved.id,
                         version: claimedVersion,
@@ -1330,19 +1405,25 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
                           : 'completed',
                         version: { increment: 1 },
                       },
-                    }),
-                  );
-                  if (persisted.count !== 1)
-                    throw new ConflictException(
-                      'The run checkpoint changed before completion.',
-                    );
+                    });
+                    if (persisted.count !== 1)
+                      throw new ConflictException(
+                        'The run checkpoint changed before completion.',
+                      );
+                    if (result.interruptions.length)
+                      await policy.onCheckpoint?.(
+                        { id: saved.id, version: claimedVersion! + 1 },
+                        result,
+                      );
+                  });
                   this.runMetadata.set(result.state, {
                     options: policy,
                     agentName: agent.name,
                     saved: { id: saved.id, version: claimedVersion! + 1 },
                   });
                 } else if (
-                  session instanceof DatabaseSession &&
+                  (session instanceof DatabaseSession ||
+                    policy.chatkitThreadId) &&
                   result.interruptions.length
                 ) {
                   await this.saveRun(result, policy);
@@ -1374,6 +1455,11 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
             agent: agent.name,
             started,
             ...(chatId && { chatId }),
+            ...(chatId && {
+              conversationType: policy.chatkitThreadId
+                ? ('chatkit' as const)
+                : ('chat' as const),
+            }),
             ...(model && { model }),
             ...(policy.userId && { userId: policy.userId }),
             ...(traceId && { traceId }),

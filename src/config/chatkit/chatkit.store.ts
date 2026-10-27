@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { chatkitUploadLimitSchema } from '../environment.js';
 import type { Prisma } from '@/generated/prisma/client.js';
 import {
   AttachmentStore,
@@ -18,7 +19,7 @@ import {
 } from '@/lib/prisma/prisma.service.js';
 import { ChatKitAuth, type ChatKitContext } from './chatkit.auth.js';
 
-export const DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+export { DEFAULT_MAX_UPLOAD_BYTES } from '../environment.js';
 
 const json = (value: unknown) => value as unknown as Prisma.InputJsonValue;
 
@@ -30,8 +31,20 @@ export class ChatKitStore extends Store<ChatKitContext> {
     super();
   }
 
+  generateThreadId(context: ChatKitContext) {
+    return context.createdThreadId ?? super.generateThreadId(context);
+  }
+
+  transaction<T>(
+    _threadId: string,
+    _context: ChatKitContext,
+    work: (store: Store<ChatKitContext>) => Promise<T>,
+  ): Promise<T> {
+    return this.prisma.transaction(() => work(this));
+  }
+
   async loadThread(threadId: string, context: ChatKitContext) {
-    const row = await this.prisma.db.chatkitThread.findFirst({
+    const row = await this.prisma.connection.chatkitThread.findFirst({
       where: { id: threadId, userId: context.userId },
       select: { data: true },
     });
@@ -42,25 +55,27 @@ export class ChatKitStore extends Store<ChatKitContext> {
   //1. Updates the user's own thread, or creates it.
   //2. A thread id owned by someone else fails as not found, never as a takeover.
   async saveThread(thread: ThreadMetadata, context: ChatKitContext) {
-    const { count } = await this.prisma.db.chatkitThread.updateMany({
-      where: { id: thread.id, userId: context.userId },
-      data: { data: json(thread) },
-    });
-    if (count) return;
-    try {
-      await this.prisma.db.chatkitThread.create({
-        data: {
-          id: thread.id,
-          userId: context.userId,
-          data: json(thread),
-          createdAt: new Date(thread.created_at),
-        },
+    return await this.prisma.transaction(async () => {
+      const { count } = await this.prisma.connection.chatkitThread.updateMany({
+        where: { id: thread.id, userId: context.userId },
+        data: { data: json(thread) },
       });
-    } catch (error) {
-      if (isUniqueViolation(error))
-        throw new NotFoundError('Thread not found.');
-      throw error;
-    }
+      if (count) return;
+      try {
+        await this.prisma.connection.chatkitThread.create({
+          data: {
+            id: thread.id,
+            userId: context.userId,
+            data: json(thread),
+            createdAt: new Date(thread.created_at),
+          },
+        });
+      } catch (error) {
+        if (isUniqueViolation(error))
+          throw new NotFoundError('Thread not found.');
+        throw error;
+      }
+    });
   }
 
   async loadThreads(
@@ -70,13 +85,13 @@ export class ChatKitStore extends Store<ChatKitContext> {
     context: ChatKitContext,
   ): Promise<Page<ThreadMetadata>> {
     const cursor = after
-      ? await this.prisma.db.chatkitThread.findFirst({
+      ? await this.prisma.connection.chatkitThread.findFirst({
           where: { id: after, userId: context.userId },
           select: { createdAt: true, id: true },
         })
       : null;
     const direction = order === 'asc' ? 'gt' : 'lt';
-    const rows = await this.prisma.db.chatkitThread.findMany({
+    const rows = await this.prisma.connection.chatkitThread.findMany({
       where: {
         userId: context.userId,
         ...(cursor && {
@@ -94,9 +109,11 @@ export class ChatKitStore extends Store<ChatKitContext> {
   }
 
   async deleteThread(threadId: string, context: ChatKitContext) {
-    // Items and attachments (with their bytes) go with the thread.
-    await this.prisma.db.chatkitThread.deleteMany({
-      where: { id: threadId, userId: context.userId },
+    return await this.prisma.transaction(async () => {
+      // Items and attachments (with their bytes) go with the thread.
+      await this.prisma.connection.chatkitThread.deleteMany({
+        where: { id: threadId, userId: context.userId },
+      });
     });
   }
 
@@ -109,14 +126,18 @@ export class ChatKitStore extends Store<ChatKitContext> {
   ): Promise<Page<ThreadItem>> {
     await this.loadThread(threadId, context);
     const cursor = after
-      ? await this.prisma.db.chatkitItem.findUnique({
-          where: { threadId_id: { threadId, id: after } },
+      ? await this.prisma.connection.chatkitItem.findUnique({
+          where: {
+            threadId_id: { threadId, id: after },
+            thread: { userId: context.userId },
+          },
           select: { seq: true },
         })
       : null;
-    const rows = await this.prisma.db.chatkitItem.findMany({
+    const rows = await this.prisma.connection.chatkitItem.findMany({
       where: {
         threadId,
+        thread: { userId: context.userId },
         ...(cursor && { seq: { [order === 'asc' ? 'gt' : 'lt']: cursor.seq } }),
       },
       orderBy: { seq: order },
@@ -136,18 +157,26 @@ export class ChatKitStore extends Store<ChatKitContext> {
   }
 
   async saveItem(threadId: string, item: ThreadItem, context: ChatKitContext) {
-    await this.loadThread(threadId, context);
-    await this.prisma.db.chatkitItem.upsert({
-      where: { threadId_id: { threadId, id: item.id } },
-      create: { threadId, id: item.id, data: json(item) },
-      update: { data: json(item) },
+    return await this.prisma.transaction(async () => {
+      await this.loadThread(threadId, context);
+      await this.prisma.connection.chatkitItem.upsert({
+        where: {
+          threadId_id: { threadId, id: item.id },
+          thread: { userId: context.userId },
+        },
+        create: { threadId, id: item.id, data: json(item) },
+        update: { data: json(item) },
+      });
     });
   }
 
   async loadItem(threadId: string, itemId: string, context: ChatKitContext) {
     await this.loadThread(threadId, context);
-    const row = await this.prisma.db.chatkitItem.findUnique({
-      where: { threadId_id: { threadId, id: itemId } },
+    const row = await this.prisma.connection.chatkitItem.findUnique({
+      where: {
+        threadId_id: { threadId, id: itemId },
+        thread: { userId: context.userId },
+      },
       select: { data: true },
     });
     if (!row) throw new NotFoundError('Item not found.');
@@ -159,38 +188,58 @@ export class ChatKitStore extends Store<ChatKitContext> {
     itemId: string,
     context: ChatKitContext,
   ) {
-    await this.loadThread(threadId, context);
-    await this.prisma.db.chatkitItem.deleteMany({
-      where: { threadId, id: itemId },
+    return await this.prisma.transaction(async () => {
+      await this.loadThread(threadId, context);
+      await this.prisma.connection.chatkitItem.deleteMany({
+        where: { threadId, id: itemId, thread: { userId: context.userId } },
+      });
     });
   }
 
   async saveAttachment(attachment: Attachment, context: ChatKitContext) {
-    if (attachment.thread_id)
-      await this.loadThread(attachment.thread_id, context);
-    const { count } = await this.prisma.db.chatkitAttachment.updateMany({
-      where: { id: attachment.id, userId: context.userId },
-      data: { data: json(attachment), threadId: attachment.thread_id ?? null },
+    return await this.prisma.transaction(async () => {
+      if (attachment.thread_id)
+        await this.loadThread(attachment.thread_id, context);
+      const existing = await this.lockAttachment(attachment.id);
+      if (existing) {
+        if (
+          existing.userId !== context.userId ||
+          (existing.threadId && existing.threadId !== attachment.thread_id)
+        )
+          throw new NotFoundError(
+            'Attachment is not available for this thread.',
+          );
+        const threadId = attachment.thread_id ?? null;
+        // Binding never replaces canonical metadata with a stale client-visible copy.
+        const updated = {
+          ...(existing.data as unknown as Attachment),
+          ...(threadId && { thread_id: threadId }),
+        };
+        await this.prisma.connection.chatkitAttachment.updateMany({
+          where: { id: attachment.id, userId: context.userId },
+          data: { threadId, data: json(updated) },
+        });
+        return;
+      }
+      try {
+        await this.prisma.connection.chatkitAttachment.create({
+          data: {
+            id: attachment.id,
+            userId: context.userId,
+            threadId: attachment.thread_id ?? null,
+            data: json(attachment),
+          },
+        });
+      } catch (error) {
+        if (isUniqueViolation(error))
+          throw new NotFoundError('Attachment not found.');
+        throw error;
+      }
     });
-    if (count) return;
-    try {
-      await this.prisma.db.chatkitAttachment.create({
-        data: {
-          id: attachment.id,
-          userId: context.userId,
-          threadId: attachment.thread_id ?? null,
-          data: json(attachment),
-        },
-      });
-    } catch (error) {
-      if (isUniqueViolation(error))
-        throw new NotFoundError('Attachment not found.');
-      throw error;
-    }
   }
 
   async loadAttachment(attachmentId: string, context: ChatKitContext) {
-    const row = await this.prisma.db.chatkitAttachment.findFirst({
+    const row = await this.prisma.connection.chatkitAttachment.findFirst({
       where: { id: attachmentId, userId: context.userId },
       select: { data: true },
     });
@@ -199,23 +248,17 @@ export class ChatKitStore extends Store<ChatKitContext> {
   }
 
   async deleteAttachment(attachmentId: string, context: ChatKitContext) {
-    await this.prisma.db.chatkitAttachment.deleteMany({
-      where: { id: attachmentId, userId: context.userId },
+    return await this.prisma.transaction(async () => {
+      await this.prisma.connection.chatkitAttachment.deleteMany({
+        where: { id: attachmentId, userId: context.userId },
+      });
     });
   }
 
   // The bytes of the user's own file, for the model.
   async loadAttachmentContent(attachmentId: string, userId: string) {
-    const found = await this.loadAttachmentForLink(attachmentId);
-    if (found.userId !== userId)
-      throw new NotFoundError('Attachment not found.');
-    return found;
-  }
-
-  // A file by id with its owner, so a signed link can be checked against that owner.
-  async loadAttachmentForLink(attachmentId: string) {
-    const row = await this.prisma.db.chatkitAttachment.findUnique({
-      where: { id: attachmentId },
+    const row = await this.prisma.connection.chatkitAttachment.findFirst({
+      where: { id: attachmentId, userId },
       select: { userId: true, data: true, content: true },
     });
     if (!row) throw new NotFoundError('Attachment not found.');
@@ -226,19 +269,74 @@ export class ChatKitStore extends Store<ChatKitContext> {
     };
   }
 
+  async loadAttachmentInfo(attachmentId: string) {
+    const row = await this.prisma.connection.chatkitAttachment.findUnique({
+      where: { id: attachmentId },
+      select: { userId: true, data: true },
+    });
+    if (!row) throw new NotFoundError('Attachment not found.');
+    return {
+      userId: row.userId,
+      attachment: row.data as unknown as Attachment,
+    };
+  }
+
+  async loadPendingAttachment(attachmentId: string, userId: string) {
+    const row = await this.prisma.connection.chatkitAttachment.findFirst({
+      where: { id: attachmentId, userId, content: null },
+      select: { data: true },
+    });
+    const attachment = row?.data as unknown as Attachment | undefined;
+    if (!attachment?.upload_descriptor)
+      throw new NotFoundError('Attachment not found.');
+    return attachment;
+  }
+
+  // Compatibility for callers checking link existence; bytes require an owner.
+  loadAttachmentForLink(attachmentId: string) {
+    return this.loadAttachmentInfo(attachmentId);
+  }
+
   // Saves uploaded bytes, and clears the upload instructions once the file is there.
   async saveAttachmentContent(
     attachment: Attachment,
     content: Buffer,
     context: ChatKitContext,
   ) {
-    const { upload_descriptor: _done, ...uploaded } = attachment;
-    const { count } = await this.prisma.db.chatkitAttachment.updateMany({
-      where: { id: attachment.id, userId: context.userId },
-      data: { data: json(uploaded), content: new Uint8Array(content) },
+    return await this.prisma.transaction(async () => {
+      const current = await this.lockAttachment(attachment.id);
+      if (!current || current.userId !== context.userId)
+        throw new NotFoundError('Attachment not found.');
+      const { upload_descriptor: _done, ...uploaded } =
+        current.data as unknown as Attachment;
+      const { count } =
+        await this.prisma.connection.chatkitAttachment.updateMany({
+          where: { id: attachment.id, userId: context.userId, content: null },
+          data: { data: json(uploaded), content: new Uint8Array(content) },
+        });
+      if (!count) throw new NotFoundError('Attachment not found.');
+      return uploaded as Attachment;
     });
-    if (!count) throw new NotFoundError('Attachment not found.');
-    return uploaded as Attachment;
+  }
+
+  saveUploadedAttachment(
+    attachment: Attachment,
+    content: Buffer,
+    context: ChatKitContext,
+  ) {
+    return this.prisma.transaction(async () => {
+      await this.saveAttachment(attachment, context);
+      return this.saveAttachmentContent(attachment, content, context);
+    });
+  }
+
+  private async lockAttachment(id: string) {
+    const rows = await this.prisma.connection.$queryRaw<
+      Array<{ userId: string; threadId: string | null; data: Prisma.JsonValue }>
+    >`
+      SELECT user_id AS "userId", thread_id AS "threadId", data
+      FROM chatkit_attachments WHERE id = ${id} FOR UPDATE`;
+    return rows[0];
   }
 }
 
@@ -255,9 +353,8 @@ export class ChatKitAttachmentStore extends AttachmentStore<ChatKitContext> {
   }
 
   get maxBytes() {
-    return (
-      this.config.get<number>('CHATKIT_MAX_UPLOAD_BYTES') ??
-      DEFAULT_MAX_UPLOAD_BYTES
+    return chatkitUploadLimitSchema.parse(
+      this.config.get<unknown>('CHATKIT_MAX_UPLOAD_BYTES'),
     );
   }
 
@@ -285,7 +382,7 @@ export class ChatKitAttachmentStore extends AttachmentStore<ChatKitContext> {
   createAttachment(input: AttachmentCreateParams, context: ChatKitContext) {
     checkUpload(input.name, input.mime_type, input.size, this.maxBytes);
     const id = this.generateAttachmentId(input.mime_type, context);
-    const signature = this.auth.signAttachment(id, context.userId);
+    const signature = this.auth.issueUpload(id, context.userId);
     return Promise.resolve({
       ...this.describe(id, input.name, input.mime_type, context),
       upload_descriptor: {
@@ -296,9 +393,11 @@ export class ChatKitAttachmentStore extends AttachmentStore<ChatKitContext> {
   }
 
   async deleteAttachment(attachmentId: string, context: ChatKitContext) {
-    await this.prisma.db.chatkitAttachment.deleteMany({
-      where: { id: attachmentId, userId: context.userId },
-    });
+    await this.prisma.transaction(() =>
+      this.prisma.connection.chatkitAttachment.deleteMany({
+        where: { id: attachmentId, userId: context.userId },
+      }),
+    );
   }
 }
 

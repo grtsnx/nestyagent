@@ -683,11 +683,11 @@ Bakery website (ChatKit window)  ──POST /v1/chatkit──▶  this app  ─�
 
 The code is in three places:
 
-| Folder                | What it is                                                                                                                                                                    |
-| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/lib/chatkit`     | `chatkit.service.ts` is the ChatKit protocol, ported from OpenAI's Python `chatkit` package: requests, events, widgets, and the SDK bridge. `chatkit.types.ts` has its types. |
-| `src/config/chatkit`  | Sunny Bakery's setup: user tokens and file links (`chatkit.auth.ts`) and the Postgres store (`chatkit.store.ts`).                                                             |
-| `src/modules/chatkit` | The routes, and `MsSuzieChatKitService` in `chatkit.service.ts`, which answers every message.                                                                                 |
+| Folder                | What it is                                                                                                                                                                                                      |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/lib/chatkit`     | `chatkit.module.ts` registers the shared providers and is imported/exported by `LibModule`. `chatkit.service.ts` contains the protocol service, types, validation, durable operations, widgets, and SDK bridge. |
+| `src/config/chatkit`  | Sunny Bakery's setup: user tokens and file links (`chatkit.auth.ts`) and the Postgres store (`chatkit.store.ts`).                                                                                               |
+| `src/modules/chatkit` | The routes and `MsSuzieChatKitService`, which extends the library service and answers every message; its module imports the shared ChatKit library module.                                                      |
 
 ### Turn it on
 
@@ -695,7 +695,7 @@ The code is in three places:
 2. Set `ADMIN_API_KEY`, so your own backend can ask for user tokens.
 3. Put the bakery website in `CORS_ORIGINS`, like `https://sunnybakery.example`. Without it, the browser blocks the requests.
 4. Add the website's domain to your OpenAI [domain allowlist](https://platform.openai.com/settings/organization/security/domain-allowlist). OpenAI gives you a `domainKey` for it.
-5. Run `bun run db:deploy` to add the four ChatKit tables.
+5. Run `bun run db:deploy` and `bun run db:generate` to apply the ChatKit tables, approval bindings, and conversation usage migration.
 
 | Setting                       | Default                  | What it does                                               |
 | ----------------------------- | ------------------------ | ---------------------------------------------------------- |
@@ -837,36 +837,36 @@ The window also sends events you can listen to: `chatkit.ready`, `chatkit.error`
 
 1. A new chat is named after its first message, up to 60 characters.
 2. The last 50 items of the chat go to MsSuzie as history. Images go as pictures, and other files go with their name.
-3. MsSuzie uses her editable system prompt (see System prompts) and runs through `OpenaiService`, so `agent_runs`, traces, and prompt caching all work. Each turn is recorded with workflow `chatkit-turn` and the user's id.
+3. MsSuzie uses her editable system prompt (see System prompts) and runs through `OpenaiService`, so `agent_runs`, traces, and prompt caching all work. Each turn is recorded with workflow `chatkit-turn`, the user's id, the thread id, and conversation type `chatkit`. Admin chat summaries include these conversations.
 4. The answer streams back word by word. When it ends, every item is saved in `chatkit_items`.
 
-Only one answer runs per chat at a time, across all servers, so two quick messages never get mixed up.
+Only one answer runs per chat at a time, across all servers. The first turn acquires its lock before publishing the new thread id. Every storage mutation checks lease ownership inside its database transaction, so an expired worker cannot overwrite its replacement. SSE writes wait for the browser to drain its buffer.
 
-| What the user does                    | What happens on the server                                                                                 |
-| ------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| Presses stop                          | The run stops. Text that already arrived is kept, and MsSuzie is told the user stopped her.                |
-| Presses retry (`retry: true`)         | Items after the chosen message are removed, and MsSuzie answers it again.                                  |
-| Thumbs up or down (`feedback: true`)  | A row goes into `chatkit_feedback`, for evals. Only on the user's own chat.                                |
-| Speaks (`dictation`)                  | The audio is turned into text with `CHATKIT_TRANSCRIPTION_MODEL`, and the text lands in the composer.      |
-| Renames or deletes a chat             | The chat is updated or deleted, with its items and files.                                                  |
-| Picks a tool or model in the composer | It arrives as `input.inference_options` on the message. MsSuzie ignores it until you read it in `respond`. |
+| What the user does                    | What happens on the server                                                                                              |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Presses stop                          | The run stops. Text that already arrived is kept, and MsSuzie is told the user stopped her.                             |
+| Presses retry (`retry: true`)         | The suffix and a retry marker commit together, then MsSuzie answers again; failed deletion preserves the whole history. |
+| Thumbs up or down (`feedback: true`)  | A row goes into `chatkit_feedback`, for evals. Only on the user's own chat.                                             |
+| Speaks (`dictation`)                  | The audio is turned into text with `CHATKIT_TRANSCRIPTION_MODEL`, and the text lands in the composer.                   |
+| Renames or deletes a chat             | The chat is updated or deleted, with its items and files.                                                               |
+| Picks a tool or model in the composer | It arrives as `input.inference_options` on the message. MsSuzie ignores it until you read it in `respond`.              |
 
 > [!NOTE]
-> Voice input arrives as JSON, and the app keeps Nest's normal JSON size limit (100 KB). That fits about 20 seconds of speech. A longer clip gets 413.
+> Voice input arrives as JSON, and the app keeps Nest's normal JSON size limit (100 KB). Base64 encoding counts toward that limit, so the usable audio duration depends on its codec and bitrate. A larger request gets 413.
 
 ### Files and pictures
 
 Two ways to upload. Pick one with `uploadStrategy`:
 
-| Strategy                                                    | How it works                                                                                                   |
-| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `{ type: 'direct', uploadUrl: '…/v1/chatkit/attachments' }` | The window sends the file in one request, with the user's token.                                               |
-| `{ type: 'two_phase' }`                                     | The window first asks for an upload link, then sends the file there. The link is signed, so it needs no token. |
+| Strategy                                                    | How it works                                                                                                                                                        |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `{ type: 'direct', uploadUrl: '…/v1/chatkit/attachments' }` | The window sends the file in one request, with the user's token.                                                                                                    |
+| `{ type: 'two_phase' }`                                     | The window first asks for an upload link, then sends the file there. The upload permission expires after 15 minutes and is consumed once; it needs no bearer token. |
 
-- The file and its bytes are saved in `chatkit_attachments`. Deleting the chat deletes its files.
+- The file and its bytes are saved atomically in `chatkit_attachments`. An attachment binds to one thread and cannot move to another; upload it again to reuse it elsewhere. Deleting the chat deletes its files.
 - Images get a `preview_url`. It is a signed link that only works for that file and its owner, so the image shows in the chat without a token.
 - Only PNG, JPEG, GIF, and WebP open in the page. Every other file downloads, so an uploaded web page can never run on this site.
-- Files larger than `CHATKIT_MAX_UPLOAD_BYTES`, empty files, and files without a type are refused with 400.
+- Authentication or upload permission validation runs before multipart buffering. `CHATKIT_MAX_UPLOAD_BYTES` is the actual parser limit; oversized files return 413. Empty files and missing types return 400. Read links cannot upload, and completed uploads cannot be overwritten.
 
 ### Cards and buttons (widgets)
 
@@ -967,8 +967,9 @@ widgets: {
 When MsSuzie calls a tool that needs a yes, like `cancelOrder`, the run pauses and saves itself (see Decide later). The chat shows a card with the tool and its inputs, and **Approve** and **Decline** buttons.
 
 - Only the user who owns the run can answer it. Anyone else gets "This request was already answered."
-- After a click, the card changes to "Approved." or "Declined.", and MsSuzie carries on.
-- A second click, or a click after a restart on another server, is safe. The saved run is claimed once.
+- A checkpoint and its approval card commit together. Each action binds to the user, original thread, card, and checkpoint version. Newly saved runs also pin the prompt text hash and `AGENT_REVISION`; increment that constant when tool behavior changes incompatibly. A stale card cannot approve a later pause.
+- The card changes to "Approved." or "Declined." only after the saved run is claimed. Waiting or interrupted approvals block new turns before chat history changes.
+- Deleting the thread deletes its live approval checkpoints. Another thread cannot resume them. A second click cannot execute a completed checkpoint again.
 
 ### Tools the browser runs (client tools)
 
@@ -989,6 +990,7 @@ const readBasket = clientTool({
 this.openai.createAgent('MsSuzie', this.systemPrompts.forAgent('mssuzie'), {
   tools: [readBasket],
   toolUseBehavior: clientToolStopBehavior(['read_basket']),
+  modelSettings: { parallelToolCalls: false },
 });
 ```
 
@@ -998,12 +1000,48 @@ On the page, answer it with `onClientTool`. What you return goes back to MsSuzie
 onClientTool: async ({ name }) => (name === 'read_basket' ? { items: basket.items } : {}),
 ```
 
+The wire protocol carries a result without a tool-call id. Keep browser tools serial: the bridge rejects multiple browser calls from one model turn before dispatching any of them. A browser call mixed with server tools keeps its own SDK call identity.
+
+Accepted results and continuation markers commit together. An explicitly retryable failure can continue from the saved result; an uncertain failure or a worker restart leaves the operation blocked for reconciliation. Duplicate completed results do not rerun the completed continuation. Retry deletion follows the same durable operation lifecycle. Only an explicit `CustomStreamError(message, true)` certifies that the application can safely retry before committing output; generic stream failures require reconciliation.
+
+For custom clients, set `metadata.client_tool_call_id` on every tool-result request to the pending item's `call_id`. The first call accepts the stock request shape; later new calls require this identity so a delayed earlier result cannot be assigned to the wrong tool. An identical retry of the currently completed result does nothing. Custom clients that use multiple browser tools must supply this field through their request adapter. Set `metadata.operation_id` to a new id for each deliberate retry, preserving it on network retries. Without that id, repeating a successful retry for the same message does nothing. These fields resolve ambiguities in the stock request shape.
+
+A trusted operator can reconcile an interrupted continuation through `MsSuzieChatKitService` after inspecting any external effects:
+
+```typescript
+await chatkitService.recoverOperation(
+  threadId,
+  {
+    decision: 'retry',
+    note: 'Verified that the remote action did not execute.',
+  },
+  { userId: ownerId, baseUrl: publicApiUrl },
+);
+```
+
+Use `decision: 'cancel'` to keep existing history and release the blocked turn. Recovery takes the same thread lock as requests and requires the correct owner. It does not undo an external action or prove that repeating one is safe. After authorizing retry, resend the original request. For an interrupted tool approval, recover its checkpoint and publish a fresh versioned card together:
+
+```typescript
+const refreshedCard = await chatkitService.recoverApproval(
+  threadId,
+  runId,
+  {
+    version: interruptedVersion,
+    note: 'Reconciled the remote action before another approval.',
+  },
+  { userId: ownerId, baseUrl: publicApiUrl },
+);
+```
+
+Use the current checkpoint `version` from the admin approvals response. The returned card is already persisted; reloading the thread shows it. Older cards remain invalid. Recovery refuses a live lease and a changed prompt revision. The migration upgrades the latest legacy waiting card so existing threads can still answer their approvals. Older checkpoints have no recorded prompt revision, so that check applies only to newly saved runs. Historical usage rows without thread identity cannot be linked retrospectively.
+
 ### @-mentions (entities)
 
 With `entities.onTagSearch` on the page, a user can type `@` and pick something, like a cake or an order. MsSuzie sees the tag's text and its `data`. To show more, such as the order's status, extend `ThreadItemConverter.tagToMessageContent` in `src/modules/chatkit/chatkit.service.ts`.
 
 ### Keep it safe
 
+- **Validated requests.** Every request variant validates its required ids and nested fields before routing, with bounded page sizes, attachment counts, and payload depth. Application-specific action payloads still need their own schemas.
 - **One user, one set of chats.** Every read and write is checked against the token's user. Another user's chat id answers 404, never its content. A chat id that already belongs to someone else cannot be taken over.
 - **Secrets stay on the server.** Thread `metadata` is saved, but never sent to the browser. Hidden items, like the "user stopped" note, are never sent either.
 - **Short tokens.** At most one day. The admin key never reaches the browser.
@@ -1020,7 +1058,7 @@ With `entities.onTagSearch` on the page, a user can type `@` and pick something,
 | `chatkit_attachments` | Uploaded files, their owner, and their bytes.               |
 | `chatkit_feedback`    | Thumbs up and down, with the items they are about.          |
 
-Items are stored as ChatKit's own JSON, so a new ChatKit version needs no migration. Deleting a chat deletes its items and files.
+Items are stored as ChatKit JSON; structural database changes still require migrations. Deleting a chat deletes its items, files, and bound approval checkpoints. Responses streaming and Chat Completions final messages share the same persisted assistant-message format. Hidden events stay server-side, and opaque JSON payloads retain explicit `null` values.
 
 </details>
 

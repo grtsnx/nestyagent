@@ -88,6 +88,7 @@ export class AdminController {
     {
       id: '0192f1e2-0000-7000-8000-000000000001',
       chatId: 'chat-c-42',
+      conversationType: 'chat',
       agent: 'MsSuzie',
       model: 'gpt-6-astra',
       userId: 'guardian-7',
@@ -118,6 +119,8 @@ export class AdminController {
       id: '0192f1e2-0000-7000-8000-000000000002',
       status: 'waiting',
       chatId: 'chat-c-42',
+      chatkitThreadId: null,
+      version: 0,
       agentName: 'MsSuzie',
       agentVersion: 'orders-v1',
       ownerId: 'guardian-7',
@@ -135,11 +138,12 @@ export class AdminController {
   @ApiOperation({
     summary: 'List recent chats',
     description:
-      'This route lists the most recently active chats with their message and run counts, without any message text.',
+      'This route lists recent database chats and ChatKit threads with their message and run counts, without any message text.',
   })
   @ApiSuccess('These are the most recently active chats.', [
     {
       id: 'chat-c-42',
+      conversationType: 'chat',
       messages: 12,
       runs: 6,
       createdAt: TIME,

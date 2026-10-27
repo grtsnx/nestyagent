@@ -8,60 +8,657 @@ import {
   type RunStreamEvent,
   type Tool,
 } from '@openai/agents';
-import { randomUUID } from 'node:crypto';
-import {
-  type Action,
-  type ActionConfig,
-  type ActionHandler,
-  type Annotation,
-  type AssistantMessageContent,
-  type AssistantMessageItem,
-  type Attachment,
-  type AttachmentCreateParams,
-  type AudioInput,
-  type ChatKitReq,
-  type ClientToolCallItem,
-  CustomStreamError,
-  type EndOfTurnItem,
-  ErrorCode,
-  type FeedbackKind,
-  type GeneratedImageItem,
-  type HiddenContextItem,
-  type IconName,
-  isHiddenItem,
-  isStreamingReq,
-  type LoadingBehavior,
-  type NonStreamingReq,
-  NotFoundError,
-  type Page,
-  REQUEST_TYPES,
-  type SDKHiddenContextItem,
-  StreamError,
-  type StreamingReq,
-  type StreamOptions,
-  type StructuredInputItem,
-  type StructuredInputSubmission,
-  type SyncCustomActionResponse,
-  type Task,
-  type TaskItem,
-  type ThoughtTask,
-  type Thread,
-  type ThreadItem,
-  type ThreadItemUpdate,
-  type ThreadMetadata,
-  type ThreadStreamEvent,
-  type TranscriptionResult,
-  type UserMessageInput,
-  type UserMessageItem,
-  type UserMessageTagContent,
-  type WidgetItem,
-  type WidgetRoot,
-  type Workflow,
-  type WorkflowItem,
-  type WorkflowSummary,
-} from './chatkit.types.js';
+import { createHash, randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { Widgets } from '@openai/chatkit';
+import { z } from 'zod';
 
-export * from './chatkit.types.js';
+// Protocol ceilings; deployments may enforce smaller body and upload limits.
+export const CHATKIT_MAX_PAGE_SIZE = 100;
+const maxFileBytes = 50 * 1024 * 1024;
+const text = z.string().max(1024 * 1024);
+const id = z.string().min(1).max(512).regex(/\S/);
+const mimeType = z
+  .string()
+  .min(1)
+  .max(255)
+  .regex(/^[\w!#$&^.+-]+\/[\w!#$&^.+-]+(?:\s*;[^\r\n]*)?$/);
+const objectData = z.record(z.string(), z.unknown());
+
+// Check arbitrary payloads iteratively before the recursive JSON schemas run.
+export function hasBoundedRequestJson(value: unknown): boolean {
+  const pending = [{ value, depth: 0 }];
+  let nodes = 0;
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (++nodes > 100_000 || current.depth > 64) return false;
+    if (current.value !== null && typeof current.value === 'object') {
+      for (const child of Object.values(current.value))
+        pending.push({ value: child, depth: current.depth + 1 });
+      if (pending.length + nodes > 100_000) return false;
+    }
+  }
+  return true;
+}
+
+export const inferenceOptionsSchema = z.object({
+  tool_choice: z.object({ id }).nullish(),
+  model: id.nullish(),
+});
+export const userMessageTextContentSchema = z.object({
+  type: z.literal('input_text'),
+  text,
+});
+export const userMessageTagContentSchema = z.object({
+  type: z.literal('input_tag'),
+  id,
+  text,
+  data: objectData,
+  group: z.string().max(512).nullish(),
+  interactive: z.boolean().optional(),
+});
+export const userMessageContentSchema = z.discriminatedUnion('type', [
+  userMessageTextContentSchema,
+  userMessageTagContentSchema,
+]);
+export const userMessageInputSchema = z.object({
+  content: z.array(userMessageContentSchema).max(100),
+  attachments: z.array(id).max(20).default([]),
+  quoted_text: text.nullish(),
+  inference_options: inferenceOptionsSchema.default({}),
+});
+export const structuredInputSubmissionSchema = z.object({
+  status: z.enum(['answered', 'skipped']).optional(),
+  answers: z
+    .record(
+      id,
+      z.object({
+        values: z.array(text).max(100).optional(),
+        skipped: z.boolean().optional(),
+      }),
+    )
+    .refine((value) => Object.keys(value).length <= 100)
+    .optional(),
+});
+export const attachmentCreateParamsSchema = z.object({
+  name: z.string().min(1).max(1024),
+  size: z.number().int().min(1).max(maxFileBytes),
+  mime_type: mimeType,
+});
+const page = {
+  limit: z.number().int().min(1).max(CHATKIT_MAX_PAGE_SIZE).nullish(),
+  order: z.enum(['asc', 'desc']).optional(),
+  after: id.nullish(),
+};
+const action = z.object({ type: id, payload: z.json().optional() });
+const customAction = z.object({ thread_id: id, item_id: id.nullish(), action });
+const request = <T extends string, P extends z.ZodType>(type: T, params: P) =>
+  z.object({
+    type: z.literal(type),
+    params,
+    metadata: objectData.optional(),
+  });
+
+export const streamingRequestSchema = z.discriminatedUnion('type', [
+  request('threads.create', z.object({ input: userMessageInputSchema })),
+  request(
+    'threads.add_user_message',
+    z.object({ thread_id: id, input: userMessageInputSchema }),
+  ),
+  request(
+    'threads.add_client_tool_output',
+    z.object({ thread_id: id, result: z.json() }),
+  ),
+  request(
+    'threads.add_structured_input',
+    z.object({
+      thread_id: id,
+      item_id: id,
+      input: structuredInputSubmissionSchema,
+    }),
+  ),
+  request('threads.retry_after_item', z.object({ thread_id: id, item_id: id })),
+  request('threads.custom_action', customAction),
+]);
+export const nonStreamingRequestSchema = z.discriminatedUnion('type', [
+  request('threads.get_by_id', z.object({ thread_id: id })),
+  request('threads.list', z.object(page)),
+  request('items.list', z.object({ thread_id: id, ...page })),
+  request(
+    'items.feedback',
+    z.object({
+      thread_id: id,
+      item_ids: z.array(id).min(1).max(100),
+      kind: z.enum(['positive', 'negative']),
+    }),
+  ),
+  request('attachments.create', attachmentCreateParamsSchema),
+  request('attachments.delete', z.object({ attachment_id: id })),
+  request(
+    'threads.update',
+    z.object({ thread_id: id, title: z.string().max(1024) }),
+  ),
+  request('threads.delete', z.object({ thread_id: id })),
+  request(
+    'input.transcribe',
+    z.object({
+      audio_base64: z
+        .string()
+        .min(4)
+        .max(4 * Math.ceil(maxFileBytes / 3))
+        .regex(
+          /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/,
+        ),
+      mime_type: mimeType,
+    }),
+  ),
+  request('threads.sync_custom_action', customAction),
+]);
+export const chatKitRequestSchema = z.union([
+  streamingRequestSchema,
+  nonStreamingRequestSchema,
+]);
+
+export const STREAMING_REQUEST_TYPES: ReadonlySet<string> = new Set(
+  streamingRequestSchema.options.map((option) => option.shape.type.value),
+);
+export const REQUEST_TYPES: ReadonlySet<string> = new Set([
+  ...STREAMING_REQUEST_TYPES,
+  ...nonStreamingRequestSchema.options.map((option) => option.shape.type.value),
+]);
+
+// The ChatKit server protocol, ported from openai/chatkit-python (chatkit/types.py, v1.6.5).
+// Field names stay snake_case because that is what the ChatKit client sends and expects.
+
+export type WidgetRoot = Widgets.WidgetRoot;
+export type WidgetComponent = Widgets.WidgetComponent;
+export type IconName = Widgets.WidgetIcon;
+
+export type Page<T> = { data: T[]; has_more: boolean; after?: string | null };
+
+// Actions
+
+export type ActionHandler = 'client' | 'server';
+export type LoadingBehavior = 'auto' | 'none' | 'self' | 'container';
+
+// What a widget node carries, such as Button.onClickAction or Card.confirm.action.
+export type ActionConfig = {
+  type: string;
+  payload?: unknown;
+  handler?: ActionHandler;
+  loadingBehavior?: LoadingBehavior;
+  streaming?: boolean;
+};
+
+// What the client sends back. Untrusted: validate type and payload before acting.
+export type Action<TType extends string = string, TPayload = unknown> = {
+  type: TType;
+  payload?: TPayload;
+};
+
+// Requests
+
+export type InferenceOptions = z.output<typeof inferenceOptionsSchema>;
+export type UserMessageTextContent = z.output<
+  typeof userMessageTextContentSchema
+>;
+export type UserMessageTagContent = z.output<
+  typeof userMessageTagContentSchema
+>;
+export type UserMessageContent = z.output<typeof userMessageContentSchema>;
+export type UserMessageInput = z.output<typeof userMessageInputSchema>;
+export type StructuredInputSubmission = z.output<
+  typeof structuredInputSubmissionSchema
+>;
+export type AttachmentCreateParams = z.output<
+  typeof attachmentCreateParamsSchema
+>;
+export type StreamingReq = z.output<typeof streamingRequestSchema>;
+export type NonStreamingReq = z.output<typeof nonStreamingRequestSchema>;
+export type ChatKitReq = z.output<typeof chatKitRequestSchema>;
+export type ThreadsGetByIdReq = Extract<
+  ChatKitReq,
+  { type: 'threads.get_by_id' }
+>;
+export type ThreadsCreateReq = Extract<ChatKitReq, { type: 'threads.create' }>;
+export type ThreadsListReq = Extract<ChatKitReq, { type: 'threads.list' }>;
+export type ThreadsAddUserMessageReq = Extract<
+  ChatKitReq,
+  { type: 'threads.add_user_message' }
+>;
+export type ThreadsAddClientToolOutputReq = Extract<
+  ChatKitReq,
+  { type: 'threads.add_client_tool_output' }
+>;
+export type ThreadsAddStructuredInputReq = Extract<
+  ChatKitReq,
+  { type: 'threads.add_structured_input' }
+>;
+export type ThreadsCustomActionReq = Extract<
+  ChatKitReq,
+  { type: 'threads.custom_action' }
+>;
+export type ThreadsSyncCustomActionReq = Extract<
+  ChatKitReq,
+  { type: 'threads.sync_custom_action' }
+>;
+export type ThreadsRetryAfterItemReq = Extract<
+  ChatKitReq,
+  { type: 'threads.retry_after_item' }
+>;
+export type ItemsFeedbackReq = Extract<ChatKitReq, { type: 'items.feedback' }>;
+export type AttachmentsDeleteReq = Extract<
+  ChatKitReq,
+  { type: 'attachments.delete' }
+>;
+export type AttachmentsCreateReq = Extract<
+  ChatKitReq,
+  { type: 'attachments.create' }
+>;
+export type InputTranscribeReq = Extract<
+  ChatKitReq,
+  { type: 'input.transcribe' }
+>;
+export type ItemsListReq = Extract<ChatKitReq, { type: 'items.list' }>;
+export type ThreadsUpdateReq = Extract<ChatKitReq, { type: 'threads.update' }>;
+export type ThreadsDeleteReq = Extract<ChatKitReq, { type: 'threads.delete' }>;
+
+export function isStreamingReq(request: ChatKitReq): request is StreamingReq {
+  return STREAMING_REQUEST_TYPES.has(request.type);
+}
+
+export type AudioInput = { data: Buffer; mime_type: string };
+export type TranscriptionResult = { text: string };
+export type SyncCustomActionResponse = { updated_item?: ThreadItem | null };
+
+// Threads
+
+export type ThreadStatus =
+  | { type: 'active' }
+  | { type: 'locked'; reason?: string | null }
+  | { type: 'closed'; reason?: string | null };
+
+export type ThreadMetadata = {
+  id: string;
+  title?: string | null;
+  created_at: string;
+  status: ThreadStatus;
+  allowed_image_domains?: string[] | null;
+  // Server-side state, never sent to the client.
+  metadata: Record<string, unknown>;
+};
+
+export type Thread = Omit<ThreadMetadata, 'metadata'> & {
+  items: Page<ThreadItem>;
+};
+
+// Thread items
+
+type ItemBase = { id: string; thread_id: string; created_at: string };
+
+export type Annotation = {
+  type: 'annotation';
+  source: URLSource | FileSource | EntitySource;
+  index?: number | null;
+};
+
+export type AssistantMessageContent = {
+  type: 'output_text';
+  text: string;
+  annotations: Annotation[];
+};
+
+export type AttachmentUploadDescriptor = {
+  url: string;
+  method: 'POST' | 'PUT';
+  headers?: Record<string, string>;
+};
+
+type AttachmentBase = {
+  id: string;
+  name: string;
+  mime_type: string;
+  upload_descriptor?: AttachmentUploadDescriptor | null;
+  thread_id?: string | null;
+  // Integration-only. Never returned to the client.
+  metadata?: Record<string, unknown> | null;
+};
+export type FileAttachment = AttachmentBase & { type: 'file' };
+export type ImageAttachment = AttachmentBase & {
+  type: 'image';
+  preview_url: string;
+};
+export type Attachment = FileAttachment | ImageAttachment;
+
+export type UserMessageItem = ItemBase & {
+  type: 'user_message';
+  content: UserMessageContent[];
+  attachments: Attachment[];
+  quoted_text?: string | null;
+  inference_options: InferenceOptions;
+};
+export type AssistantMessageItem = ItemBase & {
+  type: 'assistant_message';
+  content: AssistantMessageContent[];
+};
+export type ClientToolCallItem = ItemBase & {
+  type: 'client_tool_call';
+  status: 'pending' | 'completed';
+  call_id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  output?: unknown;
+};
+export type WidgetItem = ItemBase & {
+  type: 'widget';
+  widget: WidgetRoot;
+  copy_text?: string | null;
+};
+export type GeneratedImage = { id: string; url: string };
+export type GeneratedImageItem = ItemBase & {
+  type: 'generated_image';
+  image?: GeneratedImage | null;
+};
+export type StructuredInputAnswer = { values: string[]; skipped: boolean };
+type StructuredInputBase = {
+  id: string;
+  question: string;
+  answer?: StructuredInputAnswer | null;
+};
+export type StructuredInput =
+  | (StructuredInputBase & {
+      type: 'multiple_choice';
+      options: { value: string }[];
+      multiple?: boolean;
+    })
+  | (StructuredInputBase & { type: 'freeform'; description?: string | null });
+export type StructuredInputItem = ItemBase & {
+  type: 'structured_input';
+  status: 'pending' | 'answered' | 'skipped';
+  inputs: StructuredInput[];
+};
+export type TaskItem = ItemBase & { type: 'task'; task: Task };
+export type WorkflowItem = ItemBase & { type: 'workflow'; workflow: Workflow };
+export type EndOfTurnItem = ItemBase & { type: 'end_of_turn' };
+// Never sent to the client. Context for the model at a place in the thread.
+export type HiddenContextItem = ItemBase & {
+  type: 'hidden_context_item';
+  content: unknown;
+};
+export type SDKHiddenContextItem = ItemBase & {
+  type: 'sdk_hidden_context';
+  content: string;
+};
+
+export type ThreadItem =
+  | UserMessageItem
+  | AssistantMessageItem
+  | ClientToolCallItem
+  | WidgetItem
+  | GeneratedImageItem
+  | StructuredInputItem
+  | WorkflowItem
+  | TaskItem
+  | HiddenContextItem
+  | SDKHiddenContextItem
+  | EndOfTurnItem;
+
+export function isHiddenItem(item: ThreadItem) {
+  return (
+    item.type === 'hidden_context_item' || item.type === 'sdk_hidden_context'
+  );
+}
+
+// Workflows and tasks
+
+type TaskBase = { status_indicator?: 'none' | 'loading' | 'complete' };
+export type CustomTask = TaskBase & {
+  type: 'custom';
+  title?: string | null;
+  icon?: IconName | null;
+  content?: string | null;
+};
+export type SearchTask = TaskBase & {
+  type: 'web_search';
+  title?: string | null;
+  title_query?: string | null;
+  queries?: string[];
+  sources?: URLSource[];
+};
+export type ThoughtTask = TaskBase & {
+  type: 'thought';
+  title?: string | null;
+  content: string;
+};
+export type FileTask = TaskBase & {
+  type: 'file';
+  title?: string | null;
+  sources?: FileSource[];
+};
+export type ImageTask = TaskBase & { type: 'image'; title?: string | null };
+export type Task = CustomTask | SearchTask | ThoughtTask | FileTask | ImageTask;
+
+export type WorkflowSummary =
+  { title: string; icon?: IconName | null } | { duration: number };
+export type Workflow = {
+  type: 'custom' | 'reasoning';
+  tasks: Task[];
+  summary?: WorkflowSummary | null;
+  expanded?: boolean;
+};
+
+// Sources
+
+type SourceBase = {
+  title: string;
+  description?: string | null;
+  timestamp?: string | null;
+  group?: string | null;
+};
+export type FileSource = SourceBase & { type: 'file'; filename: string };
+export type URLSource = SourceBase & {
+  type: 'url';
+  url: string;
+  attribution?: string | null;
+};
+export type EntitySource = SourceBase & {
+  type: 'entity';
+  id: string;
+  icon?: IconName | null;
+  label?: string | null;
+  inline_label?: string | null;
+  interactive?: boolean;
+  data?: Record<string, unknown>;
+};
+
+export type FeedbackKind = 'positive' | 'negative';
+
+// Item updates
+
+export type ThreadItemUpdate =
+  | {
+      type: 'assistant_message.content_part.added';
+      content_index: number;
+      content: AssistantMessageContent;
+    }
+  | {
+      type: 'assistant_message.content_part.text_delta';
+      content_index: number;
+      delta: string;
+    }
+  | {
+      type: 'assistant_message.content_part.annotation_added';
+      content_index: number;
+      annotation_index: number;
+      annotation: Annotation;
+    }
+  | {
+      type: 'assistant_message.content_part.done';
+      content_index: number;
+      content: AssistantMessageContent;
+    }
+  | {
+      type: 'widget.streaming_text.value_delta';
+      component_id: string;
+      delta: string;
+      done: boolean;
+    }
+  | { type: 'widget.root.updated'; widget: WidgetRoot }
+  | {
+      type: 'widget.component.updated';
+      component_id: string;
+      component: WidgetComponent;
+    }
+  | { type: 'workflow.task.added'; task_index: number; task: Task }
+  | { type: 'workflow.task.updated'; task_index: number; task: Task }
+  | {
+      type: 'generated_image.updated';
+      image: GeneratedImage;
+      progress?: number | null;
+    };
+
+// Stream events
+
+export type StreamOptions = { allow_cancel: boolean };
+
+export type ThreadStreamEvent =
+  | { type: 'thread.created'; thread: Thread }
+  | { type: 'thread.updated'; thread: Thread }
+  | { type: 'thread.item.added'; item: ThreadItem }
+  | { type: 'thread.item.updated'; item_id: string; update: ThreadItemUpdate }
+  | { type: 'thread.item.done'; item: ThreadItem }
+  | { type: 'thread.item.removed'; item_id: string }
+  | { type: 'thread.item.replaced'; item: ThreadItem }
+  | { type: 'stream_options'; stream_options: StreamOptions }
+  | { type: 'progress_update'; icon?: IconName | null; text: string }
+  | { type: 'client_effect'; name: string; data: Record<string, unknown> }
+  | {
+      type: 'error';
+      code: string;
+      message?: string | null;
+      allow_retry: boolean;
+    }
+  | {
+      type: 'notice';
+      level: 'info' | 'warning' | 'danger';
+      message: string;
+      title?: string | null;
+    };
+
+// Not a closed list. ChatKit maps known codes to localized messages.
+export const ErrorCode = { STREAM_ERROR: 'stream.error' } as const;
+export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
+
+// An error with a known code. The client shows its own localized message.
+export class StreamError extends Error {
+  constructor(
+    readonly code: ErrorCode,
+    readonly allowRetry = code === ErrorCode.STREAM_ERROR,
+  ) {
+    super(code);
+    this.name = 'StreamError';
+  }
+}
+
+// An error whose message is shown to the user as written. Localize it before throwing.
+export class CustomStreamError extends Error {
+  constructor(
+    message: string,
+    readonly allowRetry = false,
+  ) {
+    super(message);
+    this.name = 'CustomStreamError';
+  }
+}
+
+// A thread, item, or attachment that does not exist for this caller.
+export class NotFoundError extends Error {
+  constructor(message = 'Not found.') {
+    super(message);
+    this.name = 'NotFoundError';
+  }
+}
+
+// Durable continuation and retry receipts.
+export type ThreadOperation = {
+  id: string;
+  kind: 'client_output' | 'retry';
+  itemId: string;
+  status: 'pending' | 'running' | 'completed' | 'recovery_required';
+  resultHash?: string;
+  callId?: string;
+  recoveryNote?: string;
+  requestKey?: string;
+};
+
+const key = '_chatkit_operation';
+const receiptsKey = '_chatkit_retry_receipts';
+const clientResultsKey = '_chatkit_has_client_result';
+const retryKey = (itemId: string, requestId?: string) =>
+  requestId ? `request:${requestId}` : `item:${itemId}`;
+export function retryReceipt(
+  thread: ThreadMetadata,
+  itemId: string,
+  requestId?: string,
+) {
+  const receipts = thread.metadata[receiptsKey] as
+    Record<string, ThreadOperation> | undefined;
+  return receipts?.[retryKey(itemId, requestId)];
+}
+export function hasClientResult(thread: ThreadMetadata) {
+  return thread.metadata[clientResultsKey] === true;
+}
+export function operationOf(thread: ThreadMetadata) {
+  return thread.metadata[key] as ThreadOperation | undefined;
+}
+export function setOperation(
+  thread: ThreadMetadata,
+  operation: ThreadOperation,
+) {
+  thread.metadata[key] = operation;
+  if (operation.kind === 'client_output')
+    thread.metadata[clientResultsKey] = true;
+  if (operation.requestKey) {
+    thread.metadata[receiptsKey] = {
+      ...(thread.metadata[receiptsKey] as
+        Record<string, ThreadOperation> | undefined),
+      [operation.requestKey]: { ...operation },
+    };
+  }
+}
+export function clearOperation(thread: ThreadMetadata) {
+  delete thread.metadata[key];
+}
+export function newOperation(
+  kind: ThreadOperation['kind'],
+  itemId: string,
+  result?: unknown,
+  requestId?: string,
+): ThreadOperation {
+  return {
+    id: requestId ?? randomUUID(),
+    kind,
+    itemId,
+    status: 'pending',
+    ...(kind === 'client_output' && { resultHash: resultHash(result) }),
+    ...(kind === 'retry' && { requestKey: retryKey(itemId, requestId) }),
+  };
+}
+export function resultHash(result: unknown) {
+  const sort = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(sort);
+    if (value !== null && typeof value === 'object')
+      return Object.fromEntries(
+        Object.entries(value)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([name, item]) => [name, sort(item)]),
+      );
+    return value;
+  };
+  return createHash('sha256')
+    .update(JSON.stringify(sort(result)))
+    .digest('hex');
+}
 
 export type StoreItemType =
   | 'thread'
@@ -92,6 +689,12 @@ export type Order = 'asc' | 'desc';
 //1. Threads, items, and attachment metadata. Every method gets the request context.
 //2. Use the context to scope every read and write to its user, or one user can read another's chat.
 export abstract class Store<TContext> {
+  abstract transaction<T>(
+    threadId: string,
+    context: TContext,
+    work: (store: Store<TContext>) => Promise<T>,
+  ): Promise<T>;
+
   generateThreadId(_context: TContext) {
     return defaultGenerateId('thread');
   }
@@ -185,6 +788,60 @@ export class MemoryStore<TContext = unknown> extends Store<TContext> {
   private readonly threads = new Map<string, ThreadMetadata>();
   private readonly items = new Map<string, ThreadItem[]>();
   private readonly attachments = new Map<string, Attachment>();
+  private readonly transactions = new AsyncLocalStorage<{
+    active: boolean;
+    touched: Map<object, Set<string>>;
+    undo: (() => void)[];
+  }>();
+  private transactionTail = Promise.resolve();
+
+  async transaction<T>(
+    _threadId: string,
+    _context: TContext,
+    work: (store: Store<TContext>) => Promise<T>,
+  ): Promise<T> {
+    return this.transact(() => work(this));
+  }
+
+  private async transact<T>(work: () => Promise<T>): Promise<T> {
+    if (this.transactions.getStore()?.active) return work();
+    const previous = this.transactionTail;
+    let release!: () => void;
+    this.transactionTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    const journal = {
+      active: true,
+      touched: new Map<object, Set<string>>(),
+      undo: [] as (() => void)[],
+    };
+    try {
+      return await this.transactions.run(journal, work);
+    } catch (error) {
+      for (const undo of journal.undo.reverse()) undo();
+      throw error;
+    } finally {
+      journal.active = false;
+      release();
+    }
+  }
+
+  private remember<T>(map: Map<string, T>, key: string) {
+    const journal = this.transactions.getStore();
+    if (!journal?.active)
+      throw new Error('A memory mutation requires a transaction.');
+    let keys = journal.touched.get(map);
+    if (keys?.has(key)) return;
+    if (!keys) journal.touched.set(map, (keys = new Set()));
+    keys.add(key);
+    const existed = map.has(key);
+    const before = structuredClone(map.get(key));
+    journal.undo.push(() => {
+      if (existed) map.set(key, before as T);
+      else map.delete(key);
+    });
+  }
 
   loadThread(threadId: string, _context?: TContext) {
     const thread = this.threads.get(threadId);
@@ -193,8 +850,10 @@ export class MemoryStore<TContext = unknown> extends Store<TContext> {
   }
 
   saveThread(thread: ThreadMetadata, _context?: TContext) {
-    this.threads.set(thread.id, structuredClone(thread));
-    return Promise.resolve();
+    return this.transact(async () => {
+      this.remember(this.threads, thread.id);
+      this.threads.set(thread.id, structuredClone(thread));
+    });
   }
 
   loadThreadItems(
@@ -227,12 +886,14 @@ export class MemoryStore<TContext = unknown> extends Store<TContext> {
   }
 
   saveItem(threadId: string, item: ThreadItem, _context?: TContext) {
-    const list = this.items.get(threadId) ?? [];
-    const index = list.findIndex((existing) => existing.id === item.id);
-    if (index === -1) list.push(structuredClone(item));
-    else list[index] = structuredClone(item);
-    this.items.set(threadId, list);
-    return Promise.resolve();
+    return this.transact(async () => {
+      this.remember(this.items, threadId);
+      const list = this.items.get(threadId) ?? [];
+      const index = list.findIndex((existing) => existing.id === item.id);
+      if (index === -1) list.push(structuredClone(item));
+      else list[index] = structuredClone(item);
+      this.items.set(threadId, list);
+    });
   }
 
   loadItem(threadId: string, itemId: string, _context?: TContext) {
@@ -242,23 +903,30 @@ export class MemoryStore<TContext = unknown> extends Store<TContext> {
   }
 
   deleteThread(threadId: string, _context?: TContext) {
-    this.threads.delete(threadId);
-    this.items.delete(threadId);
-    return Promise.resolve();
+    return this.transact(async () => {
+      this.remember(this.threads, threadId);
+      this.remember(this.items, threadId);
+      this.threads.delete(threadId);
+      this.items.delete(threadId);
+    });
   }
 
   deleteThreadItem(threadId: string, itemId: string, _context?: TContext) {
-    const list = this.items.get(threadId) ?? [];
-    this.items.set(
-      threadId,
-      list.filter((item) => item.id !== itemId),
-    );
-    return Promise.resolve();
+    return this.transact(async () => {
+      this.remember(this.items, threadId);
+      const list = this.items.get(threadId) ?? [];
+      this.items.set(
+        threadId,
+        list.filter((item) => item.id !== itemId),
+      );
+    });
   }
 
   saveAttachment(attachment: Attachment, _context?: TContext) {
-    this.attachments.set(attachment.id, structuredClone(attachment));
-    return Promise.resolve();
+    return this.transact(async () => {
+      this.remember(this.attachments, attachment.id);
+      this.attachments.set(attachment.id, structuredClone(attachment));
+    });
   }
 
   loadAttachment(attachmentId: string, _context?: TContext) {
@@ -269,8 +937,10 @@ export class MemoryStore<TContext = unknown> extends Store<TContext> {
   }
 
   deleteAttachment(attachmentId: string, _context?: TContext) {
-    this.attachments.delete(attachmentId);
-    return Promise.resolve();
+    return this.transact(async () => {
+      this.remember(this.attachments, attachmentId);
+      this.attachments.delete(attachmentId);
+    });
   }
 }
 
@@ -337,6 +1007,7 @@ function fullReplace(before: Node, after: Node): boolean {
     // Appending to a Text or Markdown value streams as a delta, not a replace.
     if (
       field === 'value' &&
+      !!before.id &&
       isStreamingText(before) &&
       isStreamingText(after) &&
       (after.value as string).startsWith(before.value as string)
@@ -496,6 +1167,75 @@ export abstract class ChatKitService<TContext> {
     input: UserMessageItem | undefined,
     context: TContext,
   ): AsyncIterable<ThreadStreamEvent>;
+
+  // Validate application state before committing a new turn or a retry.
+  prepareRespond(
+    _thread: ThreadMetadata,
+    _input: UserMessageItem | undefined,
+    _context: TContext,
+  ): Promise<void> {
+    return Promise.resolve();
+  }
+
+  // Trusted operators must hold the same thread execution lock as HTTP requests.
+  // A retry is authorized only after reconciling possible external side effects.
+  async recoverOperation(
+    threadId: string,
+    recovery: { decision: 'retry' | 'cancel'; note: string },
+    context: TContext,
+  ) {
+    if (!recovery.note.trim())
+      throw new InvalidRequestError('A reconciliation note is required.');
+    await this.store.transaction(threadId, context, async (store) => {
+      const thread = await store.loadThread(threadId, context);
+      const operation = operationOf(thread);
+      if (
+        !operation ||
+        !['running', 'recovery_required'].includes(operation.status)
+      )
+        throw new InvalidRequestError(
+          'No interrupted operation needs reconciliation.',
+        );
+      if (recovery.decision === 'cancel') {
+        for await (const item of this.itemsNewestFirst(threadId, context)) {
+          if (item.type === 'user_message') break;
+          if (item.type === 'client_tool_call' && item.status === 'pending')
+            await store.saveItem(
+              threadId,
+              {
+                ...item,
+                status: 'completed',
+                output: {
+                  error: 'The operation was cancelled after reconciliation.',
+                },
+              },
+              context,
+            );
+        }
+      }
+      operation.status =
+        recovery.decision === 'retry' ? 'pending' : 'completed';
+      operation.recoveryNote = recovery.note;
+      setOperation(thread, operation);
+      await store.saveThread(thread, context);
+    });
+  }
+
+  private assertOperationReady(
+    thread: ThreadMetadata,
+    operation?: ThreadOperation,
+  ) {
+    const current = operationOf(thread);
+    if (
+      current &&
+      current.status !== 'completed' &&
+      (current.id !== operation?.id || current.status !== 'pending')
+    ) {
+      throw new InvalidRequestError(
+        'This thread has an unfinished operation requiring reconciliation before another turn.',
+      );
+    }
+  }
 
   // Save thumbs up or down for one or more items.
   addFeedback(
@@ -738,32 +1478,81 @@ export abstract class ChatKitService<TContext> {
           request.params.thread_id,
           context,
         );
-        const latest = await this.store.loadThreadItems(
-          thread.id,
-          null,
-          1,
-          'desc',
-          context,
+        const existing = operationOf(thread);
+        const callId = this.operationIdentity(
+          request.metadata?.client_tool_call_id,
         );
-        const call = latest.data.find(
-          (item) =>
-            item.type === 'client_tool_call' && item.status === 'pending',
-        );
-        if (!call || call.type !== 'client_tool_call')
+        if (
+          existing?.kind === 'client_output' &&
+          existing.status === 'completed' &&
+          (callId === existing.callId || !callId) &&
+          existing.resultHash === resultHash(request.params.result)
+        )
+          return;
+        const pending: ClientToolCallItem[] = [];
+        for await (const item of this.itemsNewestFirst(thread.id, context)) {
+          if (item.type === 'user_message') break;
+          if (item.type === 'client_tool_call' && item.status === 'pending')
+            pending.push(item);
+        }
+        if (pending.length > 1)
           throw new InvalidRequestError(
-            `The last item in ${thread.id} is not a pending client tool call.`,
+            'Parallel browser tools are unsupported because outputs have no call identity.',
           );
-        await this.store.saveItem(
-          thread.id,
-          { ...call, output: request.params.result, status: 'completed' },
-          context,
-        );
-        await this.cleanupPendingClientToolCalls(thread, context);
+        let operation: ThreadOperation;
+        if (
+          existing?.kind === 'client_output' &&
+          (!pending.length || existing.status !== 'completed')
+        ) {
+          if (existing.resultHash !== resultHash(request.params.result))
+            throw new InvalidRequestError(
+              'This client tool result was already accepted with a different value.',
+            );
+          operation = existing;
+          if (callId && callId !== operation.callId)
+            throw new InvalidRequestError(
+              'The result does not belong to the accepted browser tool.',
+            );
+          this.assertOperationReady(thread, operation);
+          if (operation.status === 'completed') return;
+        } else {
+          this.assertOperationReady(thread);
+          const call = pending[0];
+          if (!call)
+            throw new InvalidRequestError(
+              `Thread ${thread.id} has no pending client tool call.`,
+            );
+          if (!callId && hasClientResult(thread))
+            throw new InvalidRequestError(
+              'Subsequent browser results require metadata.client_tool_call_id to distinguish them from delayed retries.',
+            );
+          if (callId && callId !== call.call_id)
+            throw new InvalidRequestError(
+              'The result does not belong to the pending browser tool.',
+            );
+          operation = newOperation(
+            'client_output',
+            call.id,
+            request.params.result,
+          );
+          operation.callId = call.call_id;
+          await this.prepareRespond(thread, undefined, context);
+          await this.store.transaction(thread.id, context, async (store) => {
+            await store.saveItem(
+              thread.id,
+              { ...call, output: request.params.result, status: 'completed' },
+              context,
+            );
+            setOperation(thread, operation);
+            await store.saveThread(thread, context);
+          });
+        }
         yield* this.processEvents(
           thread,
           context,
           () => this.respond(thread, undefined, context),
           signal,
+          operation,
         );
         return;
       }
@@ -781,6 +1570,8 @@ export abstract class ChatKitService<TContext> {
           throw new InvalidRequestError(
             `Item ${request.params.item_id} is not a structured input.`,
           );
+        this.assertOperationReady(thread);
+        await this.prepareRespond(thread, undefined, context);
         const answered = this.applyStructuredInput(item, request.params.input);
         const respond = this.respond.bind(this);
         yield* this.processEvents(
@@ -799,6 +1590,26 @@ export abstract class ChatKitService<TContext> {
           request.params.thread_id,
           context,
         );
+        const prior = operationOf(thread);
+        const requestId = this.operationIdentity(
+          request.metadata?.operation_id,
+        );
+        const receipt = retryReceipt(thread, request.params.item_id, requestId);
+        if (receipt && receipt.itemId !== request.params.item_id)
+          throw new InvalidRequestError(
+            'The operation id was already used for a different request.',
+          );
+        if (receipt?.status === 'completed') return;
+        const operation =
+          receipt && prior?.id === receipt.id
+            ? prior
+            : newOperation(
+                'retry',
+                request.params.item_id,
+                undefined,
+                requestId,
+              );
+        this.assertOperationReady(thread, operation);
         const removed: ThreadItem[] = [];
         let message: UserMessageItem | undefined;
         for await (const item of this.itemsNewestFirst(thread.id, context)) {
@@ -812,15 +1623,22 @@ export abstract class ChatKitService<TContext> {
           }
           removed.push(item);
         }
-        if (!message) return;
-        for (const item of removed)
-          await this.store.deleteThreadItem(thread.id, item.id, context);
+        if (!message)
+          throw new InvalidRequestError('Retry target was not found.');
+        await this.prepareRespond(thread, message, context);
+        await this.store.transaction(thread.id, context, async (store) => {
+          for (const item of removed)
+            await store.deleteThreadItem(thread.id, item.id, context);
+          setOperation(thread, operation);
+          await store.saveThread(thread, context);
+        });
         const retried = message;
         yield* this.processEvents(
           thread,
           context,
           () => this.respond(thread, retried, context),
           signal,
+          operation,
         );
         return;
       }
@@ -870,6 +1688,15 @@ export abstract class ChatKitService<TContext> {
     return { thread, sender: item, invalid: false };
   }
 
+  private operationIdentity(value: unknown): string | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== 'string' || !value.trim() || value.length > 512)
+      throw new InvalidRequestError(
+        'Operation identities must be nonempty strings up to 512 characters.',
+      );
+    return value;
+  }
+
   private applyStructuredInput(
     item: StructuredInputItem,
     submission: StructuredInputSubmission,
@@ -908,35 +1735,29 @@ export abstract class ChatKitService<TContext> {
     };
   }
 
-  private async cleanupPendingClientToolCalls(
-    thread: ThreadMetadata,
-    context: TContext,
-  ) {
-    const items = await this.store.loadThreadItems(
-      thread.id,
-      null,
-      DEFAULT_PAGE_SIZE,
-      'desc',
-      context,
-    );
-    for (const item of items.data) {
-      if (item.type === 'client_tool_call' && item.status === 'pending') {
-        this.logger.warn(`Client tool call ${item.call_id} was not completed.`);
-        await this.store.deleteThreadItem(thread.id, item.id, context);
-      }
-    }
-  }
-
   private async *respondToNewMessage(
     thread: ThreadMetadata,
     message: UserMessageItem,
     context: TContext,
     signal?: AbortSignal,
   ): AsyncGenerator<ThreadStreamEvent> {
-    // Attachments now belong to this thread.
-    for (const attachment of message.attachments)
-      await this.store.saveAttachment(attachment, context);
-    await this.store.addThreadItem(thread.id, message, context);
+    this.assertOperationReady(thread);
+    for await (const item of this.itemsNewestFirst(thread.id, context)) {
+      if (item.type === 'user_message') break;
+      if (item.type === 'client_tool_call' && item.status === 'pending')
+        throw new InvalidRequestError(
+          'Complete the pending browser tool before starting another turn.',
+        );
+    }
+    await this.prepareRespond(thread, message, context);
+    // The message and all its attachment bindings share one commit.
+    await this.store.transaction(thread.id, context, async (store) => {
+      for (const attachment of message.attachments)
+        await store.saveAttachment(attachment, context);
+      await store.addThreadItem(thread.id, message, context);
+      clearOperation(thread);
+      await store.saveThread(thread, context);
+    });
     yield { type: 'thread.item.done', item: message };
     yield* this.processEvents(
       thread,
@@ -954,12 +1775,12 @@ export abstract class ChatKitService<TContext> {
     context: TContext,
     stream: () => AsyncIterable<ThreadStreamEvent>,
     signal?: AbortSignal,
+    operation?: ThreadOperation,
   ): AsyncGenerator<ThreadStreamEvent> {
-    yield {
-      type: 'stream_options',
-      stream_options: this.getStreamOptions(thread, context),
-    };
     let saved = JSON.stringify(thread);
+    let responseCommitted = false;
+    let responseStarted = false;
+    let operationSettled = false;
     const pending = new Map<string, ThreadItem>();
     const threadChanged = async () => {
       const now = JSON.stringify(thread);
@@ -969,6 +1790,18 @@ export abstract class ChatKitService<TContext> {
       return true;
     };
     try {
+      yield {
+        type: 'stream_options',
+        stream_options: this.getStreamOptions(thread, context),
+      };
+      signal?.throwIfAborted();
+      if (operation) {
+        operation.status = 'running';
+        setOperation(thread, operation);
+        await this.store.saveThread(thread, context);
+        saved = JSON.stringify(thread);
+      }
+      responseStarted = true;
       for await (const event of stream()) {
         signal?.throwIfAborted();
         switch (event.type) {
@@ -977,6 +1810,7 @@ export abstract class ChatKitService<TContext> {
             break;
           case 'thread.item.done':
             await this.store.addThreadItem(thread.id, event.item, context);
+            responseCommitted = true;
             pending.delete(event.item.id);
             break;
           case 'thread.item.removed':
@@ -989,19 +1823,40 @@ export abstract class ChatKitService<TContext> {
             break;
           case 'thread.item.replaced':
             await this.store.saveItem(thread.id, event.item, context);
+            responseCommitted = true;
             pending.delete(event.item.id);
             break;
           case 'thread.item.updated':
             applyPendingUpdate(pending, event.item_id, event.update);
             break;
         }
-        if (!(event.type === 'thread.item.done' && isHiddenItem(event.item)))
-          yield event;
+        if (!('item' in event && isHiddenItem(event.item))) yield event;
         if (await threadChanged())
           yield { type: 'thread.updated', thread: toThreadResponse(thread) };
       }
       signal?.throwIfAborted();
+      if (operation) {
+        operation.status = 'completed';
+        setOperation(thread, operation);
+        await this.store.saveThread(thread, context);
+      }
+      operationSettled = true;
     } catch (error) {
+      // Only the application can explicitly attest that a failed operation is safe to replay.
+      // A generic StreamError defaults to retryable and provides no such evidence.
+      const retryable =
+        !responseCommitted &&
+        error instanceof CustomStreamError &&
+        error.allowRetry;
+      operationSettled = true;
+      if (operation) {
+        operation.status =
+          !responseStarted || (retryable && !signal?.aborted)
+            ? 'pending'
+            : 'recovery_required';
+        setOperation(thread, operation);
+        await this.store.saveThread(thread, context);
+      }
       if (signal?.aborted) {
         await this.handleStreamCancelled(
           thread,
@@ -1015,13 +1870,17 @@ export abstract class ChatKitService<TContext> {
           type: 'error',
           code: 'custom',
           message: error.message,
-          allow_retry: error.allowRetry,
+          allow_retry: operation
+            ? operation.status === 'pending'
+            : error.allowRetry,
         };
       } else if (error instanceof StreamError) {
         yield {
           type: 'error',
           code: error.code,
-          allow_retry: error.allowRetry,
+          allow_retry: operation
+            ? operation.status === 'pending'
+            : error.allowRetry,
         };
       } else {
         this.logger.error({
@@ -1031,8 +1890,16 @@ export abstract class ChatKitService<TContext> {
         yield {
           type: 'error',
           code: ErrorCode.STREAM_ERROR,
-          allow_retry: true,
+          allow_retry: !operation,
         };
+      }
+    } finally {
+      // AsyncIterator.return() skips catch. Preserve an accepted, unstarted result;
+      // once execution began, a disconnected consumer cannot attest its outcome.
+      if (operation && responseStarted && !operationSettled) {
+        operation.status = 'recovery_required';
+        setOperation(thread, operation);
+        await this.store.saveThread(thread, context);
       }
     }
     if (await threadChanged())
@@ -1099,7 +1966,7 @@ export abstract class ChatKitService<TContext> {
   }
 }
 
-// Validates the shape enough to route safely. Each handler reads only the fields it needs.
+// Request types, dispatch lists, and runtime validation share the same schemas.
 export function parseRequest(body: string): ChatKitReq {
   let parsed: unknown;
   try {
@@ -1107,16 +1974,10 @@ export function parseRequest(body: string): ChatKitReq {
   } catch {
     throw new InvalidRequestError('The ChatKit request is not valid JSON.');
   }
-  if (
-    typeof parsed !== 'object' ||
-    parsed === null ||
-    typeof (parsed as { type?: unknown }).type !== 'string' ||
-    !REQUEST_TYPES.has((parsed as { type: string }).type) ||
-    typeof (parsed as { params?: unknown }).params !== 'object' ||
-    (parsed as { params?: unknown }).params === null
-  )
-    throw new InvalidRequestError();
-  return parsed as ChatKitReq;
+  if (!hasBoundedRequestJson(parsed)) throw new InvalidRequestError();
+  const validated = chatKitRequestSchema.safeParse(parsed);
+  if (!validated.success) throw new InvalidRequestError();
+  return validated.data;
 }
 
 // Server-side thread metadata and hidden items never reach the client.
@@ -1140,15 +2001,25 @@ export function toThreadResponse(thread: ThreadMetadata | Thread): Thread {
   };
 }
 
-// Like the Python SDK: drop nulls, and never send attachment metadata to the client.
+// Omit optional protocol nulls, preserving arbitrary JSON inside application fields.
 export function serialize(value: unknown): string {
-  return JSON.stringify(value, (key, entry: unknown) => {
-    if (entry === null || entry === undefined) return undefined;
-    if (key === 'attachments' && Array.isArray(entry))
-      return entry.map((attachment) => withoutMetadata(attachment));
-    if (isAttachment(entry)) return withoutMetadata(entry);
-    return entry;
-  });
+  const opaque = new Set(['payload', 'arguments', 'output', 'metadata']);
+  const protocol = (entry: unknown): unknown => {
+    if (Array.isArray(entry)) return entry.map(protocol);
+    if (!entry || typeof entry !== 'object') return entry;
+    const object = (
+      isAttachment(entry) ? withoutMetadata(entry) : entry
+    ) as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(object).flatMap(([key, field]) => {
+        if (opaque.has(key) || (key === 'data' && !('has_more' in object)))
+          return [[key, field]];
+        if (field == null) return [];
+        return [[key, protocol(field)]];
+      }),
+    );
+  };
+  return JSON.stringify(protocol(value));
 }
 
 function isAttachment(value: unknown): value is Record<string, unknown> {
@@ -1222,6 +2093,8 @@ function applyAssistantUpdate(
 export type ClientToolCall = {
   name: string;
   arguments: Record<string, unknown>;
+  callId?: string;
+  itemId?: string;
 };
 
 // A simple async queue: tools push events while the model streams.
@@ -1232,7 +2105,7 @@ class EventQueue {
 
   push(event: ThreadStreamEvent) {
     if (this.closed) return;
-    this.items.push(event);
+    this.items.push(structuredClone(event));
     this.waiter?.();
   }
 
@@ -1263,7 +2136,17 @@ export class AgentContext<TContext = unknown> {
   readonly store: Store<TContext>;
   readonly requestContext: TContext;
   previousResponseId?: string;
-  clientToolCall?: ClientToolCall;
+  readonly clientToolCalls: ClientToolCall[] = [];
+  get clientToolCall(): ClientToolCall | undefined {
+    return this.clientToolCalls.at(-1);
+  }
+  set clientToolCall(call: ClientToolCall | undefined) {
+    this.clientToolCalls.splice(
+      0,
+      this.clientToolCalls.length,
+      ...(call ? [call] : []),
+    );
+  }
   workflowItem?: WorkflowItem;
   generatedImageItem?: GeneratedImageItem;
   readonly events = new EventQueue();
@@ -1400,14 +2283,16 @@ export function clientTool(options: {
       ...options.parameters,
     } as never,
     strict: false,
-    execute: (input, runContext?: RunContext<unknown>) => {
+    execute: (input, runContext: RunContext<unknown> | undefined, details) => {
       const context = runContext?.context;
       if (!(context instanceof AgentContext))
         throw new Error('Client tools need an AgentContext run context.');
-      context.clientToolCall = {
+      context.clientToolCalls.push({
         name: options.name,
         arguments: (input ?? {}) as Record<string, unknown>,
-      };
+        callId: details?.toolCall?.callId,
+        itemId: details?.toolCall?.id,
+      });
       return 'Sent to the browser.';
     },
   });
@@ -1483,11 +2368,11 @@ export async function* streamAgentResponse<TContext>(
 ): AsyncGenerator<ThreadStreamEvent> {
   const thread = context.thread;
   const produced = new Set<string>();
+  const completedMessages = new Set<string>();
   const annotationCounts = new Map<string, number>();
   let streamingThought:
     { itemId: string; index: number; task: ThoughtTask } | undefined;
-  let currentToolCall: string | undefined;
-  let currentItemId: string | undefined;
+  const toolCalls: { callId: string; id?: string; name?: string }[] = [];
 
   // Continue a workflow left open by the last turn, or the one before a client tool call.
   const recent = await context.store.loadThreadItems(
@@ -1526,9 +2411,24 @@ export async function* streamAgentResponse<TContext>(
           event.type === 'thread.item.added' &&
           event.item.type === 'workflow'
         )
-          context.workflowItem = event.item;
+          if (context.workflowItem?.id !== event.item.id)
+            context.workflowItem = structuredClone(event.item);
+        if (
+          event.type === 'thread.item.done' &&
+          event.item.type === 'workflow' &&
+          context.workflowItem?.id === event.item.id
+        )
+          context.workflowItem = undefined;
         produced.add(event.item.id);
       }
+      if (
+        event.type === 'thread.item.updated' &&
+        context.workflowItem?.id === event.item_id &&
+        (event.update.type === 'workflow.task.added' ||
+          event.update.type === 'workflow.task.updated')
+      )
+        context.workflowItem.workflow.tasks[event.update.task_index] =
+          structuredClone(event.update.task);
       yield event;
     }
   };
@@ -1555,12 +2455,23 @@ export async function* streamAgentResponse<TContext>(
             type?: string;
             callId?: string;
             id?: string;
+            name?: string;
           };
           if (raw.type === 'function_call' && raw.callId) {
-            currentToolCall = raw.callId;
-            currentItemId = raw.id;
+            toolCalls.push({ callId: raw.callId, id: raw.id, name: raw.name });
             if (raw.id) produced.add(raw.id);
           }
+        }
+        if (event.item.type === 'message_output_item') {
+          // Chat Completions and custom models need not emit raw Responses events.
+          // Their normalized completed message is still authoritative model output.
+          const message = event.item.rawItem;
+          const id = message.id ?? context.generateId('message');
+          if (!completedMessages.has(id))
+            yield* convertRaw({
+              type: 'response.output_item.done',
+              item: { ...message, id },
+            });
         }
         continue;
       }
@@ -1596,16 +2507,38 @@ export async function* streamAgentResponse<TContext>(
       context.requestContext,
     );
 
-  if (context.clientToolCall) {
+  // The stock client's result request has no call identifier. Parallel browser
+  // dispatch therefore cannot safely associate out-of-order or repeated outputs.
+  if (context.clientToolCalls.length > 1)
+    throw new CustomStreamError(
+      'Browser tools must be called one at a time. Disable parallel tool calls.',
+      false,
+    );
+  const clientCall = context.clientToolCall;
+  if (clientCall) {
+    const matching = toolCalls.filter((call) =>
+      clientCall.callId
+        ? call.callId === clientCall.callId
+        : call.name === clientCall.name,
+    );
+    if (matching.length > 1)
+      throw new CustomStreamError(
+        'Browser tools must be called one at a time. Disable parallel tool calls.',
+        false,
+      );
+    const identity = matching[0];
     const item: ClientToolCallItem = {
       type: 'client_tool_call',
-      id: currentItemId ?? context.generateId('tool_call'),
+      id: clientCall.itemId ?? identity?.id ?? context.generateId('tool_call'),
       thread_id: thread.id,
       created_at: new Date().toISOString(),
       status: 'pending',
-      call_id: currentToolCall ?? context.generateId('tool_call'),
-      name: context.clientToolCall.name,
-      arguments: context.clientToolCall.arguments,
+      call_id:
+        clientCall.callId ??
+        identity?.callId ??
+        context.generateId('tool_call'),
+      name: clientCall.name,
+      arguments: clientCall.arguments,
     };
     yield { type: 'thread.item.done', item };
   }
@@ -1823,6 +2756,7 @@ export async function* streamAgentResponse<TContext>(
         const item = raw.item as Record<string, unknown>;
         if (item.type === 'message') {
           const id = String(item.id);
+          completedMessages.add(id);
           produced.add(id);
           yield {
             type: 'thread.item.done',

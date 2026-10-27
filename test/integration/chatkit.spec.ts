@@ -343,6 +343,17 @@ describe('ChatKit in Postgres', () => {
     const alice = owner();
     const mine = thread();
     await store.saveThread(mine, alice);
+    await store.addThreadItem(
+      mine.id,
+      {
+        type: 'assistant_message',
+        id: 'msg_1',
+        thread_id: mine.id,
+        created_at: mine.created_at,
+        content: [{ type: 'output_text', text: 'Hello.', annotations: [] }],
+      },
+      alice,
+    );
     await send(
       {
         type: 'items.feedback',

@@ -2,6 +2,18 @@ import { z } from 'zod';
 
 const environments = ['development', 'production', 'test'] as const;
 
+export const DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+export const chatkitUploadLimitSchema = z.preprocess(
+  (value) =>
+    typeof value === 'string' && value.trim() === '' ? undefined : value,
+  z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(50 * 1024 * 1024)
+    .default(DEFAULT_MAX_UPLOAD_BYTES),
+);
+
 export const remoteMachineProviders = [
   'local',
   'aws',
@@ -108,15 +120,7 @@ const environmentSchema = z
         .optional(),
     ),
     CHATKIT_TRANSCRIPTION_MODEL: optionalString(),
-    CHATKIT_MAX_UPLOAD_BYTES: z.preprocess(
-      (value) => (value === '' ? undefined : value),
-      z.coerce
-        .number()
-        .int()
-        .min(1)
-        .max(50 * 1024 * 1024)
-        .optional(),
-    ),
+    CHATKIT_MAX_UPLOAD_BYTES: chatkitUploadLimitSchema,
     // Admin secret for the admin routes, such as editing system prompts. Long, so it cannot be guessed.
     ADMIN_API_KEY: z.preprocess(
       (value) => (value === '' ? undefined : value),

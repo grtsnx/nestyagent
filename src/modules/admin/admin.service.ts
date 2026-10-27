@@ -4,6 +4,10 @@ import { Prisma, type PausedRun } from '@/generated/prisma/client.js';
 import { PrismaService } from '@/lib/prisma/prisma.service.js';
 
 const DAY_MS = 24 * 60 * 60_000;
+const CONVERSATIONS = Prisma.sql`
+  SELECT id, created_at, updated_at, 'chat' AS conversation_type FROM chats
+  UNION ALL
+  SELECT id, created_at, updated_at, 'chatkit' AS conversation_type FROM chatkit_threads`;
 const RECOVERY_REQUIRED = Prisma.sql`
   p.status IN ('recovery_required', 'taken') OR (
     p.status = 'running' AND NOT EXISTS (
@@ -46,9 +50,9 @@ export class AdminService {
       machinesNeedingCheck,
       runs,
     ] = await Promise.all([
-      db.chat.count(),
-      db.chat.count({ where: { createdAt: { gte: since } } }),
-      db.chatItem.count({ where: { createdAt: { gte: since } } }),
+      this.chatCount(),
+      this.chatCount(since),
+      this.messageCount(since),
       db.pausedRun.count({ where: { status: 'waiting' } }),
       this.recoveryCount(),
       db.hostedWebhook.count({
@@ -125,7 +129,7 @@ export class AdminService {
         ? RECOVERY_REQUIRED
         : Prisma.sql`p.status = 'waiting'`;
     const rows = await this.db().$queryRaw<ApprovalRow[]>`
-      SELECT p.id, p.status, p.chat_id AS "chatId", p.agent_name AS "agentName",
+      SELECT p.id, p.status, p.version, p.chat_id AS "chatId", p.chatkit_thread_id AS "chatkitThreadId", p.agent_name AS "agentName",
              p.agent_version AS "agentVersion", p.owner_id AS "ownerId",
              p.recovery_note AS "recoveryNote", p.created_at AS "createdAt",
              p.updated_at AS "updatedAt"
@@ -137,14 +141,20 @@ export class AdminService {
   // Most recent first, with message count and last activity. No message text.
   async chats(options: ListOptions) {
     const rows = await this.db().$queryRaw<ChatRow[]>`
-      SELECT c.id, c.created_at, c.updated_at,
-             (SELECT count(*) FROM chat_items i WHERE i.chat_id = c.id) AS messages,
-             (SELECT count(*) FROM agent_runs r WHERE r.chat_id = c.id) AS runs
-      FROM (SELECT id, created_at, updated_at FROM chats
-            ORDER BY updated_at DESC, id ASC LIMIT ${limit(options)}) c
-      ORDER BY c.updated_at DESC, c.id ASC`;
+      SELECT c.id, c.created_at, c.updated_at, c.conversation_type,
+             CASE WHEN c.conversation_type = 'chatkit'
+               THEN (SELECT count(*) FROM chatkit_items i WHERE i.thread_id = c.id
+                     AND i.data->>'type' IN ('user_message', 'assistant_message'))
+               ELSE (SELECT count(*) FROM chat_items i WHERE i.chat_id = c.id)
+             END AS messages,
+             (SELECT count(*) FROM agent_runs r WHERE r.chat_id = c.id
+              AND r.conversation_type::text = c.conversation_type) AS runs
+      FROM (SELECT * FROM (${CONVERSATIONS}) all_chats
+            ORDER BY updated_at DESC, id ASC, conversation_type ASC LIMIT ${limit(options)}) c
+      ORDER BY c.updated_at DESC, c.id ASC, c.conversation_type ASC`;
     return rows.map((row) => ({
       id: row.id,
+      conversationType: row.conversation_type,
       messages: Number(row.messages),
       runs: Number(row.runs),
       createdAt: row.created_at,
@@ -208,6 +218,21 @@ export class AdminService {
     return usageNumbers(row);
   }
 
+  private async chatCount(since?: Date) {
+    const [row] = await this.db().$queryRaw<Array<{ count: bigint }>>`
+      SELECT count(*) AS count FROM (${CONVERSATIONS}) c
+      WHERE ${since ? Prisma.sql`c.created_at >= ${since}` : Prisma.sql`TRUE`}`;
+    return Number(row.count);
+  }
+
+  private async messageCount(since: Date) {
+    const [row] = await this.db().$queryRaw<Array<{ count: bigint }>>`
+      SELECT (SELECT count(*) FROM chat_items WHERE created_at >= ${since}) +
+             (SELECT count(*) FROM chatkit_items WHERE created_at >= ${since}
+              AND data->>'type' IN ('user_message', 'assistant_message')) AS count`;
+    return Number(row.count);
+  }
+
   private async recoveryCount() {
     const [row] = await this.db().$queryRaw<Array<{ count: bigint }>>`
       SELECT count(*) AS count FROM paused_runs p WHERE ${RECOVERY_REQUIRED}`;
@@ -235,6 +260,7 @@ type UsageRow = {
 
 type ChatRow = {
   id: string;
+  conversation_type: 'chat' | 'chatkit';
   created_at: Date;
   updated_at: Date;
   messages: bigint;
@@ -245,7 +271,9 @@ type ApprovalRow = Pick<
   PausedRun,
   | 'id'
   | 'status'
+  | 'version'
   | 'chatId'
+  | 'chatkitThreadId'
   | 'agentName'
   | 'agentVersion'
   | 'ownerId'

@@ -281,6 +281,7 @@ export function fakePrisma() {
     db,
     prisma: {
       db,
+      connection: db,
       withLock,
       transaction: (work: (tx: FakeDb) => Promise<unknown>) =>
         db.$transaction(work),

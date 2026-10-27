@@ -717,9 +717,16 @@ describe('ChatKit Agents SDK bridge', () => {
     expect(sent.map((event) => event.type)).toEqual([
       'progress_update',
       'thread.item.done',
+      'thread.item.done',
     ]);
     expect(sent[1]).toMatchObject({
       item: { type: 'widget', copy_text: 'Plans', thread_id: 'thr_1' },
+    });
+    expect(sent[2]).toMatchObject({
+      item: {
+        type: 'assistant_message',
+        content: [{ text: 'Here are the plans.' }],
+      },
     });
   });
 

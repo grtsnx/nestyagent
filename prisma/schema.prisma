@@ -69,6 +69,8 @@ model PausedRun {
   status       PausedRunStatus @default(waiting)
   version      Int             @default(0)
   chatId       String?         @map("chat_id")
+  chatkitThreadId String?      @map("chatkit_thread_id")
+  chatkitThread ChatkitThread? @relation(fields: [chatkitThreadId], references: [id], onDelete: Cascade)
   agentName    String?         @map("agent_name")
   agentVersion String?         @map("agent_version")
   ownerId      String?         @map("owner_id")
@@ -77,6 +79,7 @@ model PausedRun {
   createdAt    DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt    DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
 
+  @@index([chatkitThreadId, status])
   @@map("paused_runs")
 }
 
@@ -183,11 +186,17 @@ enum AgentRunStatus {
   failed
 }
 
+enum ConversationType {
+  chat
+  chatkit
+}
+
 // One helper run, for the admin monitoring routes: tokens, time, result, and its trace.
 // It holds no message text, only numbers and ids.
 model AgentRun {
   id           String         @id @default(uuid(7)) @db.Uuid
   chatId       String?        @map("chat_id")
+  conversationType ConversationType @default(chat) @map("conversation_type")
   agent        String
   model        String?
   userId       String?        @map("user_id")
@@ -205,6 +214,7 @@ model AgentRun {
   // Usage by day and recent runs read by time; one chat's runs read by chat.
   @@index([createdAt])
   @@index([chatId, createdAt])
+  @@index([conversationType, chatId, createdAt])
   @@map("agent_runs")
 }
 
@@ -218,6 +228,7 @@ model ChatkitThread {
   updatedAt   DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
   items       ChatkitItem[]
   attachments ChatkitAttachment[]
+  pausedRuns  PausedRun[]
 
   // A user's threads, newest first.
   @@index([userId, createdAt])

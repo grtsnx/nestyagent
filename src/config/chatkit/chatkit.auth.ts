@@ -25,6 +25,8 @@ export type ChatKitContext = {
   baseUrl: string;
   // Aborts when the browser disconnects or the user stops the reply.
   signal?: AbortSignal;
+  // Allocated and locked by the controller before a new thread is published.
+  createdThreadId?: string;
 };
 
 export type ChatKitRequest = Request & { chatkit?: ChatKitContext };
@@ -89,6 +91,48 @@ export class ChatKitAuth {
 
   verifyAttachment(attachmentId: string, userId: string, signature: string) {
     return safeEqual(signature, this.signAttachment(attachmentId, userId));
+  }
+
+  issueUpload(attachmentId: string, userId: string) {
+    const payload = encode({
+      purpose: 'attachment-upload',
+      id: attachmentId,
+      userId,
+      exp: Math.floor(Date.now() / 1000) + 15 * 60,
+    });
+    return `${payload}.${this.sign(`upload:${payload}`)}`;
+  }
+
+  verifyUpload(attachmentId: string, token: string): string | undefined {
+    const [payload, signature, ...extra] = token.split('.');
+    if (
+      !payload ||
+      !signature ||
+      extra.length ||
+      !safeEqual(signature, this.sign(`upload:${payload}`))
+    )
+      return undefined;
+    try {
+      const claims = decode(payload) as {
+        purpose?: unknown;
+        id?: unknown;
+        userId?: unknown;
+        exp?: unknown;
+      };
+      if (
+        claims.purpose !== 'attachment-upload' ||
+        claims.id !== attachmentId ||
+        typeof claims.userId !== 'string' ||
+        !claims.userId ||
+        typeof claims.exp !== 'number' ||
+        !Number.isSafeInteger(claims.exp) ||
+        claims.exp * 1000 <= Date.now()
+      )
+        return undefined;
+      return claims.userId;
+    } catch {
+      return undefined;
+    }
   }
 
   private sign(value: string) {
