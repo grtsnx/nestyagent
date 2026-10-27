@@ -141,6 +141,41 @@ describe('real SDK request policies', () => {
       await openai.onModuleDestroy();
     },
   );
+  it('sends the chat id as the cache key unless a key is passed', async () => {
+    const keys: unknown[] = [];
+    vi.spyOn(OpenAIProvider.prototype, 'getModel').mockImplementation(
+      async () =>
+        ({
+          async getResponse(request) {
+            keys.push(request.modelSettings.providerData?.prompt_cache_key);
+            return answer();
+          },
+          getStreamedResponse() {
+            throw new Error('Unused stream');
+          },
+        }) as Model,
+    );
+    const openai = new OpenaiService(
+      new ConfigService({ OPENAI_API_KEY: 'sk-test' }),
+      fakePrisma().prisma,
+    );
+    const menuHelper = new Agent({
+      name: 'Menu helper',
+      instructions: 'Menu.',
+    });
+    await openai.runAgent('Any cakes?', menuHelper, {
+      session: openai.createSession('chat-c-42'),
+    });
+    await openai.runAgent('Any bread?', menuHelper, {
+      session: openai.createSession('chat-c-43'),
+      promptCacheKey: 'customer-7',
+    });
+    await openai.runAgent('Hello.', menuHelper);
+
+    expect(keys).toEqual(['chat-c-42', 'customer-7', undefined]);
+    await openai.onModuleDestroy();
+  });
+
   it('keeps the cache key and each specialist provider settings through a handoff', async () => {
     const requests: Array<{ model: string | undefined; settings: unknown }> =
       [];
