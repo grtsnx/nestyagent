@@ -1,13 +1,16 @@
 import { execFileSync } from 'node:child_process';
 import {
   chmod,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
+  readlink,
   readdir,
   realpath,
   rm,
   stat,
+  symlink,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -199,7 +202,12 @@ describe('prepareManifest', () => {
       stdio: 'ignore',
     });
     await writeFile(join(source, 'README.md'), 'fixture repository\n');
-    execFileSync(realGit, ['-C', source, 'add', 'README.md']);
+    await writeFile(
+      join(source, 'run.sh'),
+      '#!/bin/sh\nprintf fixture-executable',
+    );
+    await chmod(join(source, 'run.sh'), 0o755);
+    execFileSync(realGit, ['-C', source, 'add', 'README.md', 'run.sh']);
     execFileSync(
       realGit,
       [
@@ -310,18 +318,22 @@ setTimeout(() => {
     }
     for (const { manifest } of results) {
       const entry = manifest.entries.secret;
-      expect(entry.type).toBe('local_dir');
+      expect(entry.type).toBe('dir');
       expect(manifest.extraPathGrants).toEqual([]);
-      if (entry.type !== 'local_dir')
+      if (
+        entry.type !== 'dir' ||
+        entry.children?.['README.md']?.type !== 'local_file'
+      )
         throw new Error('Expected prepared directory');
+      const source = dirname(entry.children['README.md'].src);
       const preparationRoot = join(await realpath(process.cwd()), '.msagents');
-      expect(dirname(dirname(entry.src))).toBe(preparationRoot);
+      expect(dirname(dirname(source))).toBe(preparationRoot);
       expect((await stat(preparationRoot)).mode & 0o777).toBe(0o700);
-      expect(await readFile(join(entry.src, 'README.md'), 'utf8')).toBe(
+      expect(await readFile(join(source, 'README.md'), 'utf8')).toBe(
         'fixture repository\n',
       );
       const persisted = JSON.stringify(serializeManifest(manifest));
-      const gitConfig = await readFile(join(entry.src, '.git/config'), 'utf8');
+      const gitConfig = await readFile(join(source, '.git/config'), 'utf8');
       expect(gitConfig).toContain('https://github.com/owner/secret.git');
       for (const value of [
         'first',
@@ -335,11 +347,16 @@ setTimeout(() => {
       }
     }
     const sourcePaths = results.map(
-      ({ manifest }) => (manifest.entries.secret as { src: string }).src,
+      ({ manifest }) =>
+        (
+          manifest.entries.secret as {
+            children: Record<string, { src: string }>;
+          }
+        ).children['README.md'].src,
     );
     await Promise.all(results.map((result) => result.dispose()));
     for (const sourcePath of sourcePaths)
-      await expect(readdir(sourcePath)).rejects.toMatchObject({
+      await expect(stat(sourcePath)).rejects.toMatchObject({
         code: 'ENOENT',
       });
   });
@@ -360,10 +377,10 @@ setTimeout(() => {
       },
     });
     prepared.push(result);
-    expect(result.manifest.entries.lab.type).toBe('local_dir');
+    expect(result.manifest.entries.lab.type).toBe('dir');
     expect(result.manifest.entries.nested).toMatchObject({
       type: 'dir',
-      children: { repo: { type: 'local_dir' } },
+      children: { repo: { type: 'dir' } },
     });
     expect(JSON.stringify(result.manifest)).not.toContain('lab-token');
     const calls = await readFile(join(fixture, 'calls.ndjson'), 'utf8');
@@ -428,6 +445,200 @@ setTimeout(() => {
       await session.close();
     }
   }, 20_000);
+
+  it('preserves Git executable bits when the SDK materializes the repository', async () => {
+    const result = await prepareManifest({
+      repo: 'owner/secret',
+      entries: {
+        nested: dir({
+          children: {
+            executable: gitRepo({ repo: 'owner/secret', subpath: 'run.sh' }),
+          },
+        }),
+      },
+    });
+    prepared.push(result);
+    const client = new UnixLocalSandboxClient({ workspaceBaseDir: fixture });
+    const session = await client.create(result.manifest);
+    try {
+      const root = join(session.state.workspaceRootPath, 'secret');
+      expect((await stat(join(root, 'run.sh'))).mode & 0o777).toBe(0o755);
+      expect((await stat(join(root, 'README.md'))).mode & 0o777).toBe(0o644);
+      expect(execFileSync(join(root, 'run.sh'), { encoding: 'utf8' })).toBe(
+        'fixture-executable',
+      );
+      expect(
+        (await stat(join(session.state.workspaceRootPath, 'nested/executable')))
+          .mode & 0o777,
+      ).toBe(0o755);
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('materializes safe relative Git symlinks without dereferencing them', async () => {
+    const source = join(fixture, 'source');
+    await mkdir(join(source, 'bin'));
+    await symlink('../run.sh', join(source, 'bin/start'));
+    const quotedFile = "file ' $(touch injected)";
+    const quotedLink = "link ' $(touch injected)";
+    await writeFile(join(source, quotedFile), 'quoted content');
+    await symlink(`../${quotedFile}`, join(source, 'bin', quotedLink));
+    execFileSync('git', ['-C', source, 'add', '.'], {
+      env: originalEnvironment,
+    });
+    execFileSync(
+      'git',
+      [
+        '-C',
+        source,
+        '-c',
+        'user.name=Fixture',
+        '-c',
+        'user.email=fixture@example.test',
+        'commit',
+        '-m',
+        'link',
+      ],
+      { env: originalEnvironment, stdio: 'ignore' },
+    );
+    const result = await prepareManifest({ repo: 'owner/secret' });
+    prepared.push(result);
+    const client = new UnixLocalSandboxClient({ workspaceBaseDir: fixture });
+    const session = await client.create(result.manifest);
+    try {
+      await result.materialize(session);
+      await result.dispose();
+      const link = join(session.state.workspaceRootPath, 'secret/bin/start');
+      expect((await lstat(link)).isSymbolicLink()).toBe(true);
+      expect(await readlink(link)).toBe('../run.sh');
+      expect(execFileSync(link, { encoding: 'utf8' })).toBe(
+        'fixture-executable',
+      );
+      const quoted = join(
+        session.state.workspaceRootPath,
+        'secret/bin',
+        quotedLink,
+      );
+      expect(await readlink(quoted)).toBe(`../${quotedFile}`);
+      expect(await readFile(quoted, 'utf8')).toBe('quoted content');
+      await expect(
+        stat(join(session.state.workspaceRootPath, 'injected')),
+      ).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await session.close();
+    }
+  });
+
+  it.each(['absolute', 'parent', 'chain', 'missing', 'cycle', 'subpath'])(
+    'rejects unsafe or unsupported %s Git symlinks during preparation',
+    async (kind) => {
+      const source = join(fixture, 'source');
+      await writeFile(join(fixture, 'outside'), 'outside contents');
+      await mkdir(join(source, 'links'));
+      const target =
+        kind === 'absolute'
+          ? join(fixture, 'outside')
+          : kind === 'parent'
+            ? '../../outside'
+            : kind === 'chain'
+              ? 'back/../outside'
+              : kind === 'missing'
+                ? 'missing'
+                : kind === 'cycle'
+                  ? 'link'
+                  : '../run.sh';
+      if (kind === 'chain') await symlink('..', join(source, 'links/back'));
+      await symlink(target, join(source, 'links/link'));
+      execFileSync('git', ['-C', source, 'add', '.'], {
+        env: originalEnvironment,
+      });
+      execFileSync(
+        'git',
+        [
+          '-C',
+          source,
+          '-c',
+          'user.name=Fixture',
+          '-c',
+          'user.email=fixture@example.test',
+          'commit',
+          '-m',
+          'unsafe link',
+        ],
+        { env: originalEnvironment, stdio: 'ignore' },
+      );
+      await expect(
+        prepareManifest({
+          entries: {
+            repo: gitRepo({
+              repo: 'owner/secret',
+              ...(kind === 'subpath' ? { subpath: 'links' } : {}),
+            }),
+          },
+        }),
+      ).rejects.toThrow(/Git symlinks must/);
+      const calls = (await readFile(join(fixture, 'calls.ndjson'), 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { env: NodeJS.ProcessEnv });
+      for (const call of calls)
+        await expect(stat(call.env.HOME!)).rejects.toMatchObject({
+          code: 'ENOENT',
+        });
+    },
+  );
+
+  it.each(['parent symlink', 'existing destination'])(
+    'refuses to create Git links through a %s',
+    async (kind) => {
+      const source = join(fixture, 'source');
+      await mkdir(join(source, 'bin'));
+      await symlink('../run.sh', join(source, 'bin/start'));
+      execFileSync('git', ['-C', source, 'add', '.'], {
+        env: originalEnvironment,
+      });
+      execFileSync(
+        'git',
+        [
+          '-C',
+          source,
+          '-c',
+          'user.name=Fixture',
+          '-c',
+          'user.email=fixture@example.test',
+          'commit',
+          '-m',
+          'link',
+        ],
+        { env: originalEnvironment, stdio: 'ignore' },
+      );
+      const result = await prepareManifest({ repo: 'owner/secret' });
+      prepared.push(result);
+      const session = await new UnixLocalSandboxClient({
+        workspaceBaseDir: fixture,
+      }).create(result.manifest);
+      const root = join(session.state.workspaceRootPath, 'secret');
+      const outside = join(fixture, 'outside');
+      await mkdir(outside);
+      try {
+        if (kind === 'parent symlink') {
+          await rm(join(root, 'bin'), { recursive: true });
+          await symlink(outside, join(root, 'bin'));
+        } else {
+          await mkdir(join(root, 'bin/start'));
+        }
+        await expect(result.materialize(session)).rejects.toThrow(
+          /Git symlink materialization failed/,
+        );
+        expect(await readdir(outside)).toEqual([]);
+        if (kind === 'existing destination')
+          expect(await readdir(join(root, 'bin/start'))).toEqual([]);
+      } finally {
+        await session.close();
+      }
+    },
+  );
 
   it('checks out commit refs and preserves subpath entries', async () => {
     const commit = execFileSync(

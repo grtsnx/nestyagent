@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ConfigService } from '@nestjs/config';
+import { Logger } from '@nestjs/common';
 import { Manifest, type SandboxClient } from '@openai/agents/sandbox';
 import {
   DockerSandboxClient,
@@ -7,6 +8,11 @@ import {
 } from '@openai/agents/sandbox/local';
 import type { Session } from '@openai/agents';
 import { APIError } from 'openai';
+import { execFile } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
 import type { OpenaiService } from '@/lib/openai/openai.service.js';
 import { fakePrisma } from './fake-prisma.js';
 import {
@@ -80,6 +86,14 @@ const remoteSettings = {
   DIGITALOCEAN_TOKEN: 'do-token',
 };
 
+const ociSettings = {
+  ...remoteSettings,
+  REMOTE_MACHINE_PROVIDER: 'oci',
+  OCI_SANDBOX_CREATE_URL: 'https://provisioner.example.com/sandboxes',
+  OCI_SANDBOX_TOKEN: 'gateway-token',
+  OCI_SANDBOX_PROJECT_ID: 'project-1',
+};
+
 const connectEvent = JSON.stringify({
   type: 'agent.session.action_required',
   data: { id: 'sess_1', required_action: { type: 'environment_connection' } },
@@ -135,28 +149,56 @@ describe('remote machine commands', () => {
     expect(script).not.toContain('executor-secret');
   });
 
-  it('puts the Codex connection values in the DigitalOcean manifest', () => {
-    const manifest = digitalOceanManifest({
+  it('starts the Databricks executor after preparing its home and log', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'databricks-script-'));
+    const trace = join(directory, 'trace');
+    const script = databricksExecutorScript({
       sessionId: 'sess_1',
-      environmentId: 'env_1',
-      remoteUrl: 'https://api.openai.com/v1/agents/api',
+      environmentId: "env_'1",
+      remoteUrl: 'wss://example.com/remote?value=a&other=b',
       executorKey: 'executor-secret',
-    });
-
-    expect(manifest).toContain('agent: codex-agentapi');
-    expect(manifest).toContain('CODEX_ENVIRONMENT_ID: "env_1"');
-    expect(manifest).toContain('CODEX_API_KEY: "executor-secret"');
+    }).replaceAll('/home/sandbox-agent', directory);
+    try {
+      // Every invoked program is a shell stub; only the generated launcher runs.
+      await promisify(execFile)(
+        '/bin/bash',
+        [
+          '-c',
+          [
+            'mktemp() { printf "%s\\n" "$TEST_HOME"; }',
+            'rm() { printf "remove\\n" >> "$TEST_TRACE"; }',
+            'setsid() { "$@"; }',
+            'nohup() { "$@"; }',
+            'codex() { printf "%s\\n" "$CODEX_HOME" "$@" >> "$TEST_TRACE"; }',
+            script,
+            'wait',
+          ].join('\n'),
+        ],
+        {
+          env: { TEST_TRACE: trace, TEST_HOME: join(directory, 'codex-home') },
+          timeout: 5_000,
+        },
+      );
+      expect((await readFile(trace, 'utf8')).trim().split('\n')).toEqual([
+        'remove',
+        join(directory, 'codex-home'),
+        'exec-server',
+        '--remote',
+        'wss://example.com/remote?value=a&other=b',
+        '--environment-id',
+        "env_'1",
+      ]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
-  it('quotes DigitalOcean values so a key cannot break the YAML', () => {
-    const manifest = digitalOceanManifest({
-      sessionId: 'sess_1',
-      environmentId: 'env_1',
-      remoteUrl: 'https://api.openai.com/v1/agents/api',
-      executorKey: 'key: with\nnewline',
-    });
+  it('uses substitution variables in the DigitalOcean manifest', () => {
+    const manifest = digitalOceanManifest();
 
-    expect(manifest).toContain('CODEX_API_KEY: "key: with\\nnewline"');
+    expect(manifest).toContain('agent: codex-agentapi');
+    expect(manifest).toContain('CODEX_ENVIRONMENT_ID: ${ENV_ID}');
+    expect(manifest).toContain('CODEX_API_KEY: ${OPENAI_EXECUTOR_API_KEY}');
   });
 });
 
@@ -164,6 +206,133 @@ describe('self-hosted machines', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it('sends DigitalOcean its JSON manifest and variable envelope', async () => {
+    const fetchMock = digitalOcean();
+    const { db, prisma } = fakePrisma();
+    const service = sandboxService(
+      {
+        ...remoteSettings,
+        OPENAI_EXECUTOR_API_KEY: 'key: with\nnewline',
+      },
+      hostedApi(),
+      prisma,
+    );
+    await service.handleHostedWebhook(connectEvent, {});
+    await service.processHostedWebhooks();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe(
+      'https://api.digitalocean.com/v2/agents/sessions?openai_session_id=sess_1',
+    );
+    expect(init?.headers).toMatchObject({
+      Authorization: 'Bearer do-token',
+      'Content-Type': 'application/json',
+    });
+    expect(JSON.parse(init!.body as string)).toEqual({
+      manifest: digitalOceanManifest(),
+      variables: {
+        ENV_ID: 'env_1',
+        OPENAI_EXECUTOR_API_KEY: 'key: with\nnewline',
+      },
+    });
+    expect(db.remoteMachine.rows[0]).toMatchObject({
+      status: 'ready',
+      machineId: 'digitalocean:do_1',
+    });
+  });
+
+  it('sends the OCI gateway executor configuration with stable provisioning identity', async () => {
+    const fetchMock = vi.fn(
+      async (_url: unknown, _init?: RequestInit) =>
+        new Response(
+          JSON.stringify({
+            id: 'oci_1',
+            status: 'ready',
+            sessionId: 'sess_1',
+            environmentId: 'env_1',
+          }),
+        ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const { db, prisma } = fakePrisma();
+      const service = sandboxService(ociSettings, hostedApi(), prisma);
+      await service.handleHostedWebhook(connectEvent, {});
+      await service.processHostedWebhooks();
+      expect(db.remoteMachine.rows[0]).toMatchObject({
+        status: 'ready',
+        machineId: 'oci:oci_1',
+      });
+    }
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe(ociSettings.OCI_SANDBOX_CREATE_URL);
+    expect(init).toMatchObject({ method: 'POST', redirect: 'error' });
+    expect(init?.headers).toMatchObject({
+      Authorization: 'Bearer gateway-token',
+      'Content-Type': 'application/json',
+      'Idempotency-Key': expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(fetchMock.mock.calls[1][1]?.headers).toEqual(init?.headers);
+    expect(JSON.parse(init!.body as string)).toEqual({
+      projectId: 'project-1',
+      displayName: 'openai-sess_1',
+      sessionId: 'sess_1',
+      environmentId: 'env_1',
+      remoteUrl: 'wss://example.com',
+      executorKey: 'executor-secret',
+    });
+  });
+
+  it.each([
+    { status: 'starting', sessionId: 'sess_1', environmentId: 'env_1' },
+    { status: 'ready', sessionId: 'another-session', environmentId: 'env_1' },
+    {
+      status: 'ready',
+      sessionId: 'sess_1',
+      environmentId: 'another-environment',
+    },
+    {},
+  ])(
+    'retains the OCI machine when the gateway does not confirm executor readiness: %j',
+    async (state) => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(
+          async () => new Response(JSON.stringify({ id: 'oci_1', ...state })),
+        ),
+      );
+      const { db, prisma } = fakePrisma();
+      const service = sandboxService(ociSettings, hostedApi(), prisma);
+      await service.handleHostedWebhook(connectEvent, {});
+      await service.processHostedWebhooks();
+      expect(db.remoteMachine.rows[0]).toMatchObject({
+        status: 'reconciliation',
+        machineId: 'oci:oci_1',
+      });
+      expect(db.hostedWebhook.rows[0]).toMatchObject({
+        status: 'reconciliation',
+      });
+    },
+  );
+
+  it('rejects an OCI gateway without TLS before sending executor credentials', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const { db, prisma } = fakePrisma();
+    const service = sandboxService(
+      {
+        ...ociSettings,
+        OCI_SANDBOX_CREATE_URL: 'http://provisioner.example.com/sandboxes',
+      },
+      hostedApi(),
+      prisma,
+    );
+    await service.handleHostedWebhook(connectEvent, {});
+    await service.processHostedWebhooks();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(db.remoteMachine.rows).toEqual([]);
   });
 
   it('ignores a delayed failure event after the session has recovered', async () => {
@@ -855,6 +1024,91 @@ describe('self-hosted machines', () => {
     });
   });
 
+  it('cannot overwrite a replacement machine after losing the provisioning lock', async () => {
+    const { db, prisma } = fakePrisma();
+    let lost = false;
+    prisma.transaction = async (work) => {
+      if (lost) throw new Error('Execution lock ownership was lost.');
+      return await db.$transaction(work as never);
+    };
+    const errors = vi
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        lost = true;
+        await db.remoteMachine.updateMany({
+          where: { sessionId: 'sess_1' },
+          data: {
+            claimToken: 'new-owner',
+            machineId: 'digitalocean:replacement',
+            status: 'ready',
+          },
+        });
+        return new Response(JSON.stringify({ id: 'late-orphan' }));
+      }),
+    );
+    const service = sandboxService(remoteSettings, hostedApi(), prisma);
+    await service.handleHostedWebhook(connectEvent, {});
+    await service.processHostedWebhooks();
+    expect(db.remoteMachine.rows[0]).toMatchObject({
+      claimToken: 'new-owner',
+      machineId: 'digitalocean:replacement',
+      status: 'ready',
+    });
+    expect(errors).toHaveBeenCalledWith(
+      expect.stringContaining('machine=digitalocean:late-orphan'),
+    );
+    expect(db.hostedWebhook.rows[0]).toMatchObject({
+      status: 'reconciliation',
+    });
+  });
+
+  it('records the known Databricks identity when its startup fails after lock loss', async () => {
+    const { db, prisma } = fakePrisma();
+    let lost = false;
+    prisma.transaction = async (work) => {
+      if (lost) throw new Error('Execution lock ownership was lost.');
+      return await db.$transaction(work as never);
+    };
+    const errors = vi
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: unknown, init?: RequestInit) => {
+        if (init?.body?.toString().includes('execution_timeout')) {
+          lost = true;
+          return new Response(null, { status: 503 });
+        }
+        return new Response(
+          JSON.stringify({ name: 'sandboxes/created-before-lock-loss' }),
+        );
+      }),
+    );
+    const service = sandboxService(
+      {
+        ...remoteSettings,
+        REMOTE_MACHINE_PROVIDER: 'databricks',
+        DATABRICKS_HOST: 'https://workspace.example.com',
+        DATABRICKS_TOKEN: 'token',
+      },
+      hostedApi(),
+      prisma,
+    );
+    await service.handleHostedWebhook(connectEvent, {});
+    await service.processHostedWebhooks();
+    expect(errors).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'machine=databricks:sandboxes/created-before-lock-loss',
+      ),
+    );
+    expect(db.hostedWebhook.rows[0]).toMatchObject({
+      status: 'reconciliation',
+    });
+  });
+
   it('rejects a local executor in production before spawning', () => {
     const service = sandboxService({ NODE_ENV: 'production' });
     expect(() =>
@@ -880,6 +1134,8 @@ describe('self-hosted machines', () => {
 });
 
 describe('sandbox workspaces', () => {
+  afterEach(() => vi.restoreAllMocks());
+
   function fakeClient() {
     const create = vi.fn(async (args: { manifest: Manifest }) => ({
       state: { manifest: args.manifest },
@@ -895,6 +1151,56 @@ describe('sandbox workspaces', () => {
       serializeSessionState,
     };
   }
+
+  it('finishes prepared manifest materialization before returning a workspace', async () => {
+    const fake = fakeClient();
+    const service = sandboxService({});
+    let finished = false;
+    const prepared = {
+      manifest: new Manifest({ root: '/prepared' }),
+      materialize: vi.fn(async () => {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        finished = true;
+      }),
+      dispose: vi.fn(async () => {}),
+    };
+    const workspace = await service.openSandbox(prepared, {
+      client: fake.client,
+    });
+    expect(fake.create).toHaveBeenCalledWith({ manifest: prepared.manifest });
+    expect(prepared.materialize).toHaveBeenCalledWith(workspace);
+    expect(finished).toBe(true);
+    expect(prepared.dispose).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    'closes a workspace after preparation fails even when close fails: %s',
+    async (closeFails) => {
+      vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      const failure = new Error('materialization failed');
+      const close = vi.fn(async () => {
+        if (closeFails) throw new Error('close failed');
+      });
+      const fake = fakeClient();
+      fake.create.mockImplementation(async ({ manifest }) => ({
+        state: { manifest },
+        close,
+      }));
+      const prepared = {
+        manifest: new Manifest(),
+        materialize: vi.fn(async () => {
+          throw failure;
+        }),
+        dispose: vi.fn(async () => {}),
+      };
+      const service = sandboxService({});
+      await expect(
+        service.openSandbox(prepared, { client: fake.client }),
+      ).rejects.toBe(failure);
+      expect(close).toHaveBeenCalledOnce();
+      expect(prepared.dispose).not.toHaveBeenCalled();
+    },
+  );
 
   it('keeps every manifest field when it adds the password', async () => {
     const fake = fakeClient();

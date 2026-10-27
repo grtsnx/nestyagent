@@ -17,15 +17,40 @@ import {
   s3Mount,
   SandboxGroupInit,
   SandboxUserInit,
+  type Entry,
   type GitRepo,
+  type SandboxSession,
   normalizeRelativePath,
 } from '@openai/agents/sandbox';
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rm, stat } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readlink,
+  realpath,
+  rm,
+} from 'node:fs/promises';
+import {
+  dirname,
+  isAbsolute,
+  join,
+  posix,
+  relative,
+  resolve,
+  sep,
+} from 'node:path';
 
 type GitHost = 'github' | 'gitlab' | 'bitbucket';
 type GitCredentials = { token?: string; username?: string; host?: GitHost };
+type PreparedSymlink = { path: string; target: string };
+
+export type PreparedManifest = {
+  manifest: Manifest;
+  materialize: (session: SandboxSession) => Promise<void>;
+  dispose: () => Promise<void>;
+};
 
 type RepoLink = {
   url: string;
@@ -191,15 +216,22 @@ function buildManifest(
 }
 
 // Keep these temporary sources until the SDK has materialized the workspace.
+// Call materialize(session) before exposing the session to create safe Git links.
 // dispose() is idempotent; prepare again before creating another fresh workspace.
-export async function prepareManifest(options?: CreateManifestOptions) {
+export async function prepareManifest(
+  options?: CreateManifestOptions,
+): Promise<PreparedManifest> {
   const credentials = new Map<string, GitCredentials>();
+  const symlinks: PreparedSymlink[] = [];
   const manifest = buildManifest(options, credentials);
+  const materialize = (session: SandboxSession) =>
+    materializeGitSymlinks(session, symlinks);
   const gitEntries = [...manifest.iterEntries()].filter(
     (item): item is typeof item & { entry: GitRepo } =>
       item.entry.type === 'git_repo',
   );
-  if (gitEntries.length === 0) return { manifest, dispose: async () => {} };
+  if (gitEntries.length === 0)
+    return { manifest, materialize, dispose: async () => {} };
 
   // SDK local sources must be within cwd. A dedicated writable directory also
   // supports non-root containers whose application directory is read-only.
@@ -250,7 +282,6 @@ export async function prepareManifest(options?: CreateManifestOptions) {
           );
         }
       }
-      const sourceInfo = await stat(source);
       const {
         type: _type,
         repo: _repo,
@@ -259,20 +290,133 @@ export async function prepareManifest(options?: CreateManifestOptions) {
         subpath: _subpath,
         ...metadata
       } = entry;
-      const prepared = sourceInfo.isDirectory()
-        ? localDir({ ...metadata, src: source })
-        : localFile({ ...metadata, src: source });
+      const prepared = {
+        ...(await preparedGitEntry(source, source, logicalPath, symlinks)),
+        ...metadata,
+      };
       // Replace the normalized entry in place, including entries nested in dirs.
       Object.keys(entry).forEach(
         (key) => delete (entry as Record<string, unknown>)[key],
       );
       Object.assign(entry, prepared);
     }
-    return { manifest, dispose };
+    return { manifest, materialize, dispose };
   } catch (error) {
     await dispose();
     throw error;
   }
+}
+
+async function preparedGitEntry(
+  source: string,
+  root: string,
+  logicalPath: string,
+  symlinks: PreparedSymlink[],
+): Promise<Entry> {
+  const info = await lstat(source);
+  if (info.isFile()) {
+    return localFile({ src: source, permissions: info.mode & 0o777 });
+  }
+  if (!info.isDirectory()) {
+    throw new Error(
+      'Git repository entries must be files, directories, or safe relative symlinks.',
+    );
+  }
+  const children: Record<string, Entry> = {};
+  for (const child of await readdir(source, { withFileTypes: true })) {
+    const childSource = join(source, child.name);
+    const childPath = posix.join(logicalPath, child.name);
+    if (child.isSymbolicLink()) {
+      const target = await readlink(childSource);
+      // Reject escaping links and link chains, including links outside a selected
+      // subpath. Never read or copy through a repository-controlled symlink.
+      if (
+        isAbsolute(target) ||
+        target.includes('\\') ||
+        !insideDirectory(root, resolve(dirname(childSource), target))
+      ) {
+        throw new Error(
+          'Git symlinks must resolve inside the prepared repository directory.',
+        );
+      }
+      let resolved: string;
+      try {
+        resolved = await realpath(childSource);
+      } catch {
+        throw new Error(
+          'Git symlinks must have an existing, non-cyclic target.',
+        );
+      }
+      if (!insideDirectory(root, resolved)) {
+        throw new Error(
+          'Git symlinks must resolve inside the prepared repository directory.',
+        );
+      }
+      symlinks.push({ path: childPath, target });
+      continue;
+    }
+    children[child.name] = await preparedGitEntry(
+      childSource,
+      root,
+      childPath,
+      symlinks,
+    );
+  }
+  return dir({ children, permissions: info.mode & 0o777 });
+}
+
+function insideDirectory(root: string, path: string) {
+  const fromRoot = relative(root, path);
+  return (
+    !isAbsolute(fromRoot) &&
+    fromRoot !== '..' &&
+    !fromRoot.startsWith(`..${sep}`)
+  );
+}
+
+async function materializeGitSymlinks(
+  session: SandboxSession,
+  symlinks: PreparedSymlink[],
+) {
+  if (symlinks.length === 0) return;
+  if (!session.exec)
+    throw new Error('Git symlinks require sandbox command execution.');
+  // Batch command execution to avoid one provider round trip per link. Bound each
+  // batch so repository size cannot produce an unbounded shell command.
+  for (let offset = 0; offset < symlinks.length; offset += 100) {
+    const commands = ['set -eu'];
+    for (const link of symlinks.slice(offset, offset + 100)) {
+      const parents: string[] = [];
+      for (
+        let path = posix.dirname(link.path);
+        path !== '.';
+        path = posix.dirname(path)
+      ) {
+        parents.unshift(path);
+      }
+      // A manifest entry must never redirect link creation through another link.
+      commands.push(
+        ...parents.map(
+          (path) =>
+            `test -d ${shellQuote(`./${path}`)} && test ! -L ${shellQuote(`./${path}`)}`,
+        ),
+        `test ! -e ${shellQuote(`./${link.path}`)}`,
+        `test ! -L ${shellQuote(`./${link.path}`)}`,
+        `ln -s -- ${shellQuote(link.target)} ${shellQuote(`./${link.path}`)}`,
+      );
+    }
+    const result = await session.exec({
+      cmd: commands.join('\n'),
+      workdir: session.state.manifest.root,
+      login: false,
+    });
+    if (result.exitCode !== 0)
+      throw new Error('Git symlink materialization failed.');
+  }
+}
+
+function shellQuote(value: string) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function gitEnvironment(

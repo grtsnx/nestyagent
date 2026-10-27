@@ -17,6 +17,7 @@ import {
   defineToolInputGuardrail,
   defineToolOutputGuardrail,
   getCurrentTrace,
+  getCurrentSpan,
   getDefaultModel,
   getOrCreateTrace,
   hostedMcpTool,
@@ -45,7 +46,7 @@ import {
   withCustomSpan,
   withTrace,
 } from '@openai/agents';
-import type { MCPServer } from '@openai/agents';
+import type { MCPServer, ModelRequest, RunConfig } from '@openai/agents';
 import type { SandboxRunConfig } from '@openai/agents/sandbox';
 import type { Prisma } from '@/generated/prisma/client.js';
 import { requestStore } from '@/middleware';
@@ -235,6 +236,34 @@ export class DatabaseSession implements Session {
     return rows.map((row) => row.item as unknown as AgentInputItem);
   }
 
+  // The SDK loads history before appending new input. Only that new turn may exceed
+  // the budget; an oversized completed turn must not trap the next request.
+  prepareInput(history: AgentInputItem[], input: AgentInputItem[]) {
+    if (!input.length) return history;
+    const maxItems = this.limits.maxItems ?? 200;
+    const maxBytes = this.limits.maxBytes ?? 256_000;
+    const starts = history.flatMap((item, index) =>
+      index === 0 || isUserMessage(item) ? [index] : [],
+    );
+    starts.push(history.length);
+    // One pass accounts for each history item and its separator before the new input.
+    let bytes = Buffer.byteLength(JSON.stringify(input));
+    const suffixBytes: number[] = [];
+    suffixBytes[history.length] = bytes;
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      bytes += Buffer.byteLength(JSON.stringify(history[index])) + 1;
+      suffixBytes[index] = bytes;
+    }
+    for (const start of starts) {
+      if (
+        history.length - start + input.length <= maxItems &&
+        suffixBytes[start] <= maxBytes
+      )
+        return [...history.slice(start), ...input];
+    }
+    return input;
+  }
+
   // The SDK retries the same operation ID when a history write has an uncertain outcome.
   async applyHistoryTransaction({
     operationId,
@@ -243,7 +272,7 @@ export class DatabaseSession implements Session {
     if (!operationId.trim())
       throw new Error('A history operation ID is required.');
     const digest = historyDigest(transaction);
-    await this.prisma.db.$transaction(async (tx) => {
+    await this.prisma.transaction(async (tx) => {
       // Updating the parent locks this chat until the short database transaction commits.
       await tx.chat.upsert({
         where: { id: this.chatId },
@@ -307,25 +336,24 @@ export class DatabaseSession implements Session {
   // One transaction: the chat row is made or touched, and every item is added, or none are.
   async addItems(items: AgentInputItem[]) {
     if (items.length === 0) return;
-    const db = this.prisma.db;
-    await db.$transaction([
-      db.chat.upsert({
+    await this.prisma.transaction(async (tx) => {
+      await tx.chat.upsert({
         where: { id: this.chatId },
         create: { id: this.chatId },
         update: { updatedAt: new Date() },
-      }),
-      db.chatItem.createMany({
+      });
+      await tx.chatItem.createMany({
         data: items.map((item) => ({
           chatId: this.chatId,
           item: item as unknown as Prisma.InputJsonValue,
         })),
-      }),
-    ]);
+      });
+    });
   }
 
   // Removes and returns the newest item. SKIP LOCKED lets two pops at once take different items.
   async popItem() {
-    return await this.prisma.db.$transaction(async (tx) => {
+    return await this.prisma.transaction(async (tx) => {
       await tx.chat.updateMany({
         where: { id: this.chatId },
         data: { updatedAt: new Date() },
@@ -346,7 +374,9 @@ export class DatabaseSession implements Session {
 
   // Deleting the chat row deletes its items too.
   async clearSession() {
-    await this.prisma.db.chat.deleteMany({ where: { id: this.chatId } });
+    await this.prisma.transaction((tx) =>
+      tx.chat.deleteMany({ where: { id: this.chatId } }),
+    );
   }
 }
 
@@ -367,6 +397,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   private readonly runMetadata = new WeakMap<object, RunMetadata>();
   private readonly shutdown = new AbortController();
   private socketModelProvider?: OpenAIProvider;
+  private httpModelProvider?: OpenAIProvider;
 
   constructor(
     private readonly configService: ConfigService,
@@ -382,6 +413,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   async onModuleDestroy() {
     this.shutdown.abort(new Error('Application is shutting down.'));
     await this.socketModelProvider?.close().catch(() => undefined);
+    await this.httpModelProvider?.close().catch(() => undefined);
     this.socketModelProvider = undefined;
     this.socketRunner = undefined;
   }
@@ -396,7 +428,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   //2. It applies to every later run in this app, so call it once at startup.
   createRunner(model: string) {
     this.runnerModel = model;
-    this.sharedRunner = new Runner(this.runnerConfig());
+    this.sharedRunner = this.configuredRunner(this.runnerConfig());
     this.socketRunner = undefined;
     return this.sharedRunner;
   }
@@ -474,13 +506,24 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
       metadata?: Record<string, string>;
     },
   ) {
-    return await withTrace(name, async () => run(), {
-      ...(options?.groupId && { groupId: options.groupId }),
-      metadata: {
-        ...options?.metadata,
-        ...(options?.userId && { user_id: options.userId }),
+    return await withTrace(
+      name,
+      async () => {
+        try {
+          return await run();
+        } catch (error) {
+          await getCurrentTrace()?.end();
+          throw error;
+        }
       },
-    });
+      {
+        ...(options?.groupId && { groupId: options.groupId }),
+        metadata: {
+          ...options?.metadata,
+          ...(options?.userId && { user_id: options.userId }),
+        },
+      },
+    );
   }
 
   // A step the Agents SDK does not already record, such as claiming an approval.
@@ -779,34 +822,37 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
         'Saved runs require DatabaseSession so the session can be restored after a restart.',
       );
     }
-    const row = await this.prisma.db.pausedRun.create({
-      data: {
-        state: result.state.toString(),
-        chatId: session?.chatId,
-        agentName: metadata?.agentName,
-        agentVersion: policy.agentVersion,
-        ownerId: policy.ownerId,
-        runOptions: {
-          ...(policy.websocket !== undefined && {
-            websocket: policy.websocket,
-          }),
-          ...(policy.maxTurns !== undefined && { maxTurns: policy.maxTurns }),
-          ...(typeof policy.outputGuardrailBlockedMessage === 'string' && {
-            outputGuardrailBlockedMessage: policy.outputGuardrailBlockedMessage,
-          }),
-          ...(policy.promptCacheKey && {
-            promptCacheKey: policy.promptCacheKey,
-          }),
-          ...(policy.tracePayloads !== undefined && {
-            tracePayloads: policy.tracePayloads,
-          }),
-          ...(policy.userId && { userId: policy.userId }),
-          ...(policy.workflowName && { workflowName: policy.workflowName }),
-          ...(policy.groupId && { groupId: policy.groupId }),
-          ...(session && { historyLimits: session.limits }),
+    const row = await this.prisma.transaction((tx) =>
+      tx.pausedRun.create({
+        data: {
+          state: result.state.toString(),
+          chatId: session?.chatId,
+          agentName: metadata?.agentName,
+          agentVersion: policy.agentVersion,
+          ownerId: policy.ownerId,
+          runOptions: {
+            ...(policy.websocket !== undefined && {
+              websocket: policy.websocket,
+            }),
+            ...(policy.maxTurns !== undefined && { maxTurns: policy.maxTurns }),
+            ...(typeof policy.outputGuardrailBlockedMessage === 'string' && {
+              outputGuardrailBlockedMessage:
+                policy.outputGuardrailBlockedMessage,
+            }),
+            ...(policy.promptCacheKey && {
+              promptCacheKey: policy.promptCacheKey,
+            }),
+            ...(policy.tracePayloads !== undefined && {
+              tracePayloads: policy.tracePayloads,
+            }),
+            ...(policy.userId && { userId: policy.userId }),
+            ...(policy.workflowName && { workflowName: policy.workflowName }),
+            ...(policy.groupId && { groupId: policy.groupId }),
+            ...(session && { historyLimits: session.limits }),
+          },
         },
-      },
-    });
+      }),
+    );
     this.runMetadata.set(result.state, {
       options: policy,
       agentName: metadata?.agentName,
@@ -874,14 +920,16 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
           'Only an interrupted run can be recovered.',
         );
       }
-      await this.prisma.db.pausedRun.updateMany({
-        where: { id, version: row.version },
-        data: {
-          status: 'waiting',
-          version: { increment: 1 },
-          recoveryNote: options.note,
-        },
-      });
+      await this.prisma.transaction((tx) =>
+        tx.pausedRun.updateMany({
+          where: { id, version: row.version },
+          data: {
+            status: 'waiting',
+            version: { increment: 1 },
+            recoveryNote: options.note,
+          },
+        }),
+      );
       return await this.loadRun(agent, id, options);
     });
   }
@@ -946,7 +994,6 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
     // One cache key per chat, as the prompt caching guide advises: separate cache use per customer.
     const runner = this.runner(
       policy.websocket,
-      agent,
       policy.promptCacheKey ?? (await session?.getSessionId()),
       policy.tracePayloads,
     );
@@ -988,8 +1035,9 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
       // The model this run really uses, so Langfuse can price it. The SDK default comes last.
       const model =
         (typeof agent.model === 'string' && agent.model) ||
-        this.runnerModel ||
-        getDefaultModel();
+        (typeof agent.model === 'object'
+          ? undefined
+          : this.runnerModel || getDefaultModel());
       const traceMetadata: Record<string, string> = {
         agent: agent.name,
         ...(requestId && { request_id: requestId }),
@@ -1000,122 +1048,157 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
       const userText = userTurn(input);
       return await getOrCreateTrace(
         async () => {
-          const traceId = getCurrentTrace()?.traceId;
-          if (traceId) {
-            this.langfuse?.note(traceId, {
-              ...(userText !== undefined && { input: userText }),
-              ...(sessionId && { sessionId }),
-              ...(policy.userId && { userId: policy.userId }),
-              ...(requestId && { requestId }),
-              ...(model && { model }),
-              agent: agent.name,
-            });
-          }
-          if (saved) {
-            await this.span('claim-approval', async () => {
-              const claim = await this.prisma.db.pausedRun.updateMany({
-                where: {
-                  id: saved.id,
-                  version: saved.version,
-                  status: 'waiting',
-                },
-                data: {
-                  status: 'running',
-                  state: (input as RunState<any, AnyAgent>).toString(),
-                  version: { increment: 1 },
-                },
-              });
-              if (claim.count !== 1)
-                throw new ConflictException(
-                  'This checkpoint is stale or already running. Reload the saved run.',
+          const trace = getCurrentTrace();
+          const traceId = trace?.traceId;
+          const note = {
+            ...(userText !== undefined && { input: userText }),
+            ...(sessionId && { sessionId }),
+            ...(policy.userId && { userId: policy.userId }),
+            ...(requestId && { requestId }),
+            ...(model && { model }),
+            agent: agent.name,
+          };
+          const run = async () => {
+            if (saved) {
+              await this.span('claim-approval', async () => {
+                const claim = await this.prisma.transaction((tx) =>
+                  tx.pausedRun.updateMany({
+                    where: {
+                      id: saved.id,
+                      version: saved.version,
+                      status: 'waiting',
+                    },
+                    data: {
+                      status: 'running',
+                      state: (input as RunState<any, AnyAgent>).toString(),
+                      version: { increment: 1 },
+                    },
+                  }),
                 );
-              claimedVersion = saved.version + 1;
-            });
-          }
-          try {
-            const runOptions = {
-              context: policy.context,
-              session,
-              signal,
-              maxTurns: policy.maxTurns,
-              outputGuardrailBlockedMessage:
-                policy.outputGuardrailBlockedMessage,
-              sandbox: policy.sandbox,
-              ...(joined
-                ? {}
-                : { workflowName: policy.workflowName ?? 'agent-turn' }),
-              ...(sessionId && { groupId: sessionId }),
-              traceMetadata,
-              ...(input instanceof RunState || !policy.previousResponseId
-                ? {}
-                : { previousResponseId: policy.previousResponseId }),
-            };
-            const result = policy.stream
-              ? await runner.run(agent, input, { ...runOptions, stream: true })
-              : await runner.run(agent, input, runOptions);
-            if (policy.stream) {
-              const streamed = result as StreamedRunResult<unknown, AnyAgent>;
-              // Capture the SDK promise before exposing completion that includes persistence and unlock.
-              const sdkCompletion = streamed.completed;
-              deliver(streamed);
-              await sdkCompletion;
-            }
-            if (traceId && result.finalOutput !== undefined)
-              this.langfuse?.note(traceId, { output: result.finalOutput });
-            signal?.throwIfAborted();
-            if (result.state) {
-              this.runMetadata.set(result.state, {
-                options: policy,
-                agentName: agent.name,
-              });
-              if (saved) {
-                const persisted = await this.prisma.db.pausedRun.updateMany({
-                  where: {
-                    id: saved.id,
-                    version: claimedVersion,
-                    status: 'running',
-                  },
-                  data: {
-                    state: result.state.toString(),
-                    status: result.interruptions.length
-                      ? 'waiting'
-                      : 'completed',
-                    version: { increment: 1 },
-                  },
-                });
-                if (persisted.count !== 1)
+                if (claim.count !== 1)
                   throw new ConflictException(
-                    'The run checkpoint changed before completion.',
+                    'This checkpoint is stale or already running. Reload the saved run.',
                   );
+                claimedVersion = saved.version + 1;
+              });
+            }
+            try {
+              const runOptions = {
+                context: policy.context,
+                session,
+                ...(session instanceof DatabaseSession &&
+                  !(input instanceof RunState) && {
+                    sessionInputCallback: (
+                      history: AgentInputItem[],
+                      next: AgentInputItem[],
+                    ) => session.prepareInput(history, next),
+                  }),
+                signal,
+                maxTurns: policy.maxTurns,
+                outputGuardrailBlockedMessage:
+                  policy.outputGuardrailBlockedMessage,
+                sandbox: policy.sandbox,
+                ...(joined
+                  ? {}
+                  : { workflowName: policy.workflowName ?? 'agent-turn' }),
+                ...(sessionId && { groupId: sessionId }),
+                traceMetadata,
+                ...(input instanceof RunState || !policy.previousResponseId
+                  ? {}
+                  : { previousResponseId: policy.previousResponseId }),
+              };
+              const result = policy.stream
+                ? await runner.run(agent, input, {
+                    ...runOptions,
+                    stream: true,
+                  })
+                : await runner.run(agent, input, runOptions);
+              if (policy.stream) {
+                const streamed = result as StreamedRunResult<unknown, AnyAgent>;
+                // Capture the SDK promise before exposing completion that includes persistence and unlock.
+                const sdkCompletion = streamed.completed;
+                deliver(streamed);
+                await sdkCompletion;
+              }
+              if (
+                traceId &&
+                !result.interruptions?.length &&
+                result.finalOutput !== undefined
+              )
+                this.langfuse?.note(traceId, { output: result.finalOutput });
+              signal?.throwIfAborted();
+              if (result.state) {
                 this.runMetadata.set(result.state, {
                   options: policy,
                   agentName: agent.name,
-                  saved: { id: saved.id, version: claimedVersion! + 1 },
                 });
-              } else if (
-                session instanceof DatabaseSession &&
-                result.interruptions.length
-              ) {
-                await this.saveRun(result, policy);
+                if (saved) {
+                  const persisted = await this.prisma.transaction((tx) =>
+                    tx.pausedRun.updateMany({
+                      where: {
+                        id: saved.id,
+                        version: claimedVersion,
+                        status: 'running',
+                      },
+                      data: {
+                        state: result.state.toString(),
+                        status: result.interruptions.length
+                          ? 'waiting'
+                          : 'completed',
+                        version: { increment: 1 },
+                      },
+                    }),
+                  );
+                  if (persisted.count !== 1)
+                    throw new ConflictException(
+                      'The run checkpoint changed before completion.',
+                    );
+                  this.runMetadata.set(result.state, {
+                    options: policy,
+                    agentName: agent.name,
+                    saved: { id: saved.id, version: claimedVersion! + 1 },
+                  });
+                } else if (
+                  session instanceof DatabaseSession &&
+                  result.interruptions.length
+                ) {
+                  await this.saveRun(result, policy);
+                }
               }
+              return result;
+            } catch (error) {
+              if (saved && claimedVersion !== undefined) {
+                // Keep the last known checkpoint; never replay an uncertain side effect automatically.
+                await this.prisma
+                  .transaction((tx) =>
+                    tx.pausedRun.updateMany({
+                      where: {
+                        id: saved.id,
+                        version: claimedVersion,
+                        status: 'running',
+                      },
+                      data: { status: 'recovery_required' },
+                    }),
+                  )
+                  .catch(() => {});
+                // If the database is down, the durable 'running' marker also requires reconciliation.
+              }
+              throw error;
             }
-            return result;
-          } catch (error) {
-            if (saved && claimedVersion !== undefined) {
-              // Keep the last known checkpoint; never replay an uncertain side effect automatically.
-              await this.prisma.db.pausedRun
-                .updateMany({
-                  where: {
-                    id: saved.id,
-                    version: claimedVersion,
-                    status: 'running',
-                  },
-                  data: { status: 'recovery_required' },
-                })
-                .catch(() => {});
-              // If the database is down, the durable 'running' marker also requires reconciliation.
-            }
-            throw error;
+          };
+          try {
+            return this.langfuse
+              ? await this.langfuse.withRun(note, run)
+              : await run();
+          } finally {
+            // SDK 0.21 does not end getOrCreateTrace on rejection. Always settle our trace,
+            // while leaving a surrounding workflow's lifetime with its owner.
+            const owned = new Set([!joined ? trace : undefined]);
+            // SDK 0.21 restores a separate trace with RunState and does not end it
+            // on rejection either. This exposed SDK field is covered by restart tests.
+            if (input instanceof RunState && input._trace !== joined)
+              owned.add(input._trace ?? undefined);
+            for (const current of owned) await current?.end();
           }
         },
         {
@@ -1143,42 +1226,93 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
     return streamed;
   }
 
-  //1. The socket runner, the shared runner from createRunner, or the SDK's plain default.
-  //2. With a prompt cache key, a light runner for this one run sends prompt_cache_key.
-  //3. The key travels in providerData, which replaces an agent's own, so the agent's is copied in.
-  //   An agent reached by handoff keeps only the key, not its own providerData.
-  //4. A run whose trace payloads differ from TRACE_PAYLOADS gets its own runner.
+  // Per-run transport policy is applied after the SDK merges the current agent's settings.
   private runner(
     websocket?: boolean,
-    agent?: AnyAgent,
     promptCacheKey?: string,
     tracePayloads?: boolean,
   ) {
     const includePayloads = tracePayloads ?? this.tracePayloadsDefault();
-    const config = this.runnerConfig(websocket, includePayloads);
+    const config = this.runnerConfig(
+      websocket,
+      includePayloads,
+      promptCacheKey,
+    );
     if (promptCacheKey || includePayloads !== this.tracePayloadsDefault())
-      return new Runner({
-        ...config,
-        ...(promptCacheKey && {
-          modelSettings: {
-            providerData: {
-              ...agent?.modelSettings?.providerData,
-              prompt_cache_key: promptCacheKey,
-            },
-          },
-        }),
-      });
-    if (websocket) return (this.socketRunner ??= new Runner(config));
-    return (this.sharedRunner ??= new Runner(config));
+      return this.configuredRunner(config);
+    if (websocket) return (this.socketRunner ??= this.configuredRunner(config));
+    return (this.sharedRunner ??= this.configuredRunner(config));
+  }
+
+  private configuredRunner(config: Partial<RunConfig>) {
+    const runner = new Runner(config);
+    runner.on('agent_start', (_context, agent) => {
+      const span = getCurrentSpan();
+      const agentSpanId =
+        span?.spanData.type === 'turn' ? span.parentId : span?.spanId;
+      if (!agentSpanId) return;
+      // Custom Model objects bypass ModelProvider. Do not price their turns as the
+      // previous specialist's model; the provider annotates concrete OpenAI calls.
+      const model =
+        typeof agent.model === 'object'
+          ? undefined
+          : agent.model ||
+            (typeof config.model === 'string' ? config.model : undefined) ||
+            getDefaultModel();
+      this.langfuse?.noteSpan(agentSpanId, { model });
+    });
+    return runner;
   }
 
   // What every runner shares. All socket runs reuse one socket provider.
   // Payloads stay off until TRACE_PAYLOADS or a run's tracePayloads flag turns them on.
-  private runnerConfig(websocket?: boolean, includePayloads?: boolean) {
+  private runnerConfig(
+    websocket?: boolean,
+    includePayloads?: boolean,
+    promptCacheKey?: string,
+  ) {
+    const provider = websocket
+      ? this.socketProvider()
+      : (this.httpModelProvider ??= new OpenAIProvider());
     return {
       ...(this.runnerModel && { model: this.runnerModel }),
       traceIncludeSensitiveData: includePayloads ?? this.tracePayloadsDefault(),
-      ...(websocket && { modelProvider: this.socketProvider() }),
+      modelProvider: {
+        getModel: async (name?: string) => {
+          const model = await provider.getModel(name);
+          const prepare = (request: ModelRequest): ModelRequest => {
+            const spanId = getCurrentSpan()?.spanId;
+            if (spanId)
+              this.langfuse?.noteSpan(spanId, {
+                model: name || getDefaultModel(),
+              });
+            return promptCacheKey
+              ? {
+                  ...request,
+                  modelSettings: {
+                    ...request.modelSettings,
+                    providerData: {
+                      ...request.modelSettings.providerData,
+                      prompt_cache_key: promptCacheKey,
+                    },
+                  },
+                }
+              : request;
+          };
+          return new Proxy(model, {
+            get(target, property) {
+              if (property === 'getResponse')
+                return (request: ModelRequest) =>
+                  target.getResponse(prepare(request));
+              if (property === 'getStreamedResponse')
+                return (request: ModelRequest) =>
+                  target.getStreamedResponse(prepare(request));
+              const value = Reflect.get(target, property, target) as unknown;
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+        },
+      },
     };
   }
 

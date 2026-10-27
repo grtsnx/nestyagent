@@ -5,6 +5,7 @@ import {
   type OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { SpanContext } from '@opentelemetry/api';
 import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
 import {
@@ -68,7 +69,7 @@ export type PlannedObservation = {
   usageDetails?: {
     input?: number;
     output?: number;
-    cache_read_input_tokens?: number;
+    input_cached_tokens?: number;
   };
   metadata: Record<string, string>;
   sessionId?: string;
@@ -80,7 +81,7 @@ export type PlannedObservation = {
   endTime?: Date;
 };
 
-//1. One Agents SDK trace becomes one Langfuse trace.
+//1. One completed Agents SDK trace segment becomes one Langfuse trace.
 //2. A model turn is a generation, so cost and tokens attach to it.
 //3. A tool, guardrail, or handoff keeps its own type and sits beside that generation.
 export function planObservations(
@@ -105,8 +106,23 @@ export function planObservations(
 
   for (const item of ordered) {
     const trace = traces.get(item.traceId);
-    const note = notes.get(item.traceId);
-    const mapped = mapSpan(item, trace, note, seenGenerations);
+    const ancestors = [item];
+    const seen = new Set([item.spanId]);
+    let parent = item.parentId && byId.get(item.parentId);
+    while (parent && !seen.has(parent.spanId)) {
+      ancestors.push(parent);
+      seen.add(parent.spanId);
+      parent = parent.parentId && byId.get(parent.parentId);
+    }
+    const note = Object.assign(
+      {},
+      notes.get(item.traceId),
+      ...ancestors.toReversed().map((ancestor) => notes.get(ancestor.spanId)),
+    ) as TurnNote;
+    const runId =
+      ancestors.find((ancestor) => ancestor.spanData.type === 'task')?.spanId ??
+      item.traceId;
+    const mapped = mapSpan(item, trace, note, seenGenerations, runId);
     if (!mapped) continue;
     const parentId = item.parentId;
     planned.push({
@@ -141,6 +157,7 @@ function mapSpan(
   trace: Extract<AgentTraceItem, { type: 'trace' }> | undefined,
   note: TurnNote | undefined,
   seenGenerations: Map<string, number>,
+  runId: string,
 ):
   | Omit<
       PlannedObservation,
@@ -151,6 +168,8 @@ function mapSpan(
   const metadata = stringMetadata(trace?.metadata);
   if (note?.requestId) metadata.request_id = note.requestId;
   if (note?.agent) metadata.agent = note.agent;
+  if (note?.sessionId) metadata.session_id = note.sessionId;
+  if (note?.userId) metadata.user_id = note.userId;
   const failed = item.error
     ? { level: 'ERROR' as const, statusMessage: item.error.message }
     : {};
@@ -173,8 +192,8 @@ function mapSpan(
     case 'agent':
       return { name: data.name, asType: 'agent', metadata, ...failed };
     case 'turn': {
-      const index = seenGenerations.get(item.traceId) ?? 0;
-      seenGenerations.set(item.traceId, index + 1);
+      const index = seenGenerations.get(runId) ?? 0;
+      seenGenerations.set(runId, index + 1);
       return {
         name: 'generate-response',
         asType: 'generation',
@@ -281,12 +300,17 @@ function usageOf(usage?: {
   const details: {
     input?: number;
     output?: number;
-    cache_read_input_tokens?: number;
+    input_cached_tokens?: number;
   } = {};
-  if (usage.input_tokens !== undefined) details.input = usage.input_tokens;
+  // OpenAI includes cache hits in input; Langfuse expects exclusive buckets.
+  if (usage.input_tokens !== undefined)
+    details.input = Math.max(
+      0,
+      usage.input_tokens - (usage.cached_input_tokens ?? 0),
+    );
   if (usage.output_tokens !== undefined) details.output = usage.output_tokens;
   if (usage.cached_input_tokens)
-    details.cache_read_input_tokens = usage.cached_input_tokens;
+    details.input_cached_tokens = usage.cached_input_tokens;
   return Object.keys(details).length ? { usageDetails: details } : {};
 }
 
@@ -311,12 +335,13 @@ type Opened = {
 
 //1. Off until the public key, secret, and base URL are all set.
 //2. Test runs never export, so the suite does not talk to Langfuse.
-//3. Each Agents SDK trace is one Langfuse trace, sent after the turn records its answer.
+//3. Each completed SDK trace segment is sent after the turn records its answer.
 @Injectable()
 export class LangfuseService
   implements OnModuleInit, OnModuleDestroy, TracingProcessor
 {
   private readonly notes = new Map<string, TurnNote>();
+  private readonly runNote = new AsyncLocalStorage<TurnNote>();
   private readonly pending = new Map<string, AgentTraceItem[]>();
   private readonly timers = new Map<string, NodeJS.Timeout>();
   private readonly logger = new Logger(LangfuseService.name);
@@ -357,19 +382,35 @@ export class LangfuseService
     );
   }
 
-  // Merge the user message, answer, chat, and request onto the trace before it is sent.
+  // Merge context into the active run, or the trace when called outside a run.
   note(traceId: string, patch: Partial<TurnNote>) {
     if (!this.enabled) return;
-    const next: TurnNote = { ...this.notes.get(traceId) };
+    const current = this.runNote.getStore();
+    const next: TurnNote = current ?? { ...this.notes.get(traceId) };
     for (const [key, value] of Object.entries(patch)) {
       if (value !== undefined) next[key as keyof TurnNote] = value as never;
     }
-    this.notes.set(traceId, next);
+    if (!current) this.notes.set(traceId, next);
+  }
+
+  // Each Runner invocation owns its input and output, even inside a shared workflow.
+  withRun<T>(note: TurnNote, callback: () => T): T {
+    return this.runNote.run({ ...note }, callback);
+  }
+
+  // A model provider records the resolved model on the current SDK turn span.
+  noteSpan(spanId: string, patch: Partial<TurnNote>) {
+    if (!this.enabled) return;
+    this.notes.set(spanId, { ...this.notes.get(spanId), ...patch });
   }
 
   async onTraceStart() {}
 
-  async onSpanStart() {}
+  async onSpanStart(span: Span<SpanData>) {
+    const note = this.runNote.getStore();
+    if (note && span.spanData.type === 'task')
+      this.notes.set(span.spanId, note);
+  }
 
   async onSpanEnd(span: Span<SpanData>) {
     this.remember({
@@ -431,6 +472,45 @@ export class LangfuseService
     const planned = planObservations(items, this.notes);
     const trace = items.find((item) => item.type === 'trace');
     const traceName = trace?.type === 'trace' ? trace.name : 'agent-turn';
+    const roots = planned.filter((observation) => !observation.parentSpanId);
+    if (roots.length > 1) {
+      const rootId = `workflow:${traceId}`;
+      const starts = roots.flatMap((item) =>
+        item.startTime ? [item.startTime.getTime()] : [],
+      );
+      const ends = roots.flatMap((item) =>
+        item.endTime ? [item.endTime.getTime()] : [],
+      );
+      for (const root of roots) root.parentSpanId = rootId;
+      // Workflow context belongs to its root; each run keeps its own metadata.
+      for (const observation of planned) delete observation.tags;
+      const sessionId = roots.find((item) => item.sessionId)?.sessionId;
+      const userId = roots.find((item) => item.userId)?.userId;
+      planned.unshift({
+        traceId,
+        spanId: rootId,
+        name: traceName,
+        asType: 'span',
+        input: roots
+          .filter((item) => item.input !== undefined)
+          .map((item) => item.input),
+        output: roots
+          .filter((item) => item.output !== undefined)
+          .map((item) => item.output),
+        metadata: { ...stringMetadata(trace?.metadata), sdk_trace_id: traceId },
+        tags: ['agent'],
+        ...(sessionId &&
+          roots.every(
+            (item) => !item.sessionId || item.sessionId === sessionId,
+          ) && { sessionId }),
+        ...(userId &&
+          roots.every((item) => !item.userId || item.userId === userId) && {
+            userId,
+          }),
+        ...(starts.length && { startTime: new Date(Math.min(...starts)) }),
+        ...(ends.length && { endTime: new Date(Math.max(...ends)) }),
+      });
+    }
     const opened = new Map<string, Opened>();
     for (const observation of planned) {
       const parent = observation.parentSpanId
@@ -479,6 +559,9 @@ export class LangfuseService
       opened.set(observation.spanId, created);
     }
     this.notes.delete(traceId);
+    for (const item of items) {
+      if (item.type === 'trace.span') this.notes.delete(item.spanId);
+    }
   }
 }
 

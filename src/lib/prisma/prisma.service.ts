@@ -7,14 +7,23 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@/generated/prisma/client.js';
+import type { Prisma } from '@/generated/prisma/client.js';
+
+type ExecutionLease = {
+  owner: string;
+  keys: string[];
+  controller: AbortController;
+};
 
 @Injectable()
 export class PrismaService implements OnModuleDestroy {
   private client?: PrismaClient;
   private readonly locks = new Set<AbortController>();
   private readonly logger = new Logger(PrismaService.name);
+  private readonly execution = new AsyncLocalStorage<ExecutionLease[]>();
   // A lock lives this long unless its owner renews it. A crashed owner frees it after this.
   lockTtlMs = 60_000;
   lockRenewMs = 15_000;
@@ -54,6 +63,43 @@ export class PrismaService implements OnModuleDestroy {
     }
   }
 
+  // Lock ownership and protected writes commit together. A takeover waits for this short
+  // transaction, and an expired owner cannot renew or write over its replacement.
+  async transaction<T>(
+    work: (tx: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T> {
+    const leases = this.execution.getStore() ?? [];
+    return await this.db.$transaction(async (tx) => {
+      await this.assertOwnership(tx, leases);
+      const result = await work(tx);
+      await this.assertOwnership(tx, leases);
+      return result;
+    });
+  }
+
+  private async assertOwnership(
+    tx: Prisma.TransactionClient,
+    leases: ExecutionLease[],
+  ) {
+    for (const lease of leases) {
+      lease.controller.signal.throwIfAborted();
+      for (const key of lease.keys) {
+        const rows = await tx.$queryRaw<
+          Array<{ owner: string; valid: boolean }>
+        >`
+          SELECT owner, expires_at > clock_timestamp() AS valid
+          FROM execution_locks WHERE key = ${key} FOR UPDATE`;
+        if (rows[0]?.owner !== lease.owner || !rows[0]?.valid) {
+          const error = new ConflictException(
+            'Database execution lock was lost.',
+          );
+          lease.controller.abort(error);
+          throw error;
+        }
+      }
+    }
+  }
+
   //1. A lock is a row in execution_locks with an expiry. No connection is held while work runs,
   //   so any number of chats can run at once.
   //2. The owner renews the row. If the row is lost, or cannot be renewed before it expires,
@@ -69,7 +115,19 @@ export class PrismaService implements OnModuleDestroy {
     this.locks.add(controller);
     let held = 0;
     let renewal: ReturnType<typeof setInterval> | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let renewing = false;
+    let released = false;
+    const armDeadline = (started: number) => {
+      clearTimeout(deadline);
+      deadline = setTimeout(
+        () => controller.abort(new Error('Database execution lock expired.')),
+        Math.max(0, this.lockTtlMs - (Date.now() - started)),
+      );
+      deadline.unref();
+    };
     try {
+      const acquiredAt = Date.now();
       for (const lockKey of keys) {
         const taken = await this.db.$executeRaw`
           INSERT INTO execution_locks (key, owner, expires_at)
@@ -83,31 +141,42 @@ export class PrismaService implements OnModuleDestroy {
           );
         held += 1;
       }
-      let renewedAt = Date.now();
+      armDeadline(acquiredAt);
       renewal = setInterval(() => {
+        if (renewing || controller.signal.aborted) return;
+        renewing = true;
+        const started = Date.now();
         void this.db.$executeRaw`
           UPDATE execution_locks
-          SET expires_at = now() + ${this.lockTtlMs} * interval '1 millisecond'
-          WHERE owner = ${owner}::uuid`
+          SET expires_at = clock_timestamp() + ${this.lockTtlMs} * interval '1 millisecond'
+          WHERE owner = ${owner}::uuid AND expires_at > clock_timestamp()`
           .then((count) => {
             if (count !== held)
               controller.abort(new Error('Database execution lock was lost.'));
-            else renewedAt = Date.now();
+            else if (!released && !controller.signal.aborted)
+              armDeadline(started);
           })
-          .catch(() => {
-            // One failed renewal is fine. Stop only when the lock may already have expired.
-            if (Date.now() - renewedAt >= this.lockTtlMs - this.lockRenewMs)
-              controller.abort(
-                new Error('Database execution lock could not be renewed.'),
-              );
+          // The independent deadline still aborts if renewals fail or remain pending.
+          .catch(() => {})
+          .finally(() => {
+            renewing = false;
           });
       }, this.lockRenewMs);
       renewal.unref();
-      const result = await work(controller.signal);
-      controller.signal.throwIfAborted();
-      return result;
+      const leases = [
+        ...(this.execution.getStore() ?? []),
+        { owner, keys, controller },
+      ];
+      return await this.execution.run(leases, async () => {
+        await this.transaction(async () => {});
+        const result = await work(controller.signal);
+        await this.transaction(async () => {});
+        return result;
+      });
     } finally {
+      released = true;
       clearInterval(renewal);
+      clearTimeout(deadline);
       this.locks.delete(controller);
       if (held > 0) {
         // If this fails, the rows expire by themselves after lockTtlMs.

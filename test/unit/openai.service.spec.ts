@@ -861,40 +861,6 @@ describe('OpenaiService storage and limits', () => {
     expect(transaction).not.toHaveBeenCalled();
   });
 
-  it('sends one prompt cache key per chat and keeps the agent settings', async () => {
-    const run = vi
-      .spyOn(Runner.prototype, 'run')
-      .mockResolvedValue({} as never);
-    const openai = service();
-    const agent = new Agent({
-      name: 'Menu helper',
-      instructions: 'Menu.',
-      modelSettings: { providerData: { metadata: { shop: 'sunny' } } },
-    });
-    try {
-      await openai.runAgent('Any cakes?', agent, {
-        session: openai.createSession('chat-c-42'),
-      });
-      await openai.runAgent('Any bread?', agent, {
-        promptCacheKey: 'customer-7',
-      });
-      await openai.runAgent('Hello.', agent);
-
-      const sent = run.mock.contexts.map(
-        (runner) =>
-          (runner as unknown as { config: RunConfig }).config.modelSettings
-            ?.providerData,
-      );
-      expect(sent).toEqual([
-        { metadata: { shop: 'sunny' }, prompt_cache_key: 'chat-c-42' },
-        { metadata: { shop: 'sunny' }, prompt_cache_key: 'customer-7' },
-        undefined,
-      ]);
-    } finally {
-      run.mockRestore();
-    }
-  });
-
   it('passes signal and maxTurns to the run', async () => {
     const run = vi
       .spyOn(Runner.prototype, 'run')

@@ -32,6 +32,7 @@ import {
   type Environment,
   type RemoteMachineProvider,
 } from '@/config/index.js';
+import type { PreparedManifest } from '@/config/workspace/index.js';
 import {
   guardrailConfig,
   OpenaiService,
@@ -224,13 +225,34 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
   //3. ports are preview ports. snapshotDir is where file snapshots are stored.
   //4. password replaces ACCOUNT_PASSWORD for this workspace. Leave it out to use the shared secret.
   //5. computer can be unix, docker, modal, vercel, cloudflare, e2b, daytona, or blaxel.
-  async openSandbox(manifest = new Manifest(), options?: OpenSandboxOptions) {
+  // Pass a prepared manifest to finish Git link creation before the workspace is exposed.
+  async openSandbox(
+    manifest: Manifest | PreparedManifest = new Manifest(),
+    options?: OpenSandboxOptions,
+  ) {
     const client = await this.sandboxClient(options);
     if (!client.create)
       throw new Error('This computer cannot open a workspace.');
-    return (await client.create({
-      manifest: this.workspaceManifest(manifest, options?.password),
+    const prepared = manifest instanceof Manifest ? undefined : manifest;
+    const workspace = (await client.create({
+      manifest: this.workspaceManifest(
+        manifest instanceof Manifest ? manifest : manifest.manifest,
+        options?.password,
+      ),
     })) as SandboxWorkspace;
+    try {
+      await prepared?.materialize(workspace);
+      return workspace;
+    } catch (error) {
+      try {
+        await workspace.close?.();
+      } catch {
+        this.logger.warn(
+          'Workspace cleanup failed after materialization failed.',
+        );
+      }
+      throw error;
+    }
   }
 
   // Close the workspace. Memory writes its lessons during this close.
@@ -574,7 +596,7 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
       (typeof headerId === 'string' ? headerId : undefined) ??
       createHash('sha256').update(rawBody).digest('hex');
     try {
-      await this.db().$transaction(async (tx) => {
+      await this.prisma.transaction(async (tx) => {
         await tx.hostedWebhook.create({
           data: { id, type: event.type, resourceId: event.data.id },
         });
@@ -725,10 +747,12 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
           needsConnection &&
           row?.status === 'deleted'
         ) {
-          await this.db().remoteMachine.updateMany({
-            where: { sessionId },
-            data: { desiredState: 'active' },
-          });
+          await this.prisma.transaction((tx) =>
+            tx.remoteMachine.updateMany({
+              where: { sessionId },
+              data: { desiredState: 'active' },
+            }),
+          );
           await this.requireReconciliation(
             sessionId,
             undefined,
@@ -767,25 +791,29 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
         };
         const claimToken = randomUUID();
         if (!row) {
-          row = await this.db().remoteMachine.create({
-            data: {
-              sessionId,
-              environmentId: environment.id,
-              claimToken,
-              provider,
-            },
-          });
+          row = await this.prisma.transaction((tx) =>
+            tx.remoteMachine.create({
+              data: {
+                sessionId,
+                environmentId: environment.id,
+                claimToken,
+                provider,
+              },
+            }),
+          );
         }
-        await this.db().remoteMachine.updateMany({
-          where: { sessionId },
-          data: {
-            status: 'creating',
-            provider,
-            claimToken,
-            claimedAt: new Date(),
-            lastError: null,
-          },
-        });
+        await this.prisma.transaction((tx) =>
+          tx.remoteMachine.updateMany({
+            where: { sessionId },
+            data: {
+              status: 'creating',
+              provider,
+              claimToken,
+              claimedAt: new Date(),
+              lastError: null,
+            },
+          }),
+        );
         let machineId: string;
         try {
           operationSignal.throwIfAborted();
@@ -797,27 +825,31 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
           );
         }
         try {
-          const saved = await this.db().remoteMachine.updateMany({
-            where: { sessionId, claimToken, status: 'creating' },
-            data: {
-              machineId,
-              status: operationSignal.aborted ? 'reconciliation' : 'ready',
-              claimedAt: new Date(),
-            },
-          });
+          const saved = await this.prisma.transaction((tx) =>
+            tx.remoteMachine.updateMany({
+              where: { sessionId, claimToken, status: 'creating' },
+              data: {
+                machineId,
+                status: operationSignal.aborted ? 'reconciliation' : 'ready',
+                claimedAt: new Date(),
+              },
+            }),
+          );
           if (saved.count !== 1) throw new Error('Machine claim was lost.');
         } catch {
           // Keep the known id whenever the database recovers. Never erase an ambiguous create claim.
           try {
-            await this.db().remoteMachine.updateMany({
-              where: { sessionId },
-              data: {
-                machineId,
-                status: 'reconciliation',
-                desiredState: 'deleted',
-                lastError: 'machine_record_failed',
-              },
-            });
+            await this.prisma.transaction((tx) =>
+              tx.remoteMachine.updateMany({
+                where: { sessionId, claimToken },
+                data: {
+                  machineId,
+                  status: 'reconciliation',
+                  desiredState: 'deleted',
+                  lastError: 'machine_record_failed',
+                },
+              }),
+            );
           } catch {
             this.logger.error(
               `Machine requires reconciliation: session=${sessionId} machine=${machineId}`,
@@ -931,10 +963,12 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
     // A failed session can recover before a retry; only expiry or explicit orphan disposal
     // should persist a terminal intent. The failure event itself remains durable for retries.
     if (permanent) {
-      await this.db().remoteMachine.updateMany({
-        where: { sessionId: row.sessionId },
-        data: { desiredState: 'deleted' },
-      });
+      await this.prisma.transaction((tx) =>
+        tx.remoteMachine.updateMany({
+          where: { sessionId: row.sessionId },
+          data: { desiredState: 'deleted' },
+        }),
+      );
     }
     if (!row.machineId && ['creating', 'reconciliation'].includes(row.status))
       await this.requireReconciliation(row.sessionId);
@@ -948,10 +982,12 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
         throw error;
       }
     }
-    await this.db().remoteMachine.updateMany({
-      where: { sessionId: row.sessionId },
-      data: { status: 'deleted', machineId: null, lastError: null },
-    });
+    await this.prisma.transaction((tx) =>
+      tx.remoteMachine.updateMany({
+        where: { sessionId: row.sessionId },
+        data: { status: 'deleted', machineId: null, lastError: null },
+      }),
+    );
   }
 
   private async requireReconciliation(
@@ -959,14 +995,24 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
     machineId?: string,
     reason = 'provider_outcome_unknown',
   ): Promise<never> {
-    await this.db().remoteMachine.updateMany({
-      where: { sessionId },
-      data: {
-        status: 'reconciliation',
-        lastError: reason,
-        ...(machineId && { machineId }),
-      },
-    });
+    try {
+      await this.prisma.transaction((tx) =>
+        tx.remoteMachine.updateMany({
+          where: { sessionId },
+          data: {
+            status: 'reconciliation',
+            lastError: reason,
+            ...(machineId && { machineId }),
+          },
+        }),
+      );
+    } catch (error) {
+      if (!machineId) throw error;
+      // The stale owner must not overwrite a successor, but the provider id must remain recoverable.
+      this.logger.error(
+        `Machine requires reconciliation: session=${sessionId} machine=${machineId}`,
+      );
+    }
     throw new MachineReconciliationRequired();
   }
 
@@ -990,7 +1036,7 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
       });
       if (!['creating', 'reconciliation'].includes(current.status))
         throw new Error('This machine does not need reconciliation.');
-      await this.db().$transaction(async (tx) => {
+      await this.prisma.transaction(async (tx) => {
         await tx.remoteMachine.updateMany({
           where: { sessionId },
           data: {
@@ -1103,6 +1149,8 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
     for (const key of required[provider]) this.setting(key);
     if (provider === 'databricks')
       databricksHost(this.setting('DATABRICKS_HOST'));
+    if (provider === 'oci')
+      ociGatewayUrl(this.setting('OCI_SANDBOX_CREATE_URL'));
   }
 
   private assertLocalAllowed() {
@@ -1158,9 +1206,15 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
       signal: providerSignal(request.signal),
       headers: {
         Authorization: `Bearer ${this.setting('DIGITALOCEAN_TOKEN')}`,
-        'Content-Type': 'application/x-yaml',
+        'Content-Type': 'application/json',
       },
-      body: digitalOceanManifest(request),
+      body: JSON.stringify({
+        manifest: digitalOceanManifest(),
+        variables: {
+          ENV_ID: request.environmentId,
+          OPENAI_EXECUTOR_API_KEY: request.executorKey,
+        },
+      }),
     });
     const id = readId(await readJson(response));
     if (!id) throw new Error('DigitalOcean did not return a session id.');
@@ -1243,40 +1297,54 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
     assertDeleted(response, 'Databricks');
   }
 
+  // This is an application-owned gateway, not OCI's native beta API.
+  // The gateway authenticates to OCI, waits for RUNNING, and starts the executor.
   private async createOciMachine(request: MachineRequest) {
-    const response = await fetch(this.setting('OCI_SANDBOX_CREATE_URL'), {
+    const endpoint = ociGatewayUrl(this.setting('OCI_SANDBOX_CREATE_URL'));
+    const response = await fetch(endpoint.href, {
       method: 'POST',
+      redirect: 'error',
       signal: providerSignal(request.signal),
       headers: {
         Authorization: `Bearer ${this.setting('OCI_SANDBOX_TOKEN')}`,
         'Content-Type': 'application/json',
+        'Idempotency-Key': createHash('sha256')
+          .update(JSON.stringify([request.sessionId, request.environmentId]))
+          .digest('hex'),
       },
       body: JSON.stringify({
         projectId: this.setting('OCI_SANDBOX_PROJECT_ID'),
         displayName: `openai-${request.sessionId}`,
-        freeformTags: {
-          environmentId: request.environmentId,
-          remoteUrl: request.remoteUrl,
-        },
+        sessionId: request.sessionId,
+        environmentId: request.environmentId,
+        remoteUrl: request.remoteUrl,
+        executorKey: request.executorKey,
       }),
     });
-    const id = readId(await readJson(response));
-    if (!id) throw new Error('OCI did not return a sandbox id.');
+    const body = await readJson(response);
+    const id = readId(body);
+    if (!id) throw new Error('OCI gateway did not return a sandbox id.');
+    const state = body as Record<string, unknown>;
+    if (
+      state.status !== 'ready' ||
+      state.sessionId !== request.sessionId ||
+      state.environmentId !== request.environmentId
+    )
+      throw new KnownMachineFailure(`oci:${id}`);
     return id;
   }
 
   private async deleteOciMachine(id: string, signal?: AbortSignal) {
-    const endpoint = this.setting('OCI_SANDBOX_CREATE_URL');
-    const response = await fetch(
-      `${endpoint.replace(/\/$/, '')}/${encodeURIComponent(id)}`,
-      {
-        method: 'DELETE',
-        signal: providerSignal(signal),
-        headers: {
-          Authorization: `Bearer ${this.setting('OCI_SANDBOX_TOKEN')}`,
-        },
+    const endpoint = ociGatewayUrl(this.setting('OCI_SANDBOX_CREATE_URL'));
+    endpoint.pathname = `${endpoint.pathname.replace(/\/$/, '')}/${encodeURIComponent(id)}`;
+    const response = await fetch(endpoint.href, {
+      method: 'DELETE',
+      redirect: 'error',
+      signal: providerSignal(signal),
+      headers: {
+        Authorization: `Bearer ${this.setting('OCI_SANDBOX_TOKEN')}`,
       },
-    );
+    });
     assertDeleted(response, 'OCI');
   }
 
@@ -1492,17 +1560,17 @@ export function awsTerminateArgs(id: string, region?: string) {
   ];
 }
 
-// Values are double-quoted, so a key with :, #, or a newline cannot break the YAML.
-export function digitalOceanManifest(request: MachineRequest) {
+// The provider substitutes values from the JSON variables mapping.
+export function digitalOceanManifest() {
   return [
     'agent: codex-agentapi',
     'egress:',
     '  - api.openai.com',
     '  - codex-cloud-environments.chatgpt.com',
     'env:',
-    `  CODEX_ENVIRONMENT_ID: ${JSON.stringify(request.environmentId)}`,
+    '  CODEX_ENVIRONMENT_ID: ${ENV_ID}',
     'secrets:',
-    `  CODEX_API_KEY: ${JSON.stringify(request.executorKey)}`,
+    '  CODEX_API_KEY: ${OPENAI_EXECUTOR_API_KEY}',
     '',
   ].join('\n');
 }
@@ -1511,13 +1579,16 @@ export function databricksExecutorScript(request: MachineRequest) {
   const remote = shellQuote(request.remoteUrl);
   const environment = shellQuote(request.environmentId);
   return [
+    'set -e',
     'cx=$(mktemp -d -p /home/sandbox-agent)',
     'rm -f /home/sandbox-agent/codex-exec-server.log',
-    'CODEX_HOME=$cx setsid nohup codex exec-server',
-    `--remote ${remote}`,
-    `--environment-id ${environment}`,
-    '>/home/sandbox-agent/codex-exec-server.log 2>&1 & echo pid=$!',
-  ].join(' ');
+    [
+      'CODEX_HOME=$cx setsid nohup codex exec-server',
+      `--remote ${remote}`,
+      `--environment-id ${environment}`,
+      '>/home/sandbox-agent/codex-exec-server.log 2>&1 & echo pid=$!',
+    ].join(' '),
+  ].join('\n');
 }
 
 function databricksSandboxId(sessionId: string) {
@@ -1531,6 +1602,14 @@ function databricksHost(value: string) {
     throw new Error('DATABRICKS_HOST must be https.');
   }
   return url.origin;
+}
+
+function ociGatewayUrl(value: string) {
+  const url = new URL(value);
+  if (url.protocol !== 'https:' || url.username || url.password || url.hash) {
+    throw new Error('OCI_SANDBOX_CREATE_URL must be an HTTPS gateway URL.');
+  }
+  return url;
 }
 
 function databricksHeaders(token: string) {

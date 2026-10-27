@@ -190,6 +190,8 @@ Each customer message is a trace named `agent-turn`. A chat id groups those trac
 
 Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` to also send each trace to your self-hosted Langfuse. Langfuse gets the customer's message, the final answer, the chat id, the user id, the request id, the model, and token use. With payloads on, it also gets tool inputs and outputs. API keys in that text are masked. Turn Langfuse on only where storing customer messages is allowed.
 
+A resumed approval is exported as another Langfuse trace segment, grouped by the same chat/session id. Runs inside one `traceWorkflow` publication share a trace while retaining their own inputs and outputs.
+
 A trace appears in Langfuse only after a helper runs. This app ships no route that runs a helper, so the dashboard stays empty until your own code calls `runAgent`, `reply`, or `runSandbox`. If Langfuse is down, the app keeps working and those traces are dropped.
 
 `traceWorkflow` puts several runs in one trace. `span` records a step the helper does not already record.
@@ -322,7 +324,7 @@ The second message works because the helper remembers the cake.
 
 Only one active run may use a database chat at a time, across all app replicas. An overlapping request gets a conflict; queue it in your application or retry after the first run finishes. Streaming holds that lock until `stream.completed`, including history persistence. A saved pending approval blocks new messages until it is resolved.
 
-The helper reads at most 200 messages and 256,000 bytes of the chat. When a chat is longer, the oldest whole turns are left out, so a tool result never loses the call it answers. The current turn is always sent whole, even when it alone is bigger than the limits. A customer who shares one huge menu file can keep chatting; on the next message, that old turn is left out. Change the limits with `createSession(chatId, { maxItems: 400, maxBytes: 512_000 })`. Limits only change what the model sees; every message stays stored. For very long chats, the SDK's `OpenAIResponsesCompactionSession` can summarize old turns.
+Each new message budgets its model context to 200 items and 256,000 bytes by default, including the new input. Older history is trimmed only at whole-turn boundaries, so a tool result never loses the call it answers. The new input and the active turn remain whole even when they exceed these soft limits. On the next message, an oversized completed turn is left out. Approval resumes preserve the active turn from the saved SDK state. Change the limits with `createSession(chatId, { maxItems: 400, maxBytes: 512_000 })`. Limits only change what the model sees; every message stays stored. For very long chats, the SDK's `OpenAIResponsesCompactionSession` can summarize old turns.
 
 Give each chat its own id, like the customer's chat id, and store it. Pass that id again tomorrow and the chat carries on. With no id, `createSession()` makes a new random one, which you can read with `await chat.getSessionId()`.
 
@@ -422,7 +424,7 @@ const result = await this.openai.runAgent(
 
 ### Cheaper repeat questions (prompt caching)
 
-OpenAI caches the start of a prompt it has seen recently, so a long chat costs less and answers faster. It works on its own. A helper in a saved chat also sends the chat id as its cache key, so each chat gets its own cache. One customer cannot probe another's cache, and Langfuse shows cached tokens per chat.
+OpenAI can cache repeated prompt prefixes. Database chats send the chat id as a prompt cache key, and a key supplied by the caller takes precedence. The key is applied to each OpenAI model request after the SDK merges the current specialist’s settings, including after handoffs. It is a routing hint, not an authorization boundary or a guarantee of a cache hit. Custom model adapters manage their own caching. Langfuse reports cached input separately from uncached input.
 
 Pass your own key to share a cache across one customer's chats:
 
@@ -1254,7 +1256,7 @@ Storage is read-only unless you pass `readOnly: false`. Keep keys on the mount o
 
 ### Private git projects
 
-Use `prepareManifest` for authenticated repositories. It clones with credentials scoped to that child process, then gives the SDK a local source. The synchronous `createManifest` rejects token-bearing repo shortcuts rather than putting credentials in shared process state.
+Use `prepareManifest` for authenticated repositories. It clones with credentials scoped to that child process and prepares files with their Git executable modes. Pass the complete prepared object to `openSandbox` so validated relative symlinks are installed before the workspace is returned. The synchronous `createManifest` rejects token-bearing repo shortcuts rather than putting credentials in shared process state.
 
 ```typescript
 import { prepareManifest } from '@/config';
@@ -1266,7 +1268,7 @@ const prepared = await prepareManifest({
   },
 });
 try {
-  const workspace = await this.sandbox.openSandbox(prepared.manifest, {
+  const workspace = await this.sandbox.openSandbox(prepared, {
     computer: 'docker',
   });
   // The workspace now owns a copy of the repository.
@@ -1277,7 +1279,7 @@ try {
 
 Use an HTTPS URL and a read-only token. `prepareManifest` also isolates anonymous clones and Git entries supplied through `entries`. It does not inherit the server's Git credentials, credential helpers, or Git configuration. Tokens stay out of manifests, command arguments, clone URLs, `.git/config`, saved state, and surfaced errors.
 
-Preparation requires Git and a writable `.msagents/` directory under the app's working directory. Temporary source files are private and excluded from Git and Docker build contexts. Keep them until the SDK finishes materializing the workspace, then dispose them in `finally`. Prepare again before creating a fresh workspace from a disposed manifest. Existing workspace copies and snapshots remain usable. After an unclean process exit, remove abandoned preparation directories only when no active preparation uses them.
+Preparation requires Git and a writable `.msagents/` directory under the app's working directory. Temporary source files are private and excluded from Git and Docker build contexts. Keep them until `openSandbox(prepared)` finishes creating the files and links, then dispose them in `finally`. Unsafe, absolute, broken, or escaping links are rejected during preparation. When using the SDK client directly, call `await prepared.materialize(workspace)` immediately after `client.create({ manifest: prepared.manifest })`; close the workspace if that step fails. For prepared repositories, use `runSandbox` with the opened workspace, or `asTool({ workspace })`. `runSandboxOnce` always creates a fresh workspace and does not accept a prepared object. Prepare again before creating a fresh workspace from a disposed manifest. Existing workspace copies remain usable. SDK snapshots do not consistently preserve symlinks across providers; use retained provider storage for repositories that depend on links, or prepare and materialize them again in a fresh workspace. Do not assume a generic snapshot retains Git file metadata. After an unclean process exit, remove abandoned preparation directories only when no active preparation uses them.
 
 | Site      | Where to make the token                                         | Notes                                                                                          |
 | --------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
@@ -1415,13 +1417,24 @@ OpenAI can call this app when a session needs a computer. The app then makes one
 2. Put the signing secret in `OPENAI_WEBHOOK_SECRET` and restart.
 3. Set `REMOTE_MACHINE_PROVIDER` to where the computer should run:
 
-| Provider       | Set up                                                                                                                                                                                    |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `local`        | Nothing. The executor starts on this machine.                                                                                                                                             |
-| `aws`          | `AWS_MICROVM_IMAGE_ARN`, `AWS_MICROVM_SECRET_ARN`, and AWS CLI login. The image's `/run` hook reads `environmentId`, `remoteUrl`, and `secretArn`.                                        |
-| `digitalocean` | `DIGITALOCEAN_TOKEN`.                                                                                                                                                                     |
-| `databricks`   | `DATABRICKS_HOST` (an `https` address) and `DATABRICKS_TOKEN`. The computer is named after the session, so a retry reuses it.                                                             |
-| `oci`          | Run `oci session authenticate --profile-name Sandbox --region <region>`. Then set `OCI_SANDBOX_PROJECT_ID`, `OCI_SANDBOX_TOKEN`, and `OCI_SANDBOX_CREATE_URL` from the current OCI guide. |
+| Provider       | Set up                                                                                                                                             |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `local`        | Nothing. The executor starts on this machine.                                                                                                      |
+| `aws`          | `AWS_MICROVM_IMAGE_ARN`, `AWS_MICROVM_SECRET_ARN`, and AWS CLI login. The image's `/run` hook reads `environmentId`, `remoteUrl`, and `secretArn`. |
+| `digitalocean` | `DIGITALOCEAN_TOKEN`.                                                                                                                              |
+| `databricks`   | `DATABRICKS_HOST` (an `https` address) and `DATABRICKS_TOKEN`. The computer is named after the session, so a retry reuses it.                      |
+| `oci`          | Deploy your OCI provisioning gateway, then set `OCI_SANDBOX_PROJECT_ID`, `OCI_SANDBOX_TOKEN`, and `OCI_SANDBOX_CREATE_URL` as described below.     |
+
+The OCI adapter connects to an application-managed provisioning gateway; it does not call Oracle’s native sandbox API directly. `OCI_SANDBOX_CREATE_URL` must be an HTTPS gateway endpoint, and `OCI_SANDBOX_TOKEN` is its bearer credential, not an Oracle security token. The gateway owns the native OCI authentication and beta SDK setup described in the [official OCI guide](https://developers.openai.com/api/docs/guides/agents-api/environments/providers/oci).
+
+The gateway contract is:
+
+- `POST` receives `projectId`, `displayName`, `sessionId`, `environmentId`, `remoteUrl`, and the restricted `executorKey` as JSON. Keep the key confidential and use it only as `CODEX_API_KEY` inside that sandbox.
+- `Idempotency-Key` is a SHA-256 digest of the session and environment ids. Repeated requests must identify the same sandbox and must not launch a second executor.
+- Wait for the OCI sandbox to reach `RUNNING`, prepare its workspace, install Codex, and launch `codex exec-server` for that environment. Return `{ id, status: 'ready', sessionId, environmentId }` only after successful setup. A known id with incomplete or mismatched setup enters reconciliation.
+- `DELETE <endpoint>/<encoded-id>` must stop and delete that sandbox. Repeating deletion must succeed or return `404`. Redirects are rejected so credentials never follow a redirect to another service.
+
+DigitalOcean provisioning sends a JSON envelope containing the YAML manifest and its variables. Databricks setup runs separate shell statements before starting the detached executor. Provider contract tests run without cloud credentials; deploy-time smoke tests must still verify the executor connects and completes a real turn.
 
 The webhook needs `DATABASE_URL`. It verifies the signature and inserts a deduplicated event in `hosted_webhooks` before acknowledging it. Provider work runs in a background worker, which starts when both `DATABASE_URL` and `OPENAI_WEBHOOK_SECRET` are configured. It starts as soon as this server stores an event, and checks every 5 seconds for events other servers stored. Each pass claims up to 20 events.
 
@@ -1547,11 +1560,11 @@ Chats, approval checkpoints, webhook events, and provider identities are stored 
 
 Database transactions are short and never span a model or provider call. External actions cannot be committed atomically with PostgreSQL: use stable idempotency keys or compensating actions in tools, and reconcile unknown results before retrying. A normal run interrupted before reaching a saved checkpoint must be inspected by the application; this is not a general-purpose durable workflow engine.
 
-A lock is a row with an expiry time, not a held database connection, so any number of chats can run at once and any connection pooler works. The worker renews its locks every 15 seconds. If a server crashes, its locks free themselves after 60 seconds. If a worker loses a lock, or cannot renew it before it expires, its run signal aborts. Custom tools must honor cancellation and independently enforce idempotency.
+Execution leases use expiring rows, so model and provider calls do not hold database connections. The worker renews its leases every 15 seconds; a crashed worker’s leases expire after 60 seconds. An independent deadline aborts work when renewal cannot complete in time. History, checkpoint, and coordinated machine writes verify the lease owner and expiry while locking that row inside the same short database transaction. A stale worker cannot commit those writes after a takeover, even before its cancellation callback runs. Database pool capacity still limits concurrent queries. Custom tools must honor cancellation and independently enforce idempotency; the database fence cannot roll back an external side effect.
 
 **Deployment:** drain old workers before applying the recovery migration and starting this version. Older binaries do not participate in the new execution locks or inbox. The migration preserves data and marks legacy consumed approvals and incomplete machine claims for reconciliation. Back up production data and inspect these records after deployment; do not replay them automatically.
 
-The Agents SDK's built-in tracing remains enabled. Model and tool payloads stay off each trace unless `TRACE_PAYLOADS` or a run's `tracePayloads` flag turns them on for grading. Use the returned result's `runContext.usage` for token accounting, and correlate application request ids with run/chat ids in your own telemetry. Define task-specific evaluation datasets and measure latency and cost on representative workloads before making performance claims. Retention and authorization policies belong to the application; authenticate before loading a chat or deciding an approval.
+Run-owned traces finish on both success and failure, including streaming failures. Langfuse keeps separate input/output notes for each run within a shared workflow, records the resolved model on each OpenAI request after handoffs, and counts cached input in a non-overlapping token bucket. Unknown custom-model identities are not assigned an invented price. The Agents SDK's built-in tracing remains enabled. Model and tool payloads stay off each trace unless `TRACE_PAYLOADS` or a run's `tracePayloads` flag turns them on for grading. Use the returned result's `runContext.usage` for token accounting, and correlate application request ids with run/chat ids in your own telemetry. Define task-specific evaluation datasets and measure latency and cost on representative workloads before making performance claims. Retention and authorization policies belong to the application; authenticate before loading a chat or deciding an approval.
 
 Sandbox files require their own retained workspace, provider storage, or snapshot. Keep executor credentials separate from application credentials, and use isolated compute for untrusted code. Shutdown cancels run signals, closes cached WebSocket providers, and stops locally owned executors; interrupted external operations remain subject to reconciliation.
 

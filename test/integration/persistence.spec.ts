@@ -181,6 +181,72 @@ describe('Postgres persistence', () => {
     );
   });
 
+  it('fences a stale SDK run before it saves history after another worker takes over', async () => {
+    const id = chat();
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let calls = 0;
+    const model: Model = {
+      async getResponse() {
+        const call = ++calls;
+        if (call === 1) {
+          entered();
+          await gate;
+        }
+        return {
+          usage: new Usage(),
+          output: [
+            {
+              type: 'message',
+              role: 'assistant',
+              status: 'completed',
+              content: [{ type: 'output_text', text: `answer-${call}` }],
+            },
+          ],
+        };
+      },
+      getStreamedResponse() {
+        throw new Error('Unused stream');
+      },
+    };
+    const a = new OpenaiService(new ConfigService(), first);
+    const b = new OpenaiService(new ConfigService(), second);
+    const agent = new Agent({ name: 'Fence helper', model });
+    const stale = a.runAgent('First question.', agent, {
+      session: a.createSession(id),
+    });
+    // Observe rejection before releasing the deliberately delayed worker.
+    const outcome = stale.then(
+      () => 'succeeded',
+      () => 'rejected',
+    );
+    try {
+      await started;
+      await second.db.executionLock.update({
+        where: { key: `chat:${id}` },
+        data: { expiresAt: new Date(0) },
+      });
+      await b.runAgent('Second question.', agent, {
+        session: b.createSession(id),
+      });
+      release();
+      expect(await outcome).toBe('rejected');
+      const history = JSON.stringify(await b.createSession(id).getItems());
+      expect(history).toContain('Second question.');
+      expect(history).not.toContain('First question.');
+    } finally {
+      release();
+      await outcome;
+      await Promise.all([a.onModuleDestroy(), b.onModuleDestroy()]);
+    }
+  });
+
   it('sends a current turn longer than maxItems whole', async () => {
     const session = new DatabaseSession(first, chat(), { maxItems: 3 });
     const steps = Array.from({ length: 4 }, (_, index) => ({

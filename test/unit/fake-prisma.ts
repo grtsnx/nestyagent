@@ -243,5 +243,13 @@ export function fakePrisma() {
       keys.forEach((entry) => locks.delete(entry));
     }
   };
-  return { db, prisma: { db, withLock } as unknown as PrismaService };
+  return {
+    db,
+    prisma: {
+      db,
+      withLock,
+      transaction: (work: (tx: FakeDb) => Promise<unknown>) =>
+        db.$transaction(work),
+    } as unknown as PrismaService,
+  };
 }
