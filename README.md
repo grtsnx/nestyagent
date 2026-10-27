@@ -104,6 +104,7 @@ The app uses Postgres through Prisma. The database keeps durable workflow record
 | `execution_locks`         | Which worker is running a chat, a saved run, or a machine change.                   | The lock name, like `chat:chat-c-42`       |
 | `expired_environments`    | Environments OpenAI said are gone, so they are never started again.                 | OpenAI's environment id                    |
 | `instructions`            | Custom instructions saved through the API. Without a row, the default file is used. | The helper name, like `mssuzie`            |
+| `composio_sessions`       | Each user's Composio session, so a session id never comes from a request.           | The user id                                |
 
 How the tables are built:
 
@@ -585,71 +586,45 @@ Put the project key in `.env` and restart:
 COMPOSIO_API_KEY=your-project-key
 ```
 
-Inject `ComposioService` the same way you inject `OpenaiService`. The user id is a stable account id, the same kind of id you pass as `ownerId` on an approval. `default` is rejected.
+Inject `ComposioService` the same way you inject `OpenaiService`.
 
-### The first message
+### Give a helper the owner's apps
 
-Leave `sessionId` out. Composio opens a session for that owner and returns tools for `createAgent`.
+Pass the owner's user id. Composio's tools come back ready for `createAgent`.
 
 ```typescript
-const connected = await this.composio.tools('owner-c-42');
+const connected = await this.composio.tools(user.id); // from login, never from the request body
 
 const helper = this.openai.createAgent(
   'Front desk',
   'Help the Sunny Bakery owner with mail and messages. When an app needs permission, share the Connect Link and wait.',
-  { tools: connected.tools },
-);
-
-const chat = this.openai.createSession('chat-owner-c-42');
-
-await this.openai.runAgent('What came in on email today?', helper, {
-  session: chat,
-});
-```
-
-Store `connected.sessionId` with `owner-c-42`. That id is how the next message keeps the same Gmail and Slack connections.
-
-### The next message
-
-Pass the stored session id. The helper remembers the chat because you pass the same chat id too.
-
-```typescript
-const connected = await this.composio.tools('owner-c-42', {
-  sessionId: savedSessionId,
-});
-
-const helper = this.openai.createAgent(
-  'Front desk',
-  'Help the Sunny Bakery owner with mail and messages. When an app needs permission, share the Connect Link and wait.',
-  { tools: connected.tools },
-);
-
-await this.openai.runAgent(
-  'Reply to the cake order and say it is ready.',
-  helper,
-  {
-    session: this.openai.createSession('chat-owner-c-42'),
-  },
-);
-```
-
-When Gmail or Slack is not connected yet, the helper gets a Connect Link. Show that link to the owner and wait. The next message on this session can use the app.
-
-### Your own tools beside the connected ones
-
-Spread the Composio tools into the same list as a tool you wrote.
-
-```typescript
-const connected = await this.composio.tools('owner-c-42', {
-  sessionId: savedSessionId,
-});
-
-const helper = this.openai.createAgent(
-  'Front desk',
-  'Help the Sunny Bakery owner. Use bakery_hours for opening times, and the connected apps for mail and messages.',
   { tools: [bakeryHours, ...connected.tools] },
 );
 ```
+
+- **The user id comes from your login.** It must be stable, and `default` is rejected. Never take it from what a caller sends, or one person could reach another person's Gmail.
+- **The session stays on the server.** The first call opens a Composio session for that user and saves its id in Postgres (`composio_sessions`). Later calls reuse it. There is no session id to store or pass. If Composio drops the session, a new one is made. Without `DATABASE_URL`, each call opens a new session; connections belong to the user, so nothing is lost.
+- **First time.** When Gmail or Slack is not connected yet, the helper gets a Connect Link. Show it to the owner. The next message can use the app.
+
+### Every action waits for a yes
+
+Looking things up runs on its own: finding tools, reading tool details, and making a Connect Link. Everything else pauses first, because it acts in the owner's real accounts: sending an email, posting to Slack, changing a calendar, running code. Any tool Composio adds later also waits.
+
+```typescript
+const chat = this.openai.createSession('chat-owner-c-42');
+const turn = await this.openai.reply(
+  'Reply to the cake order and say it is ready.',
+  helper,
+  { session: chat },
+);
+
+if (turn.waiting) {
+  // Show turn.result.interruptions to the owner: what will be sent, and where.
+  const done = await this.openai.finish(turn, 'approve'); // or 'reject'
+}
+```
+
+A person can decide later, too. The paused run is saved, the same way as [Decide later](#decide-later).
 
 </details>
 

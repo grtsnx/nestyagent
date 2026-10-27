@@ -165,3 +165,14 @@ model Instruction {
 
   @@map("instructions")
 }
+
+// One Composio session per user, kept on the server. Callers never pass a session id,
+// so one user can never open another user's connected apps.
+model ComposioSession {
+  userId    String   @id @map("user_id")
+  sessionId String   @unique @map("session_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("composio_sessions")
+}
