@@ -5,3 +5,4 @@ export {
   statusType,
 } from './http-response.js';
 export { ApiFailure, ApiRateLimited, ApiSuccess } from './api-docs.js';
+export { baseUrl } from './base-url.js';

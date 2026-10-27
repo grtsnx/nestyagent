@@ -45,6 +45,7 @@
         "@nestjs/cli": "^12.0.0",
         "@nestjs/schematics": "^12.0.0",
         "@nestjs/testing": "^12.0.1",
+        "@openai/chatkit": "1.9.0",
         "@types/express": "^5.0.0",
         "@types/node": "^24.0.0",
         "@types/pg": "^8.23.1",
@@ -298,6 +299,8 @@
     "@openai/agents-openai": ["@openai/agents-openai@0.21.0", "", { "dependencies": { "@openai/agents-core": "0.21.0", "openai": "^7.2.0" }, "peerDependencies": { "zod": "^4.0.0" } }, "sha512-Y1u1ek6FwKx8j+T7gRYcm4kKyN0irqsyZm0XUDZ+g+8s15tu4EhNwNJ92zOHGx7Vjkr2RugWBxTeNspHjw/lQw=="],
 
     "@openai/agents-realtime": ["@openai/agents-realtime@0.21.0", "", { "dependencies": { "@openai/agents-core": "0.21.0", "@types/ws": "^8.18.2", "ws": "^8.22.0" }, "peerDependencies": { "zod": "^4.0.0" } }, "sha512-nI0jGkSdivlXzS7HXAB1EVplaeSyoAvfM2ofHheJDJdshs3UQl3x405nmTflKWye+wQrqemK4uxL06NIhgvjHg=="],
+
+    "@openai/chatkit": ["@openai/chatkit@1.9.0", "", {}, "sha512-AbqNYaCkQfOauFIk/xL3LFmZ/zIBJuvV71EMUK1o1Tu3/qCG5qRjuDnTUVLkkX9Al2ZYQ6yB1oyWN0jNhoBRMQ=="],
 
     "@opentelemetry/api": ["@opentelemetry/api@1.10.0", "", {}, "sha512-lMkyes8iHrG+mk6WH7X70MdCLI2RS0FwNBY1PyQ8UemaijE2m5mv5A0Niy3HtbYTFrgkUEQjFMXmSAk2hQDuPQ=="],
 

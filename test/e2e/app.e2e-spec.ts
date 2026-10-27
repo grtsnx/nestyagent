@@ -151,6 +151,36 @@ describe('AppController (e2e)', () => {
       .expect(403);
   });
 
+  it('keeps ChatKit off without CHATKIT_SECRET', async () => {
+    const response = await request(app.getHttpServer())
+      .post('/v1/chatkit')
+      .set('Authorization', 'Bearer anything')
+      .send({ type: 'threads.list', params: {} })
+      .expect(403);
+    expect(response.body.message).toBe(
+      'ChatKit is off. Set CHATKIT_SECRET to turn it on.',
+    );
+  });
+
+  it('issues ChatKit tokens only with the admin key', async () => {
+    await request(app.getHttpServer())
+      .post('/v1/chatkit/tokens')
+      .send({ userId: 'guardian-1' })
+      .expect(403);
+  });
+
+  it('lets a trusted chat site send ChatKit requests', async () => {
+    const response = await request(app.getHttpServer())
+      .options('/v1/chatkit')
+      .set('Origin', 'https://app.example.com')
+      .set('Access-Control-Request-Method', 'POST')
+      .set('Access-Control-Request-Headers', 'authorization,content-type')
+      .expect(204);
+    expect(
+      response.headers['access-control-allow-headers'].toLowerCase().split(','),
+    ).toContain('authorization');
+  });
+
   it('keeps system prompt editing off without ADMIN_API_KEY', async () => {
     const response = await request(app.getHttpServer())
       .get('/v1/system-prompts')

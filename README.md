@@ -61,25 +61,28 @@ Swagger UI opens at `http://localhost:3000/api`. Scalar opens at `http://localho
 
 The app checks these values before it starts. A bad port, a bad true/false value, or a bad CORS origin stops it.
 
-| Variable                                                          | Default               | What it does                                                                                                         |
-| ----------------------------------------------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `NODE_ENV`                                                        | `development`         | Picks development, test, or production behavior.                                                                     |
-| `PORT`                                                            | `3000`                | The HTTP port.                                                                                                       |
-| `PLATFORM_NAME`                                                   | `Agentic`             | The name shown on the API docs.                                                                                      |
-| `CORS_ORIGINS`                                                    | empty                 | Browser sites allowed to call the API, separated by commas. Empty allows none.                                       |
-| `SWAGGER_ENABLED`                                                 | on outside production | Turns the API docs on. Set it yourself in production.                                                                |
-| `OBSERVE_ENABLED`                                                 | `false`               | Turns on NestJS Observe.                                                                                             |
-| `OBSERVE_APP_KEY`, `OBSERVE_APP_SECRET`, `OBSERVE_SERVICE_ID`     | empty                 | NestJS Observe login. Needed when `OBSERVE_ENABLED` is on.                                                           |
-| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` | empty                 | Self-hosted Langfuse. Set all three to record traces there. Leave them empty to stay on the OpenAI dashboard.        |
-| `COMPOSIO_API_KEY`                                                | empty                 | Composio project key. Empty leaves Gmail, Slack, and other connected apps off. The app starts without it.            |
-| `ADMIN_API_KEY`                                                   | empty                 | Admin key for the admin routes: system prompts and monitoring. At least 32 characters. Empty keeps those routes off. |
-| `OPENAI_API_KEY`                                                  | required              | Your OpenAI key. Every helper uses it. The app does not start without it.                                            |
-| `DATABASE_URL`                                                    | empty                 | Your Postgres address. The app starts without it. Chats, saved approvals, and the webhook need it.                   |
-| `OPENAI_HOSTED_MODEL`                                             | `gpt-6-astra`         | The model for a self-hosted session when you do not pick one.                                                        |
-| `ACCOUNT_PASSWORD`                                                | empty                 | One login password the helper can use inside its computer. Empty means no password.                                  |
-| `OPENAI_EXECUTOR_API_KEY`                                         | empty                 | The small key for a self-hosted computer. See Self-hosted.                                                           |
-| `OPENAI_WEBHOOK_SECRET`                                           | empty                 | Proves a webhook really came from OpenAI. Empty rejects every webhook.                                               |
-| `REMOTE_MACHINE_PROVIDER`                                         | `local`               | Where the webhook starts a self-hosted computer: `local`, `aws`, `digitalocean`, `databricks`, or `oci`.             |
+| Variable                                                          | Default                  | What it does                                                                                                                          |
+| ----------------------------------------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `NODE_ENV`                                                        | `development`            | Picks development, test, or production behavior.                                                                                      |
+| `PORT`                                                            | `3000`                   | The HTTP port.                                                                                                                        |
+| `PLATFORM_NAME`                                                   | `Agentic`                | The name shown on the API docs.                                                                                                       |
+| `CORS_ORIGINS`                                                    | empty                    | Browser sites allowed to call the API, separated by commas. Empty allows none.                                                        |
+| `SWAGGER_ENABLED`                                                 | on outside production    | Turns the API docs on. Set it yourself in production.                                                                                 |
+| `OBSERVE_ENABLED`                                                 | `false`                  | Turns on NestJS Observe.                                                                                                              |
+| `OBSERVE_APP_KEY`, `OBSERVE_APP_SECRET`, `OBSERVE_SERVICE_ID`     | empty                    | NestJS Observe login. Needed when `OBSERVE_ENABLED` is on.                                                                            |
+| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` | empty                    | Self-hosted Langfuse. Set all three to record traces there. Leave them empty to stay on the OpenAI dashboard.                         |
+| `COMPOSIO_API_KEY`                                                | empty                    | Composio project key. Empty leaves Gmail, Slack, and other connected apps off. The app starts without it.                             |
+| `ADMIN_API_KEY`                                                   | empty                    | Admin key for the admin routes: system prompts, monitoring, and ChatKit tokens. At least 32 characters. Empty keeps those routes off. |
+| `CHATKIT_SECRET`                                                  | empty                    | Signs ChatKit user tokens and file links. At least 32 characters. Empty keeps the ChatKit routes off.                                 |
+| `CHATKIT_TRANSCRIPTION_MODEL`                                     | `gpt-4o-mini-transcribe` | The model that turns ChatKit voice input into text.                                                                                   |
+| `CHATKIT_MAX_UPLOAD_BYTES`                                        | `10485760` (10 MB)       | The largest file a ChatKit user can upload, up to 50 MB.                                                                              |
+| `OPENAI_API_KEY`                                                  | required                 | Your OpenAI key. Every helper uses it. The app does not start without it.                                                             |
+| `DATABASE_URL`                                                    | empty                    | Your Postgres address. The app starts without it. Chats, saved approvals, and the webhook need it.                                    |
+| `OPENAI_HOSTED_MODEL`                                             | `gpt-6-astra`            | The model for a self-hosted session when you do not pick one.                                                                         |
+| `ACCOUNT_PASSWORD`                                                | empty                    | One login password the helper can use inside its computer. Empty means no password.                                                   |
+| `OPENAI_EXECUTOR_API_KEY`                                         | empty                    | The small key for a self-hosted computer. See Self-hosted.                                                                            |
+| `OPENAI_WEBHOOK_SECRET`                                           | empty                    | Proves a webhook really came from OpenAI. Empty rejects every webhook.                                                                |
+| `REMOTE_MACHINE_PROVIDER`                                         | `local`                  | Where the webhook starts a self-hosted computer: `local`, `aws`, `digitalocean`, `databricks`, or `oci`.                              |
 
 The AWS, DigitalOcean, Databricks, OCI, and Cloudflare settings are in `.env.example`. The Self-hosted and Choose the computer sections say when you need them.
 
@@ -93,19 +96,23 @@ The AWS, DigitalOcean, Databricks, OCI, and Cloudflare settings are in `.env.exa
 
 The app uses Postgres through Prisma. The database keeps durable workflow records shared by every app replica:
 
-| Table                     | What it keeps                                                                         | Key                                        |
-| ------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `chats`                   | One row per chat, with when it started and when it last moved.                        | The chat id you pick, like `chat-c-42`     |
-| `chat_items`              | Every chat message, so a helper remembers the chat.                                   | A counter, so messages stay in exact order |
-| `paused_runs`             | Approval checkpoints, execution status, owner, and recovery notes.                    | A stable UUID assigned before saving       |
-| `remote_machines`         | Which self-hosted machine belongs to which session.                                   | OpenAI's session id                        |
-| `hosted_webhooks`         | Verified events, retries, worker leases, and terminal records.                        | OpenAI event id                            |
-| `chat_history_operations` | Completed SDK history operations and their content digest.                            | Chat id + operation id                     |
-| `execution_locks`         | Which worker is running a chat, a saved run, or a machine change.                     | The lock name, like `chat:chat-c-42`       |
-| `expired_environments`    | Environments OpenAI said are gone, so they are never started again.                   | OpenAI's environment id                    |
-| `system_prompts`          | Custom system prompts saved through the API. Without a row, the default file is used. | The helper name, like `mssuzie`            |
-| `composio_sessions`       | Each user's Composio session, so a session id never comes from a request.             | The user id                                |
-| `agent_runs`              | One row per invocation: token deltas, time, result, and trace id. No message text.    | A UUID the database makes                  |
+| Table                     | What it keeps                                                                         | Key                                           |
+| ------------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `chats`                   | One row per chat, with when it started and when it last moved.                        | The chat id you pick, like `chat-c-42`        |
+| `chat_items`              | Every chat message, so a helper remembers the chat.                                   | A counter, so messages stay in exact order    |
+| `paused_runs`             | Approval checkpoints, execution status, owner, and recovery notes.                    | A stable UUID assigned before saving          |
+| `remote_machines`         | Which self-hosted machine belongs to which session.                                   | OpenAI's session id                           |
+| `hosted_webhooks`         | Verified events, retries, worker leases, and terminal records.                        | OpenAI event id                               |
+| `chat_history_operations` | Completed SDK history operations and their content digest.                            | Chat id + operation id                        |
+| `execution_locks`         | Which worker is running a chat, a saved run, or a machine change.                     | The lock name, like `chat:chat-c-42`          |
+| `expired_environments`    | Environments OpenAI said are gone, so they are never started again.                   | OpenAI's environment id                       |
+| `system_prompts`          | Custom system prompts saved through the API. Without a row, the default file is used. | The helper name, like `mssuzie`               |
+| `composio_sessions`       | Each user's Composio session, so a session id never comes from a request.             | The user id                                   |
+| `agent_runs`              | One row per invocation: token deltas, time, result, and trace id. No message text.    | A UUID the database makes                     |
+| `chatkit_threads`         | Each ChatKit chat, in ChatKit's own JSON shape, with its owner.                       | ChatKit's thread id, like `thr_…`             |
+| `chatkit_items`           | Every message, widget, and step in a ChatKit chat.                                    | Thread id + item id, with a counter for order |
+| `chatkit_attachments`     | Uploaded files: name, type, owner, and the bytes.                                     | ChatKit's attachment id, like `atc_…`         |
+| `chatkit_feedback`        | Thumbs up or down on a ChatKit answer, for evals.                                     | A UUID the database makes                     |
 
 How the tables are built:
 
@@ -660,6 +667,360 @@ const frontDesk = this.openai.createAgent(
 Each server keeps the text in memory for 5 seconds, so another server sees an edit within that time while the database is available. Local writes invalidate the cache, and an older in-flight read cannot restore the invalidated text. If the database is down, the helper keeps the last text it saw, then the built-in file. Saving needs `DATABASE_URL`.
 
 To add a helper, add `src/config/system-prompts/<name>.md` and list it in `src/config/system-prompts/index.ts`. Only names with a built-in file can be used with `forAgent`, so a helper is never left without a system prompt.
+
+</details>
+
+<details>
+<summary><h2>💬 ChatKit</h2></summary>
+
+[ChatKit](https://developers.openai.com/api/docs/guides/custom-chatkit) is OpenAI's ready-made chat window for websites. This app is its server. A customer on the Sunny Bakery site types "Do you have gluten-free bread?", and MsSuzie answers in the window, with streaming text, cards, buttons, file uploads, and voice input.
+
+```
+Bakery website (ChatKit window)  ──POST /v1/chatkit──▶  this app  ──▶  MsSuzie helper  ──▶  OpenAI
+        ▲                                                  │
+        └──────────── streamed answer (SSE) ───────────────┘   chats saved in Postgres
+```
+
+The code is in three places:
+
+| Folder                | What it is                                                                                                                                                                    |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/lib/chatkit`     | `chatkit.service.ts` is the ChatKit protocol, ported from OpenAI's Python `chatkit` package: requests, events, widgets, and the SDK bridge. `chatkit.types.ts` has its types. |
+| `src/config/chatkit`  | Sunny Bakery's setup: user tokens and file links (`chatkit.auth.ts`) and the Postgres store (`chatkit.store.ts`).                                                             |
+| `src/modules/chatkit` | The routes, and `MsSuzieChatKitService` in `chatkit.service.ts`, which answers every message.                                                                                 |
+
+### Turn it on
+
+1. Set `CHATKIT_SECRET` to a random value of at least 32 characters, like `openssl rand -base64 48`. Without it, every ChatKit route answers 403.
+2. Set `ADMIN_API_KEY`, so your own backend can ask for user tokens.
+3. Put the bakery website in `CORS_ORIGINS`, like `https://sunnybakery.example`. Without it, the browser blocks the requests.
+4. Add the website's domain to your OpenAI [domain allowlist](https://platform.openai.com/settings/organization/security/domain-allowlist). OpenAI gives you a `domainKey` for it.
+5. Run `bun run db:deploy` to add the four ChatKit tables.
+
+| Setting                       | Default                  | What it does                                               |
+| ----------------------------- | ------------------------ | ---------------------------------------------------------- |
+| `CHATKIT_SECRET`              | empty                    | Signs user tokens and file links. Empty keeps ChatKit off. |
+| `CHATKIT_TRANSCRIPTION_MODEL` | `gpt-4o-mini-transcribe` | The model that turns voice input into text.                |
+| `CHATKIT_MAX_UPLOAD_BYTES`    | `10485760` (10 MB)       | The largest file a user can upload, up to 50 MB.           |
+
+### Routes
+
+| Route                                     | Who calls it                     | What it does                                                         |
+| ----------------------------------------- | -------------------------------- | -------------------------------------------------------------------- |
+| `POST /v1/chatkit/tokens`                 | Your backend, with the admin key | Gives one signed-in user a short-lived ChatKit token.                |
+| `POST /v1/chatkit`                        | The ChatKit window               | Every chat request: messages, history, actions, feedback, and voice. |
+| `POST /v1/chatkit/attachments`            | The ChatKit window               | Direct upload of one file.                                           |
+| `POST /v1/chatkit/attachments/:id/upload` | The ChatKit window               | Second step of a two-phase upload, through a signed link.            |
+| `GET /v1/chatkit/attachments/:id/content` | The browser                      | Shows an image, or downloads a file, through a signed link.          |
+
+### Give each user a token
+
+The browser never sees the admin key. Your own backend checks who is logged in, then asks this app for a token for that person:
+
+```bash
+curl -X POST https://api.sunnybakery.example/v1/chatkit/tokens \
+  -H "x-admin-key: $ADMIN_API_KEY" -H "content-type: application/json" \
+  -d '{"userId": "customer-42", "ttlSeconds": 3600}'
+```
+
+```json
+{
+  "statusCode": 201,
+  "statusType": "CREATED",
+  "message": "Success",
+  "data": { "token": "eyJhbGciOi…", "expiresAt": "2026-10-27T10:00:00.000Z" }
+}
+```
+
+- `userId` comes from your login, never from the browser. Every chat and file belongs to it.
+- `ttlSeconds` is from 60 to 86400 (one day). The default is one hour. Ask for a new token before `expiresAt`.
+- The token is a standard HS256 JWT with `sub` (the user), `aud` `chatkit`, `iat`, and `exp`.
+
+### Put the window on the website
+
+React, with `@openai/chatkit-react`:
+
+```tsx
+import { ChatKit, useChatKit } from '@openai/chatkit-react';
+
+const API = 'https://api.sunnybakery.example';
+
+export function BakeryChat() {
+  const { control } = useChatKit({
+    api: {
+      url: `${API}/v1/chatkit`,
+      domainKey: 'domain_pk_…', // from the OpenAI domain allowlist
+      // Adds the user's token to every request, uploads included.
+      fetch: async (input, init) =>
+        fetch(input, {
+          ...init,
+          headers: {
+            ...init?.headers,
+            Authorization: `Bearer ${await getToken()}`,
+          },
+        }),
+      uploadStrategy: {
+        type: 'direct',
+        uploadUrl: `${API}/v1/chatkit/attachments`,
+      },
+    },
+    composer: { attachments: { enabled: true, maxCount: 3 } },
+  });
+  return <ChatKit control={control} className="h-[600px] w-[360px]" />;
+}
+```
+
+`getToken()` is your own function. It calls your backend, which calls `POST /v1/chatkit/tokens`, and keeps the token until shortly before `expiresAt`.
+
+Without React, load `https://cdn.platform.openai.com/deployments/chatkit/chatkit.js`, add an `<openai-chatkit>` element, and call `element.setOptions({ api: { … } })` with the same options.
+
+### Make it look like the bakery
+
+All of these go in the same options object, next to `api`. They change only the window, so the server needs nothing for them.
+
+```typescript
+useChatKit({
+  api: { … },
+  theme: {
+    colorScheme: 'light', // or 'dark'
+    color: {
+      accent: { primary: '#D97706', level: 2 },
+      grayscale: { hue: 30, tint: 2 },
+      surface: { background: '#FFFBF5', foreground: '#1F2937' },
+    },
+    radius: 'round', // 'pill', 'round', 'soft', or 'sharp'
+    density: 'normal', // 'compact', 'normal', or 'spacious'
+    typography: { fontFamily: "'Inter', sans-serif" },
+  },
+  startScreen: {
+    greeting: 'Welcome to Sunny Bakery!',
+    prompts: [
+      { name: 'Opening hours', prompt: 'When are you open today?', icon: 'calendar' },
+      { name: 'Order a cake', prompt: 'I want to order a birthday cake.', icon: 'write' },
+    ],
+  },
+  composer: {
+    placeholder: 'Ask about cakes, bread, or your order…',
+    attachments: { enabled: true, maxSize: 10 * 1024 * 1024, maxCount: 3, accept: { 'image/*': ['.png', '.jpg'] } },
+    tools: [{ id: 'order', label: 'Track order', icon: 'search', pinned: true }],
+    dictation: { enabled: true },
+  },
+  header: {
+    customButtonLeft: { icon: 'settings-cog', onClick: () => openSettings() },
+    customButtonRight: { icon: 'home', onClick: () => goHome() },
+  },
+  history: { enabled: true },
+  threadItemActions: { feedback: true, retry: true },
+  disclaimer: { text: 'MsSuzie can make mistakes. Check your order details.' },
+  locale: 'en-GB',
+  initialThread: savedThreadId, // or null for a new chat
+});
+```
+
+| Option              | What it changes                                                                           |
+| ------------------- | ----------------------------------------------------------------------------------------- |
+| `theme`             | Light or dark, accent and gray colors, surfaces, corner radius, spacing, and font.        |
+| `startScreen`       | The greeting and the starter prompts on a new chat.                                       |
+| `composer`          | Placeholder, attachments, tool menu, model picker, and voice input.                       |
+| `header`, `history` | The top bar, its custom buttons, and the list of old chats. Set `enabled: false` to hide. |
+| `threadItemActions` | Thumbs up and down (`feedback`) and the retry button (`retry`) under each answer.         |
+| `disclaimer`        | A short line under the composer.                                                          |
+| `entities`          | @-mentions: `onTagSearch`, `onClick`, and `onRequestPreview`. See below.                  |
+| `locale`            | The window's language. Without it, ChatKit uses the browser's.                            |
+| `initialThread`     | The chat to open first. Save the id from `chatkit.thread.change` to reopen it later.      |
+
+The window also sends events you can listen to: `chatkit.ready`, `chatkit.error`, `chatkit.response.start`, `chatkit.response.end`, `chatkit.thread.change`, `chatkit.thread.load.start`, `chatkit.thread.load.end`, `chatkit.effect`, and `chatkit.log`. On the web component, use `element.addEventListener('chatkit.thread.change', …)`. The React hook takes the same events as callbacks.
+
+### What the server does with each message
+
+`MsSuzieChatKitService` in `src/modules/chatkit/chatkit.service.ts` answers every message:
+
+1. A new chat is named after its first message, up to 60 characters.
+2. The last 50 items of the chat go to MsSuzie as history. Images go as pictures, and other files go with their name.
+3. MsSuzie uses her editable system prompt (see System prompts) and runs through `OpenaiService`, so `agent_runs`, traces, and prompt caching all work. Each turn is recorded with workflow `chatkit-turn` and the user's id.
+4. The answer streams back word by word. When it ends, every item is saved in `chatkit_items`.
+
+Only one answer runs per chat at a time, across all servers, so two quick messages never get mixed up.
+
+| What the user does                    | What happens on the server                                                                                 |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Presses stop                          | The run stops. Text that already arrived is kept, and MsSuzie is told the user stopped her.                |
+| Presses retry (`retry: true`)         | Items after the chosen message are removed, and MsSuzie answers it again.                                  |
+| Thumbs up or down (`feedback: true`)  | A row goes into `chatkit_feedback`, for evals. Only on the user's own chat.                                |
+| Speaks (`dictation`)                  | The audio is turned into text with `CHATKIT_TRANSCRIPTION_MODEL`, and the text lands in the composer.      |
+| Renames or deletes a chat             | The chat is updated or deleted, with its items and files.                                                  |
+| Picks a tool or model in the composer | It arrives as `input.inference_options` on the message. MsSuzie ignores it until you read it in `respond`. |
+
+> [!NOTE]
+> Voice input arrives as JSON, and the app keeps Nest's normal JSON size limit (100 KB). That fits about 20 seconds of speech. A longer clip gets 413.
+
+### Files and pictures
+
+Two ways to upload. Pick one with `uploadStrategy`:
+
+| Strategy                                                    | How it works                                                                                                   |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `{ type: 'direct', uploadUrl: '…/v1/chatkit/attachments' }` | The window sends the file in one request, with the user's token.                                               |
+| `{ type: 'two_phase' }`                                     | The window first asks for an upload link, then sends the file there. The link is signed, so it needs no token. |
+
+- The file and its bytes are saved in `chatkit_attachments`. Deleting the chat deletes its files.
+- Images get a `preview_url`. It is a signed link that only works for that file and its owner, so the image shows in the chat without a token.
+- Only PNG, JPEG, GIF, and WebP open in the page. Every other file downloads, so an uploaded web page can never run on this site.
+- Files larger than `CHATKIT_MAX_UPLOAD_BYTES`, empty files, and files without a type are refused with 400.
+
+### Cards and buttons (widgets)
+
+A tool can show a widget instead of plain text. The tool gets the chat through `runContext.context`, which is an `AgentContext`:
+
+```typescript
+import type {
+  AgentContext,
+  WidgetRoot,
+} from '@/lib/chatkit/chatkit.service.js';
+import { actionConfig } from '@/lib/chatkit/chatkit.service.js';
+
+const showCakes = tool({
+  name: 'show_cakes',
+  description: 'Show the cakes that can be ordered today.',
+  parameters: z.object({}),
+  execute: async (_input, runContext) => {
+    const chat = runContext?.context as AgentContext<ChatKitContext>;
+    chat.streamProgress('Checking the oven…', 'search');
+    const cakes: WidgetRoot = {
+      type: 'ListView',
+      children: todaysCakes.map((cake) => ({
+        type: 'ListViewItem',
+        children: [{ type: 'Text', value: `${cake.name} · £${cake.price}` }],
+        onClickAction: actionConfig('cake.order', { cakeId: cake.id }),
+      })),
+    };
+    await chat.streamWidget(cakes, 'Cakes for today');
+    return 'Showed the cakes.';
+  },
+});
+```
+
+| Helper on `AgentContext`                                                | What it does                                                            |
+| ----------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `streamWidget(widget, copyText?)`                                       | Shows a widget. Pass an async iterable to update it as it changes.      |
+| `streamProgress(text, icon?)`                                           | A short status line while a slow tool works. The next item replaces it. |
+| `startWorkflow`, `addWorkflowTask`, `updateWorkflowTask`, `endWorkflow` | A list of steps the user can open, like "Checked stock, booked oven".   |
+
+Widgets have two outer shapes, `Card` and `ListView`. Inside them you can use `Box`, `Row`, `Col`, `Text`, `Title`, `Caption`, `Markdown`, `Badge`, `Button`, `Icon`, `Image`, `Divider`, `Spacer`, `Select`, `DatePicker`, `Form`, `ListViewItem`, and `Transition`. `Text` and `Markdown` can stream. Design one in the [Widget Builder](https://widgets.chatkit.studio) and paste its JSON. The types come from `@openai/chatkit`, so a wrong field fails the type check.
+
+MsSuzie's tools go in `agent()` in `src/modules/chatkit/chatkit.service.ts`: `this.openai.createAgent('MsSuzie', …, { tools: [showCakes] })`.
+
+### Actions
+
+A button, a form, or a list item can send an action. `actionConfig(type, payload, options)` makes one.
+
+| Option            | Default    | What it does                                                                                  |
+| ----------------- | ---------- | --------------------------------------------------------------------------------------------- |
+| `handler`         | `'server'` | `'server'` sends it to `action()` here. `'client'` sends it to the page's `widgets.onAction`. |
+| `loadingBehavior` | `'auto'`   | What shows a spinner: `'self'`, `'container'`, `'none'`, or `'auto'` to let ChatKit pick.     |
+| `streaming`       | `true`     | `false` sends it to `syncAction()`, which updates the widget without a new answer.            |
+
+**On the server.** Add a branch to `action()` in `src/modules/chatkit/chatkit.service.ts`. The browser sends the payload, so check it with zod first, like the approval actions do. Never trust a price or an id just because it is in the payload.
+
+```typescript
+const cakeOrder = z.object({
+  type: z.literal('cake.order'),
+  payload: z.object({ cakeId: z.string() }),
+});
+
+// In action(), before the approval branch:
+const order = cakeOrder.safeParse(action);
+if (order.success) {
+  await this.orders.add(context.userId, order.data.payload.cakeId);
+  // Tell MsSuzie what happened, then let her answer.
+  await this.store.addThreadItem(
+    thread.id,
+    {
+      type: 'sdk_hidden_context',
+      id: this.store.generateItemId('sdk_hidden_context', thread, context),
+      thread_id: thread.id,
+      created_at: new Date().toISOString(),
+      content: 'The customer ordered a cake.',
+    },
+    context,
+  );
+  yield * this.respond(thread, undefined, context);
+  return;
+}
+```
+
+**Forms.** Every field inside a `Form`, or a `Card` with `asForm: true`, is added to the action's payload under its `name`. A name with dots makes nested keys. A field whose name is already in the payload is ignored.
+
+**On the page.** Use `handler: 'client'` for things only the page can do, like opening the cart. Send it on to the server when needed:
+
+```typescript
+widgets: {
+  async onAction(action, widgetItem) {
+    if (action.type === 'cart.open') openCart();
+    await chatkit.sendCustomAction(action, widgetItem.id); // optional
+  },
+},
+```
+
+### Approvals
+
+When MsSuzie calls a tool that needs a yes, like `cancelOrder`, the run pauses and saves itself (see Decide later). The chat shows a card with the tool and its inputs, and **Approve** and **Decline** buttons.
+
+- Only the user who owns the run can answer it. Anyone else gets "This request was already answered."
+- After a click, the card changes to "Approved." or "Declined.", and MsSuzie carries on.
+- A second click, or a click after a restart on another server, is safe. The saved run is claimed once.
+
+### Tools the browser runs (client tools)
+
+Some tools only the page can do, like reading the basket. Give MsSuzie a `clientTool` and stop the run there, so the page can answer:
+
+```typescript
+import {
+  clientTool,
+  clientToolStopBehavior,
+} from '@/lib/chatkit/chatkit.service.js';
+
+const readBasket = clientTool({
+  name: 'read_basket',
+  description: 'Read what is in the customer’s basket.',
+  parameters: { type: 'object', properties: {} },
+});
+
+this.openai.createAgent('MsSuzie', this.systemPrompts.forAgent('mssuzie'), {
+  tools: [readBasket],
+  toolUseBehavior: clientToolStopBehavior(['read_basket']),
+});
+```
+
+On the page, answer it with `onClientTool`. What you return goes back to MsSuzie, and she answers again:
+
+```typescript
+onClientTool: async ({ name }) => (name === 'read_basket' ? { items: basket.items } : {}),
+```
+
+### @-mentions (entities)
+
+With `entities.onTagSearch` on the page, a user can type `@` and pick something, like a cake or an order. MsSuzie sees the tag's text and its `data`. To show more, such as the order's status, extend `ThreadItemConverter.tagToMessageContent` in `src/modules/chatkit/chatkit.service.ts`.
+
+### Keep it safe
+
+- **One user, one set of chats.** Every read and write is checked against the token's user. Another user's chat id answers 404, never its content. A chat id that already belongs to someone else cannot be taken over.
+- **Secrets stay on the server.** Thread `metadata` is saved, but never sent to the browser. Hidden items, like the "user stopped" note, are never sent either.
+- **Short tokens.** At most one day. The admin key never reaches the browser.
+- **Signed file links.** A link works only for one file and its owner. A wrong signature answers 404, and deleting the file stops the link.
+- **Untrusted actions.** Check every action payload with zod. Errors inside a stream reach the browser as a short message, never as a stack trace.
+- **Language.** The window sends `Accept-Language`. The server keeps the first valid tag in `context.locale`, so `respond` can use it, for example to answer in French.
+
+### Tables
+
+| Table                 | What it keeps                                               |
+| --------------------- | ----------------------------------------------------------- |
+| `chatkit_threads`     | Each chat in ChatKit's own JSON shape, with its owner.      |
+| `chatkit_items`       | Messages, widgets, steps, and hidden notes, in exact order. |
+| `chatkit_attachments` | Uploaded files, their owner, and their bytes.               |
+| `chatkit_feedback`    | Thumbs up and down, with the items they are about.          |
+
+Items are stored as ChatKit's own JSON, so a new ChatKit version needs no migration. Deleting a chat deletes its items and files.
 
 </details>
 
@@ -1612,7 +1973,7 @@ DATABASE_URL="$TEST_DATABASE_URL" bun run db:deploy
 bun run test:integration
 ```
 
-The suite covers cross-worker exclusion, connection-loss recovery, idempotent history writes, transactional suffix replacement, and approval resumption after service reconstruction. It uses no paid model calls. Live provider behavior and workload latency still require environment-specific tests.
+The suite covers cross-worker exclusion, connection-loss recovery, idempotent history writes, transactional suffix replacement, and approval resumption after service reconstruction, and the ChatKit server over real HTTP: streaming, privacy between users, uploads, signed file links, and approvals. It uses no paid model calls. Live provider behavior and workload latency still require environment-specific tests.
 
 </details>
 

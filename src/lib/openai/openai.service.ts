@@ -45,6 +45,7 @@ import {
   TextOutput,
   Usage,
   Tool,
+  ToolUseBehavior,
   ToolGuardrailFunctionOutputFactory,
   ToolInputGuardrailTripwireTriggered,
   ToolOutputGuardrailTripwireTriggered,
@@ -130,6 +131,8 @@ type CreateAgentOptions<TSchema extends z.ZodObject | undefined = undefined> =
   AgentGuardrails & {
     model?: string;
     tools?: Tool[];
+    // When the run stops after a tool, such as a ChatKit client tool.
+    toolUseBehavior?: ToolUseBehavior;
     mcpServers?: MCPServer[];
     schema?: TSchema;
     handoffDescription?: string;
@@ -474,6 +477,9 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
       ...(options?.model && { model: options.model }),
       ...(options?.schema && { outputType: options.schema }),
       ...(options?.tools && { tools: options.tools }),
+      ...(options?.toolUseBehavior && {
+        toolUseBehavior: options.toolUseBehavior,
+      }),
       ...(options?.mcpServers && { mcpServers: options.mcpServers }),
       ...(options?.handoffDescription && {
         handoffDescription: options.handoffDescription,
@@ -860,7 +866,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
         'Saved runs require DatabaseSession so the session can be restored after a restart.',
       );
     }
-    const state = result.state.toString();
+    const state = serializeState(result.state);
     const row = await this.prisma.transaction((tx) =>
       tx.pausedRun.upsert({
         where: { id },
@@ -1247,7 +1253,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
                     },
                     data: {
                       status: 'running',
-                      state: (input as RunState<any, AnyAgent>).toString(),
+                      state: serializeState(input as RunState<any, AnyAgent>),
                       version: { increment: 1 },
                     },
                   }),
@@ -1318,7 +1324,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
                         status: 'running',
                       },
                       data: {
-                        state: result.state.toString(),
+                        state: serializeState(result.state),
                         status: result.interruptions.length
                           ? 'waiting'
                           : 'completed',
@@ -1532,6 +1538,22 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
 
   private apiKey() {
     return this.configService.getOrThrow<string>('OPENAI_API_KEY').trim();
+  }
+}
+
+//1. The SDK saves only plain JSON context. A context with toJSON(), like ChatKit's live
+//   AgentContext, is saved as what toJSON() returns, the same rule JSON.stringify follows.
+//2. toString() is synchronous, so no tool can see the swapped context.
+function serializeState(state: RunState<any, any>) {
+  const runContext = state._context as typeof state._context | undefined;
+  const live: unknown = runContext?.context;
+  const toJSON = (live as { toJSON?: unknown } | null)?.toJSON;
+  if (!runContext || typeof toJSON !== 'function') return state.toString();
+  runContext.context = toJSON.call(live);
+  try {
+    return state.toString();
+  } finally {
+    runContext.context = live;
   }
 }
 

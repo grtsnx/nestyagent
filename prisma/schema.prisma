@@ -207,3 +207,69 @@ model AgentRun {
   @@index([chatId, createdAt])
   @@map("agent_runs")
 }
+
+// A ChatKit conversation. data holds ChatKit's own thread shape as JSON, so a ChatKit
+// update needs no migration. Every row belongs to one user, and every query checks it.
+model ChatkitThread {
+  id          String              @id
+  userId      String              @map("user_id")
+  data        Json
+  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+  items       ChatkitItem[]
+  attachments ChatkitAttachment[]
+
+  // A user's threads, newest first.
+  @@index([userId, createdAt])
+  @@map("chatkit_threads")
+}
+
+// One ChatKit thread item as JSON. seq keeps items in the exact order they were added.
+model ChatkitItem {
+  threadId  String        @map("thread_id")
+  id        String
+  seq       BigInt        @default(autoincrement())
+  data      Json
+  createdAt DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  thread    ChatkitThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@id([threadId, id])
+  // A thread's items in order, for paging both ways.
+  @@index([threadId, seq])
+  @@map("chatkit_items")
+}
+
+// An uploaded file. content holds the bytes until the attachment or its thread is deleted.
+model ChatkitAttachment {
+  id        String         @id
+  userId    String         @map("user_id")
+  threadId  String?        @map("thread_id")
+  data      Json
+  content   Bytes?
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+  thread    ChatkitThread? @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([threadId])
+  @@map("chatkit_attachments")
+}
+
+enum ChatkitFeedbackKind {
+  positive
+  negative
+}
+
+// Thumbs up or down from the ChatKit window, for evals.
+model ChatkitFeedback {
+  id        String              @id @default(uuid(7)) @db.Uuid
+  userId    String              @map("user_id")
+  threadId  String              @map("thread_id")
+  itemIds   String[]            @map("item_ids")
+  kind      ChatkitFeedbackKind
+  createdAt DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([threadId])
+  @@index([createdAt])
+  @@map("chatkit_feedback")
+}

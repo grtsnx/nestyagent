@@ -98,6 +98,25 @@ const environmentSchema = z
     LANGFUSE_SECRET_KEY: optionalString(),
     LANGFUSE_BASE_URL: optionalString(),
     COMPOSIO_API_KEY: optionalString(),
+    // Signs ChatKit user tokens and file links. Long, so it cannot be guessed. ChatKit is off without it.
+    CHATKIT_SECRET: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z
+        .string()
+        .trim()
+        .min(32, 'CHATKIT_SECRET must be at least 32 characters')
+        .optional(),
+    ),
+    CHATKIT_TRANSCRIPTION_MODEL: optionalString(),
+    CHATKIT_MAX_UPLOAD_BYTES: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z.coerce
+        .number()
+        .int()
+        .min(1)
+        .max(50 * 1024 * 1024)
+        .optional(),
+    ),
     // Admin secret for the admin routes, such as editing system prompts. Long, so it cannot be guessed.
     ADMIN_API_KEY: z.preprocess(
       (value) => (value === '' ? undefined : value),

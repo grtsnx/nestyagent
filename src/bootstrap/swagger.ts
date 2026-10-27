@@ -3,19 +3,10 @@ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { apiReference } from '@scalar/nestjs-api-reference';
 import type { Request, Response } from 'express';
 import type { Environment } from '@/config/index.js';
+import { baseUrl } from '@/middleware';
 
 const apiVersions = ['1', '2'] as const;
 type ApiVersion = (typeof apiVersions)[number];
-
-// The site the docs were opened from, so "Try it" calls the same place.
-// Behind a proxy like Coolify, the forwarded headers give the public https address.
-function baseUrl(request: Request) {
-  const first = (header: string) =>
-    request.get(header)?.split(',')[0]?.trim() || undefined;
-  const protocol = first('x-forwarded-proto') ?? request.protocol;
-  const host = first('x-forwarded-host') ?? request.get('host');
-  return `${protocol}://${host}`;
-}
 
 export function configureSwagger(
   app: INestApplication,
@@ -32,6 +23,11 @@ export function configureSwagger(
         'Server',
         'These routes report whether the server is reachable, running, and ready to take traffic.',
       )
+      .addTag(
+        'ChatKit',
+        'These routes serve OpenAI ChatKit, the chat window for websites, from this server.',
+      )
+      .addBearerAuth()
       .addTag(
         'Admin',
         'These routes show what needs a person, how the helpers are doing, and what they cost.',

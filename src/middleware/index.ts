@@ -2,6 +2,7 @@ export {
   ApiFailure,
   ApiRateLimited,
   ApiSuccess,
+  baseUrl,
   RequestIdMiddleware,
   requestStore,
   describeException,

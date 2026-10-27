@@ -16,6 +16,7 @@ export default defineConfig({
       LANGFUSE_BASE_URL: '',
       TRACE_PAYLOADS: '',
       ADMIN_API_KEY: '',
+      CHATKIT_SECRET: '',
     },
   },
 });
