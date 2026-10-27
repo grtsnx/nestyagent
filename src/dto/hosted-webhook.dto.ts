@@ -1,20 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
 
+// What the webhook route returns inside data.
 export class HostedWebhookDto {
   @ApiProperty({ example: true })
   accepted: boolean;
-}
-
-export class HostedWebhookResponseDto {
-  @ApiProperty({ example: 200 })
-  statusCode: number;
-
-  @ApiProperty({ example: 'OK' })
-  statusType: string;
-
-  @ApiProperty({ example: 'Success' })
-  message: string;
-
-  @ApiProperty({ type: HostedWebhookDto })
-  data: HostedWebhookDto;
 }

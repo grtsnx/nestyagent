@@ -4,3 +4,4 @@ export {
   httpResponse,
   statusType,
 } from './http-response.js';
+export { ApiFailure, ApiRateLimited, ApiSuccess } from './api-docs.js';

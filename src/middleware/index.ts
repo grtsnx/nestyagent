@@ -1,4 +1,7 @@
 export {
+  ApiFailure,
+  ApiRateLimited,
+  ApiSuccess,
   RequestIdMiddleware,
   describeException,
   httpResponse,

@@ -78,6 +78,8 @@ export function configureSwagger(
       '.swagger-ui .info .title .api-theme-toggle:hover { opacity: .75; }',
     ].join('\n'),
     swaggerOptions: {
+      // Hide the Schemas list at the bottom. Each route shows its own example instead.
+      defaultModelsExpandDepth: -1,
       persistAuthorization: false,
       urls: apiVersions.map((version) => ({
         url: `/api/v${version}-json`,
@@ -162,7 +164,8 @@ export function configureSwagger(
           "style-src 'self' 'unsafe-inline'",
           "img-src 'self' data: blob:",
           "font-src 'self' data:",
-          "connect-src 'self'",
+          // The developer tools share the docs through Scalar's registry.
+          "connect-src 'self' https://*.scalar.com",
           "worker-src 'self' blob:",
           "object-src 'none'",
           "base-uri 'self'",
@@ -177,6 +180,7 @@ export function configureSwagger(
       darkMode: false,
       hideDarkModeToggle: true,
       pageTitle: `${environment.PLATFORM_NAME} API Reference`,
+      showDeveloperTools: 'always',
       sources: apiVersions.map((version, index) => ({
         default: index === 0,
         slug: `v${version}`,
