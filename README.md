@@ -327,6 +327,35 @@ The same call with no options names the tool `Summarizer`:
 const summarizeText = this.openai.asTool(summarizer);
 ```
 
+### Tool, schema, and handoff description together
+
+```typescript
+import { sampleSchema } from '@/config/schema';
+import { sampleTool } from '@/config/tools';
+
+const historyTutor = this.openai.createAgent(
+  'History tutor',
+  'You answer history questions clearly and concisely.',
+  {
+    model: 'gpt-6-astra',
+    tools: [sampleTool],
+    schema: sampleSchema,
+    handoffDescription: 'Specialist for historical questions',
+  },
+);
+
+const result = await this.openai.runAgent(
+  'Who was the first Roman emperor?',
+  historyTutor,
+  { context: { userId: '123' } },
+);
+```
+
+</details>
+
+<details>
+<summary><h2>🚧 Guardrails</h2></summary>
+
 ### Check the request
 
 `inputGuardrails` are optional. Leave them out when the request does not need a check. An input guardrail runs only when its agent is the first agent in the chain, so put it on the triage agent when a specialist takes over. `runInParallel` is optional. Leave it out to run the check alongside the agent. Pass `false` when the agent must wait until the check finishes.
@@ -558,30 +587,6 @@ const saved = this.openai.saveRun(result);
 const state = await this.openai.loadRun(support, saved);
 this.openai.approve({ state });
 const resumed = await this.openai.resumeAgent(support, state);
-```
-
-### Tool, schema, and handoff description together
-
-```typescript
-import { sampleSchema } from '@/config/schema';
-import { sampleTool } from '@/config/tools';
-
-const historyTutor = this.openai.createAgent(
-  'History tutor',
-  'You answer history questions clearly and concisely.',
-  {
-    model: 'gpt-6-astra',
-    tools: [sampleTool],
-    schema: sampleSchema,
-    handoffDescription: 'Specialist for historical questions',
-  },
-);
-
-const result = await this.openai.runAgent(
-  'Who was the first Roman emperor?',
-  historyTutor,
-  { context: { userId: '123' } },
-);
 ```
 
 </details>
