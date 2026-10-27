@@ -1,6 +1,7 @@
 import {
   ConflictException,
   Injectable,
+  Logger,
   Optional,
   OnModuleDestroy,
   OnModuleInit,
@@ -39,6 +40,7 @@ import {
   setDefaultOpenAIKey,
   StreamedRunResult,
   TextOutput,
+  Usage,
   Tool,
   ToolGuardrailFunctionOutputFactory,
   ToolInputGuardrailTripwireTriggered,
@@ -390,6 +392,7 @@ export function guardrailConfig(options?: AgentGuardrails): AgentGuardrails {
 
 @Injectable()
 export class OpenaiService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(OpenaiService.name);
   private sharedRunner?: Runner;
   private runnerModel?: string;
   private socketRunner?: Runner;
@@ -446,7 +449,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   // The agent's output type is the schema when one is passed, and text otherwise.
   createAgent<TSchema extends z.ZodObject | undefined = undefined>(
     name: string,
-    // Text, or a function such as InstructionsService.forAgent that reads the latest text.
+    // Text, or a function such as SystemPromptsService.forAgent that reads the latest text.
     instructions: string | (() => string | Promise<string>),
     options?: CreateAgentOptions<TSchema>,
   ) {
@@ -951,6 +954,44 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
     return row;
   }
 
+  //1. One row per run for the admin monitoring routes: tokens, time, and result. No message text.
+  //2. A failed write only logs, so monitoring can never break a customer's chat.
+  private async recordRun(run: {
+    agent: string;
+    started: number;
+    chatId?: string;
+    model?: string;
+    userId?: string;
+    traceId?: string;
+    requestId?: string;
+    result?: { interruptions?: unknown[]; state?: { usage?: Usage } };
+    error?: unknown;
+  }) {
+    if (!this.configService.get<string>('DATABASE_URL')) return;
+    const { started, result, error, ...ids } = run;
+    const usage = result?.state?.usage;
+    try {
+      await this.prisma.db.agentRun.create({
+        data: {
+          ...ids,
+          status: error
+            ? 'failed'
+            : result?.interruptions?.length
+              ? 'waiting'
+              : 'completed',
+          ...(error !== undefined && { error: describeError(error) }),
+          requests: usage?.requests ?? 0,
+          inputTokens: usage?.inputTokens ?? 0,
+          outputTokens: usage?.outputTokens ?? 0,
+          cachedTokens: cachedTokens(usage),
+          durationMs: Date.now() - started,
+        },
+      });
+    } catch {
+      this.logger.warn('A helper run could not be recorded for monitoring.');
+    }
+  }
+
   //1. Approve or reject each chosen pause, then hand back the state to resume.
   //2. Without a choice, every pause on the result is decided.
   private decide(
@@ -1187,10 +1228,25 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
               throw error;
             }
           };
+          const started = Date.now();
+          const recorded = {
+            agent: agent.name,
+            started,
+            ...(sessionId && { chatId: sessionId }),
+            ...(model && { model }),
+            ...(policy.userId && { userId: policy.userId }),
+            ...(traceId && { traceId }),
+            ...(requestId && { requestId }),
+          };
           try {
-            return this.langfuse
+            const result = this.langfuse
               ? await this.langfuse.withRun(note, run)
               : await run();
+            await this.recordRun({ ...recorded, result });
+            return result;
+          } catch (error) {
+            await this.recordRun({ ...recorded, error });
+            throw error;
           } finally {
             // SDK 0.21 does not end getOrCreateTrace on rejection. Always settle our trace,
             // while leaving a surrounding workflow's lifetime with its owner.
@@ -1367,4 +1423,19 @@ function historyDigest(value: unknown): string {
     normalize(JSON.parse(JSON.stringify(value))),
   );
   return createHash('sha256').update(canonical).digest('hex');
+}
+
+// Cached input tokens are listed per model request.
+function cachedTokens(usage?: Usage) {
+  return (usage?.inputTokensDetails ?? []).reduce(
+    (total, details) => total + Number(details?.cached_tokens ?? 0),
+    0,
+  );
+}
+
+// The error type and a short message, without stack traces.
+function describeError(error: unknown) {
+  const text =
+    error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  return text.slice(0, 300);
 }

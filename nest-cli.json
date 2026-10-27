@@ -5,7 +5,7 @@
     "deleteOutDir": true,
     "assets": [
       {
-        "include": "config/instructions/*.md",
+        "include": "config/system-prompts/*.md",
         "watchAssets": true
       }
     ]

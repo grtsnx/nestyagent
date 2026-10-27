@@ -98,7 +98,7 @@ const environmentSchema = z
     LANGFUSE_SECRET_KEY: optionalString(),
     LANGFUSE_BASE_URL: optionalString(),
     COMPOSIO_API_KEY: optionalString(),
-    // Admin secret for editing helper instructions. Long, so it cannot be guessed.
+    // Admin secret for the admin routes, such as editing system prompts. Long, so it cannot be guessed.
     ADMIN_API_KEY: z.preprocess(
       (value) => (value === '' ? undefined : value),
       z

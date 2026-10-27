@@ -5,9 +5,9 @@ import { IsInt, IsNotEmpty, IsString, MaxLength, Min } from 'class-validator';
 const SAMPLE =
   'You are MsSuzie’s assistant. You speak for MsSuzie, a personal tutoring company.';
 
-export class CreateInstructionDto {
+export class CreateSystemPromptDto {
   @ApiProperty({
-    description: 'This is the full instructions text the helper follows.',
+    description: 'This is the full system prompt the helper follows.',
     example: SAMPLE,
   })
   @IsString()
@@ -16,7 +16,7 @@ export class CreateInstructionDto {
   content: string;
 }
 
-export class UpdateInstructionDto extends CreateInstructionDto {
+export class UpdateSystemPromptDto extends CreateSystemPromptDto {
   @ApiProperty({
     description:
       'This is the version you read, so an edit made since then is not overwritten.',
@@ -27,7 +27,7 @@ export class UpdateInstructionDto extends CreateInstructionDto {
   version: number;
 }
 
-export class InstructionVersionDto {
+export class SystemPromptVersionDto {
   @ApiProperty({
     description:
       'This is the version you read, so an edit made since then is not removed.',

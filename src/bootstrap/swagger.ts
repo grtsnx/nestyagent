@@ -33,8 +33,12 @@ export function configureSwagger(
         'These routes report whether the server is reachable, running, and ready to take traffic.',
       )
       .addTag(
-        'Instructions',
-        'These routes let an admin read, change, and reset what each helper is told to do.',
+        'Admin',
+        'These routes show what needs a person, how the helpers are doing, and what they cost.',
+      )
+      .addTag(
+        'System prompts',
+        'These routes let an admin read, change, and reset each helper’s system prompt.',
       )
       .addApiKey({ type: 'apiKey', in: 'header', name: 'x-admin-key' }, 'admin')
       .addTag(

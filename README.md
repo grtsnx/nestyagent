@@ -61,25 +61,25 @@ Swagger UI opens at `http://localhost:3000/api`. Scalar opens at `http://localho
 
 The app checks these values before it starts. A bad port, a bad true/false value, or a bad CORS origin stops it.
 
-| Variable                                                          | Default               | What it does                                                                                                  |
-| ----------------------------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `NODE_ENV`                                                        | `development`         | Picks development, test, or production behavior.                                                              |
-| `PORT`                                                            | `3000`                | The HTTP port.                                                                                                |
-| `PLATFORM_NAME`                                                   | `Agentic`             | The name shown on the API docs.                                                                               |
-| `CORS_ORIGINS`                                                    | empty                 | Browser sites allowed to call the API, separated by commas. Empty allows none.                                |
-| `SWAGGER_ENABLED`                                                 | on outside production | Turns the API docs on. Set it yourself in production.                                                         |
-| `OBSERVE_ENABLED`                                                 | `false`               | Turns on NestJS Observe.                                                                                      |
-| `OBSERVE_APP_KEY`, `OBSERVE_APP_SECRET`, `OBSERVE_SERVICE_ID`     | empty                 | NestJS Observe login. Needed when `OBSERVE_ENABLED` is on.                                                    |
-| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` | empty                 | Self-hosted Langfuse. Set all three to record traces there. Leave them empty to stay on the OpenAI dashboard. |
-| `COMPOSIO_API_KEY`                                                | empty                 | Composio project key. Empty leaves Gmail, Slack, and other connected apps off. The app starts without it.     |
-| `ADMIN_API_KEY`                                                   | empty                 | Admin key for editing helper instructions. At least 32 characters. Empty keeps those routes off.              |
-| `OPENAI_API_KEY`                                                  | required              | Your OpenAI key. Every helper uses it. The app does not start without it.                                     |
-| `DATABASE_URL`                                                    | empty                 | Your Postgres address. The app starts without it. Chats, saved approvals, and the webhook need it.            |
-| `OPENAI_HOSTED_MODEL`                                             | `gpt-6-astra`         | The model for a self-hosted session when you do not pick one.                                                 |
-| `ACCOUNT_PASSWORD`                                                | empty                 | One login password the helper can use inside its computer. Empty means no password.                           |
-| `OPENAI_EXECUTOR_API_KEY`                                         | empty                 | The small key for a self-hosted computer. See Self-hosted.                                                    |
-| `OPENAI_WEBHOOK_SECRET`                                           | empty                 | Proves a webhook really came from OpenAI. Empty rejects every webhook.                                        |
-| `REMOTE_MACHINE_PROVIDER`                                         | `local`               | Where the webhook starts a self-hosted computer: `local`, `aws`, `digitalocean`, `databricks`, or `oci`.      |
+| Variable                                                          | Default               | What it does                                                                                                         |
+| ----------------------------------------------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `NODE_ENV`                                                        | `development`         | Picks development, test, or production behavior.                                                                     |
+| `PORT`                                                            | `3000`                | The HTTP port.                                                                                                       |
+| `PLATFORM_NAME`                                                   | `Agentic`             | The name shown on the API docs.                                                                                      |
+| `CORS_ORIGINS`                                                    | empty                 | Browser sites allowed to call the API, separated by commas. Empty allows none.                                       |
+| `SWAGGER_ENABLED`                                                 | on outside production | Turns the API docs on. Set it yourself in production.                                                                |
+| `OBSERVE_ENABLED`                                                 | `false`               | Turns on NestJS Observe.                                                                                             |
+| `OBSERVE_APP_KEY`, `OBSERVE_APP_SECRET`, `OBSERVE_SERVICE_ID`     | empty                 | NestJS Observe login. Needed when `OBSERVE_ENABLED` is on.                                                           |
+| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` | empty                 | Self-hosted Langfuse. Set all three to record traces there. Leave them empty to stay on the OpenAI dashboard.        |
+| `COMPOSIO_API_KEY`                                                | empty                 | Composio project key. Empty leaves Gmail, Slack, and other connected apps off. The app starts without it.            |
+| `ADMIN_API_KEY`                                                   | empty                 | Admin key for the admin routes: system prompts and monitoring. At least 32 characters. Empty keeps those routes off. |
+| `OPENAI_API_KEY`                                                  | required              | Your OpenAI key. Every helper uses it. The app does not start without it.                                            |
+| `DATABASE_URL`                                                    | empty                 | Your Postgres address. The app starts without it. Chats, saved approvals, and the webhook need it.                   |
+| `OPENAI_HOSTED_MODEL`                                             | `gpt-6-astra`         | The model for a self-hosted session when you do not pick one.                                                        |
+| `ACCOUNT_PASSWORD`                                                | empty                 | One login password the helper can use inside its computer. Empty means no password.                                  |
+| `OPENAI_EXECUTOR_API_KEY`                                         | empty                 | The small key for a self-hosted computer. See Self-hosted.                                                           |
+| `OPENAI_WEBHOOK_SECRET`                                           | empty                 | Proves a webhook really came from OpenAI. Empty rejects every webhook.                                               |
+| `REMOTE_MACHINE_PROVIDER`                                         | `local`               | Where the webhook starts a self-hosted computer: `local`, `aws`, `digitalocean`, `databricks`, or `oci`.             |
 
 The AWS, DigitalOcean, Databricks, OCI, and Cloudflare settings are in `.env.example`. The Self-hosted and Choose the computer sections say when you need them.
 
@@ -93,18 +93,19 @@ The AWS, DigitalOcean, Databricks, OCI, and Cloudflare settings are in `.env.exa
 
 The app uses Postgres through Prisma. The database keeps durable workflow records shared by every app replica:
 
-| Table                     | What it keeps                                                                       | Key                                        |
-| ------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------ |
-| `chats`                   | One row per chat, with when it started and when it last moved.                      | The chat id you pick, like `chat-c-42`     |
-| `chat_items`              | Every chat message, so a helper remembers the chat.                                 | A counter, so messages stay in exact order |
-| `paused_runs`             | Approval checkpoints, execution status, owner, and recovery notes.                  | A Prisma-generated UUIDv7                  |
-| `remote_machines`         | Which self-hosted machine belongs to which session.                                 | OpenAI's session id                        |
-| `hosted_webhooks`         | Verified events, retries, worker leases, and terminal records.                      | OpenAI event id                            |
-| `chat_history_operations` | Completed SDK history operations and their content digest.                          | Chat id + operation id                     |
-| `execution_locks`         | Which worker is running a chat, a saved run, or a machine change.                   | The lock name, like `chat:chat-c-42`       |
-| `expired_environments`    | Environments OpenAI said are gone, so they are never started again.                 | OpenAI's environment id                    |
-| `instructions`            | Custom instructions saved through the API. Without a row, the default file is used. | The helper name, like `mssuzie`            |
-| `composio_sessions`       | Each user's Composio session, so a session id never comes from a request.           | The user id                                |
+| Table                     | What it keeps                                                                         | Key                                        |
+| ------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------ |
+| `chats`                   | One row per chat, with when it started and when it last moved.                        | The chat id you pick, like `chat-c-42`     |
+| `chat_items`              | Every chat message, so a helper remembers the chat.                                   | A counter, so messages stay in exact order |
+| `paused_runs`             | Approval checkpoints, execution status, owner, and recovery notes.                    | A Prisma-generated UUIDv7                  |
+| `remote_machines`         | Which self-hosted machine belongs to which session.                                   | OpenAI's session id                        |
+| `hosted_webhooks`         | Verified events, retries, worker leases, and terminal records.                        | OpenAI event id                            |
+| `chat_history_operations` | Completed SDK history operations and their content digest.                            | Chat id + operation id                     |
+| `execution_locks`         | Which worker is running a chat, a saved run, or a machine change.                     | The lock name, like `chat:chat-c-42`       |
+| `expired_environments`    | Environments OpenAI said are gone, so they are never started again.                   | OpenAI's environment id                    |
+| `system_prompts`          | Custom system prompts saved through the API. Without a row, the default file is used. | The helper name, like `mssuzie`            |
+| `composio_sessions`       | Each user's Composio session, so a session id never comes from a request.             | The user id                                |
+| `agent_runs`              | One row per helper run: tokens, time, result, and trace id. No message text.          | A UUID the database makes                  |
 
 How the tables are built:
 
@@ -629,34 +630,59 @@ A person can decide later, too. The paused run is saved, the same way as [Decide
 </details>
 
 <details>
-<summary><h2>📝 Instructions</h2></summary>
+<summary><h2>📝 System prompts</h2></summary>
 
-A helper's instructions can be changed from Swagger or Scalar without a deploy. The built-in text lives in `src/config/instructions`, one Markdown file per helper, and MsSuzie's is `mssuzie.md`. A saved custom version replaces it. Delete the custom version and the built-in text comes back.
+A helper's system prompt can be changed from Swagger or Scalar without a deploy. The built-in text lives in `src/config/system-prompts`, one Markdown file per helper, and MsSuzie's is `mssuzie.md`. A saved custom version replaces it. Delete the custom version and the built-in text comes back.
 
 Set `ADMIN_API_KEY` to turn the routes on. Every request sends it in the `x-admin-key` header. In Swagger, click **Authorize** and paste the key once. Without the key set, the routes answer 403 and nothing can be changed.
 
-| Route                           | What it does                                                 |
-| ------------------------------- | ------------------------------------------------------------ |
-| `GET /v1/instructions`          | Lists each helper and whether it uses custom or default text |
-| `GET /v1/instructions/:name`    | Shows the text in use now                                    |
-| `POST /v1/instructions/:name`   | Saves a custom version                                       |
-| `PUT /v1/instructions/:name`    | Replaces the custom version                                  |
-| `DELETE /v1/instructions/:name` | Deletes the custom version, so the default is used again     |
+| Route                             | What it does                                                 |
+| --------------------------------- | ------------------------------------------------------------ |
+| `GET /v1/system-prompts`          | Lists each helper and whether it uses custom or default text |
+| `GET /v1/system-prompts/:name`    | Shows the text in use now                                    |
+| `POST /v1/system-prompts/:name`   | Saves a custom version                                       |
+| `PUT /v1/system-prompts/:name`    | Replaces the custom version                                  |
+| `DELETE /v1/system-prompts/:name` | Deletes the custom version, so the default is used again     |
 
 **Two people editing at once.** Every reply carries a `version`. Send that number back with `PUT` (in the body) or `DELETE` (as `?version=2`). If someone saved since you read it, you get 409 and their change is kept. Reload, then try again.
 
-**Use it in a helper.** Pass `forAgent` instead of fixed text. The helper reads the latest text before each model call, so a change applies to the next message.
+**Use it in a helper.** Import `SystemPromptsModule` (from `src/modules/system-prompts`) into your module, inject `SystemPromptsService`, and pass `forAgent` instead of fixed text. The helper reads the latest text before each model call, so a change applies to the next message.
 
 ```typescript
 const frontDesk = this.openai.createAgent(
   'MsSuzie',
-  this.instructions.forAgent('mssuzie'),
+  this.systemPrompts.forAgent('mssuzie'),
 );
 ```
 
 Each server keeps the text in memory for 5 seconds, so another server sees an edit within that time. If the database is down, the helper keeps the last text it saw, then the built-in file. Saving needs `DATABASE_URL`.
 
-To add a helper, add `src/config/instructions/<name>.md` and list it in `src/config/instructions/index.ts`. Only names with a built-in file can be used with `forAgent`, so a helper is never left without instructions.
+To add a helper, add `src/config/system-prompts/<name>.md` and list it in `src/config/system-prompts/index.ts`. Only names with a built-in file can be used with `forAgent`, so a helper is never left without a system prompt.
+
+</details>
+
+<details>
+<summary><h2>📊 Monitoring</h2></summary>
+
+The admin routes show what needs a person, how the helpers are doing, and what they cost. They use the same `ADMIN_API_KEY` and `x-admin-key` header as the system prompt routes, and they only read. They need `DATABASE_URL`.
+
+| Route                     | What it shows                                                                                                                            |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /v1/admin/overview`  | What needs a person now, and the last 24 hours: chats, messages, runs, failures, tokens, cache hits, speed                               |
+| `GET /v1/admin/usage`     | The same numbers per day and per model. `?days=14`, up to 90                                                                             |
+| `GET /v1/admin/runs`      | Recent helper runs, newest first. Filter with `?status=failed`, `?chatId=`, or `?agent=`                                                 |
+| `GET /v1/admin/approvals` | Runs waiting for a person, oldest first, with how long each has waited. `?status=recovery_required` lists runs a crash left for checking |
+| `GET /v1/admin/chats`     | The most recently active chats, with message and run counts                                                                              |
+| `GET /v1/admin/webhooks`  | OpenAI webhook events, their attempts, and their last error code                                                                         |
+| `GET /v1/admin/machines`  | Self-hosted machines, their provider, and their state                                                                                    |
+
+Every list takes `?limit=`, from 1 to 200.
+
+**Where the numbers come from.** Each helper run writes one row to `agent_runs` when it ends: the helper, the model, the tokens, cached tokens, how long it took, whether it finished, paused, or failed, and its trace id. Open that trace id in Langfuse or the OpenAI dashboard to see the whole run. If the row cannot be written, the chat still works and the server logs a warning.
+
+`cacheHitRate` is cached input tokens divided by all input tokens. A long chat should climb toward 1.
+
+**What is never shown.** No message text, no saved run state, no machine claim tokens, and no webhook lease tokens. A Guardian's words about a Learner stay out of the admin routes.
 
 </details>
 

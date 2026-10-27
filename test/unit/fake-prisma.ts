@@ -145,8 +145,9 @@ type FakeDb = {
   hostedWebhook: Table;
   chatHistoryOperation: Table;
   expiredEnvironment: Table;
-  instruction: Table;
+  systemPrompt: Table;
   composioSession: Table;
+  agentRun: Table;
   $queryRaw(sql: TemplateStringsArray, chatId: string): Promise<Row[]>;
   $transaction<T>(
     work: ((tx: FakeDb) => Promise<T>) | Promise<unknown>[],
@@ -189,7 +190,11 @@ export function fakePrisma() {
     })),
     chatHistoryOperation: new Table([]),
     composioSession: new Table(['userId', 'sessionId']),
-    instruction: new Table(['name'], () => ({
+    agentRun: new Table(['id'], () => ({
+      id: crypto.randomUUID(),
+      createdAt: new Date(),
+    })),
+    systemPrompt: new Table(['name'], () => ({
       version: 1,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -218,8 +223,9 @@ export function fakePrisma() {
         db.hostedWebhook,
         db.chatHistoryOperation,
         db.expiredEnvironment,
-        db.instruction,
+        db.systemPrompt,
         db.composioSession,
+        db.agentRun,
       ];
       const saved = tables.map((table) =>
         table.rows.map((row) => ({ ...row })),

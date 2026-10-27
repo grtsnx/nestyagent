@@ -1,8 +1,8 @@
 import { ConfigService } from '@nestjs/config';
 import type { ExecutionContext } from '@nestjs/common';
 import { describe, expect, it, vi } from 'vitest';
-import { defaultInstructions } from '@/config/instructions/index.js';
-import { InstructionsService } from '@/lib/instructions/instructions.service.js';
+import { defaultSystemPrompts } from '@/config/system-prompts/index.js';
+import { SystemPromptsService } from '@/modules/system-prompts/system-prompts.service.js';
 import { AdminKeyGuard } from '@/middleware/guards/admin-key.guard.js';
 import { fakePrisma } from './fake-prisma.js';
 
@@ -12,100 +12,103 @@ function service(env: Record<string, unknown> = { DATABASE_URL }) {
   const fake = fakePrisma();
   return {
     ...fake,
-    instructions: new InstructionsService(fake.prisma, new ConfigService(env)),
+    systemPrompts: new SystemPromptsService(
+      fake.prisma,
+      new ConfigService(env),
+    ),
   };
 }
 
-describe('InstructionsService', () => {
+describe('SystemPromptsService', () => {
   it('ships the MsSuzie prompt as the default', async () => {
-    const { instructions } = service();
-    expect(defaultInstructions.mssuzie).toContain(
+    const { systemPrompts } = service();
+    expect(defaultSystemPrompts.mssuzie).toContain(
       'You are MsSuzie’s assistant',
     );
-    await expect(instructions.get('mssuzie')).resolves.toMatchObject({
+    await expect(systemPrompts.get('mssuzie')).resolves.toMatchObject({
       source: 'default',
       version: null,
     });
   });
 
   it('creates, updates, and deletes a custom version, then falls back to the default', async () => {
-    const { instructions } = service();
-    const run = instructions.forAgent('mssuzie');
+    const { systemPrompts } = service();
+    const run = systemPrompts.forAgent('mssuzie');
 
-    await instructions.create('mssuzie', 'Be brief.');
+    await systemPrompts.create('mssuzie', 'Be brief.');
     expect(await run()).toBe('Be brief.');
-    await expect(instructions.get('mssuzie')).resolves.toMatchObject({
+    await expect(systemPrompts.get('mssuzie')).resolves.toMatchObject({
       source: 'custom',
       version: 1,
     });
 
-    await instructions.update('mssuzie', 'Be kind and brief.', 1);
+    await systemPrompts.update('mssuzie', 'Be kind and brief.', 1);
     expect(await run()).toBe('Be kind and brief.');
 
-    await expect(instructions.remove('mssuzie', 2)).resolves.toMatchObject({
+    await expect(systemPrompts.remove('mssuzie', 2)).resolves.toMatchObject({
       source: 'default',
     });
-    expect(await run()).toBe(defaultInstructions.mssuzie);
+    expect(await run()).toBe(defaultSystemPrompts.mssuzie);
   });
 
   it('refuses a second create and a stale update or delete', async () => {
-    const { instructions } = service();
-    await instructions.create('mssuzie', 'One.');
-    await expect(instructions.create('mssuzie', 'Two.')).rejects.toThrow(
+    const { systemPrompts } = service();
+    await systemPrompts.create('mssuzie', 'One.');
+    await expect(systemPrompts.create('mssuzie', 'Two.')).rejects.toThrow(
       /already exist/,
     );
-    await instructions.update('mssuzie', 'Two.', 1);
-    await expect(instructions.update('mssuzie', 'Three.', 1)).rejects.toThrow(
-      'These instructions changed. Reload version 2 and try again.',
+    await systemPrompts.update('mssuzie', 'Two.', 1);
+    await expect(systemPrompts.update('mssuzie', 'Three.', 1)).rejects.toThrow(
+      'This system prompt changed. Reload version 2 and try again.',
     );
-    await expect(instructions.remove('mssuzie', 1)).rejects.toThrow(
+    await expect(systemPrompts.remove('mssuzie', 1)).rejects.toThrow(
       /Reload version 2/,
     );
-    await expect(instructions.update('menu', 'New.', 1)).rejects.toThrow(
-      'No custom instructions named menu.',
+    await expect(systemPrompts.update('menu', 'New.', 1)).rejects.toThrow(
+      'No custom system prompt named menu.',
     );
   });
 
-  it('keeps custom-only instructions, and forgets them when deleted', async () => {
-    const { instructions } = service();
-    await instructions.create('menu', 'Answer about cakes.');
-    expect((await instructions.list()).map((item) => item.name)).toEqual([
+  it('keeps a custom-only system prompt, and forgets it when deleted', async () => {
+    const { systemPrompts } = service();
+    await systemPrompts.create('menu', 'Answer about cakes.');
+    expect((await systemPrompts.list()).map((item) => item.name)).toEqual([
       'menu',
       'mssuzie',
     ]);
-    await expect(instructions.remove('menu', 1)).resolves.toBeUndefined();
-    await expect(instructions.get('menu')).rejects.toThrow(
-      'No instructions named menu.',
+    await expect(systemPrompts.remove('menu', 1)).resolves.toBeUndefined();
+    await expect(systemPrompts.get('menu')).rejects.toThrow(
+      'No system prompt named menu.',
     );
-    expect(() => instructions.forAgent('menu')).toThrow(/default file/);
+    expect(() => systemPrompts.forAgent('menu')).toThrow(/default file/);
   });
 
   it('rejects names that are not simple slugs', async () => {
-    const { instructions } = service();
-    await expect(instructions.get('../etc/passwd')).rejects.toThrow(
+    const { systemPrompts } = service();
+    await expect(systemPrompts.get('../etc/passwd')).rejects.toThrow(
       /lowercase letters/,
     );
   });
 
   it('uses the default and refuses writes without a database', async () => {
-    const { instructions } = service({});
-    expect(await instructions.forAgent('mssuzie')()).toBe(
-      defaultInstructions.mssuzie,
+    const { systemPrompts } = service({});
+    expect(await systemPrompts.forAgent('mssuzie')()).toBe(
+      defaultSystemPrompts.mssuzie,
     );
-    await expect(instructions.create('mssuzie', 'Hi.')).rejects.toThrow(
-      'Saving instructions needs DATABASE_URL.',
+    await expect(systemPrompts.create('mssuzie', 'Hi.')).rejects.toThrow(
+      'Saving a system prompt needs DATABASE_URL.',
     );
   });
 
   it('keeps the last known text when the database is down', async () => {
-    const { db, instructions } = service();
-    await instructions.create('mssuzie', 'Saved text.');
-    const run = instructions.forAgent('mssuzie');
+    const { db, systemPrompts } = service();
+    await systemPrompts.create('mssuzie', 'Saved text.');
+    const run = systemPrompts.forAgent('mssuzie');
     expect(await run()).toBe('Saved text.');
 
     vi.useFakeTimers({ now: Date.now() + 10_000 });
     try {
-      vi.spyOn(db.instruction, 'findUnique').mockRejectedValue(
+      vi.spyOn(db.systemPrompt, 'findUnique').mockRejectedValue(
         new Error('ECONNREFUSED'),
       );
       expect(await run()).toBe('Saved text.');

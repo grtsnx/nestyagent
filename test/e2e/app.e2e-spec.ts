@@ -132,9 +132,16 @@ describe('AppController (e2e)', () => {
     ]);
   });
 
-  it('keeps instruction editing off without ADMIN_API_KEY', async () => {
+  it('keeps monitoring off without ADMIN_API_KEY', async () => {
+    await request(app.getHttpServer())
+      .get('/v1/admin/overview')
+      .set('x-admin-key', 'anything')
+      .expect(403);
+  });
+
+  it('keeps system prompt editing off without ADMIN_API_KEY', async () => {
     const response = await request(app.getHttpServer())
-      .get('/v1/instructions')
+      .get('/v1/system-prompts')
       .set('x-admin-key', 'anything')
       .expect(403);
     expect(response.body.message).toBe(

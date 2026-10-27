@@ -1,8 +1,9 @@
 import { Module } from '@nestjs/common';
-import { InstructionsModule } from './instructions/instructions.module.js';
+import { AdminModule } from './admin/admin.module.js';
+import { SystemPromptsModule } from './system-prompts/system-prompts.module.js';
 import { WebhookModule } from './webhook/webhook.module.js';
 
 @Module({
-  imports: [InstructionsModule, WebhookModule],
+  imports: [AdminModule, SystemPromptsModule, WebhookModule],
 })
 export class V1Module {}

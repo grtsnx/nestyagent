@@ -9,6 +9,7 @@ import {
   OutputGuardrailTripwireTriggered,
   Runner,
   RunConfig,
+  Usage,
   getDefaultModel,
   RunState,
   RunToolApprovalItem,
@@ -982,6 +983,68 @@ describe('OpenaiService storage and limits', () => {
       expect(tracePayloads(run)).toBe(true);
     } finally {
       decode.mockRestore();
+      run.mockRestore();
+    }
+  });
+
+  it('records each run for monitoring without any message text', async () => {
+    const { db, prisma } = fakePrisma();
+    const openai = service(prisma, { DATABASE_URL: 'postgresql://x' });
+    const agent = new Agent({
+      name: 'MsSuzie',
+      instructions: 'Help.',
+      model: 'gpt-6-astra',
+    });
+    const usage = new Usage({
+      requests: 2,
+      input_tokens: 1000,
+      output_tokens: 50,
+      total_tokens: 1050,
+      input_tokens_details: { cached_tokens: 768 },
+    });
+    const run = vi
+      .spyOn(Runner.prototype, 'run')
+      .mockResolvedValueOnce({
+        interruptions: [],
+        finalOutput: 'Hello.',
+        state: { usage, toString: () => 'done' },
+      } as never)
+      .mockRejectedValueOnce(new Error('Model unavailable.'));
+    try {
+      await openai.runAgent('Hi.', agent, { userId: 'guardian-7' });
+      await expect(openai.runAgent('Hi again.', agent)).rejects.toThrow();
+
+      expect(db.agentRun.rows).toMatchObject([
+        {
+          agent: 'MsSuzie',
+          model: 'gpt-6-astra',
+          userId: 'guardian-7',
+          status: 'completed',
+          requests: 2,
+          inputTokens: 1000,
+          outputTokens: 50,
+          cachedTokens: 768,
+        },
+        { status: 'failed', error: 'Error: Model unavailable.' },
+      ]);
+      expect(JSON.stringify(db.agentRun.rows)).not.toContain('Hi.');
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it('records nothing without a database', async () => {
+    const { db, prisma } = fakePrisma();
+    const run = vi
+      .spyOn(Runner.prototype, 'run')
+      .mockResolvedValue({ interruptions: [] } as never);
+    try {
+      await service(prisma).runAgent(
+        'Hi.',
+        new Agent({ name: 'MsSuzie', instructions: 'Help.' }),
+      );
+      expect(db.agentRun.rows).toEqual([]);
+    } finally {
       run.mockRestore();
     }
   });

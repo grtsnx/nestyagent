@@ -154,16 +154,16 @@ model ExpiredEnvironment {
   @@map("expired_environments")
 }
 
-// A helper's instructions, edited through the API. Without a row, the default file in
-// src/config/instructions is used. version guards against two people editing at once.
-model Instruction {
+// A helper's system prompt, edited through the API. Without a row, the default file in
+// src/config/system-prompts is used. version guards against two people editing at once.
+model SystemPrompt {
   name      String   @id
   content   String
   version   Int      @default(1)
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  @@map("instructions")
+  @@map("system_prompts")
 }
 
 // One Composio session per user, kept on the server. Callers never pass a session id,
@@ -175,4 +175,35 @@ model ComposioSession {
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   @@map("composio_sessions")
+}
+
+enum AgentRunStatus {
+  completed
+  waiting
+  failed
+}
+
+// One helper run, for the admin monitoring routes: tokens, time, result, and its trace.
+// It holds no message text, only numbers and ids.
+model AgentRun {
+  id           String         @id @default(uuid(7)) @db.Uuid
+  chatId       String?        @map("chat_id")
+  agent        String
+  model        String?
+  userId       String?        @map("user_id")
+  status       AgentRunStatus
+  error        String?
+  requests     Int            @default(0)
+  inputTokens  Int            @default(0) @map("input_tokens")
+  outputTokens Int            @default(0) @map("output_tokens")
+  cachedTokens Int            @default(0) @map("cached_tokens")
+  durationMs   Int            @map("duration_ms")
+  traceId      String?        @map("trace_id")
+  requestId    String?        @map("request_id")
+  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  // Usage by day and recent runs read by time; one chat's runs read by chat.
+  @@index([createdAt])
+  @@index([chatId, createdAt])
+  @@map("agent_runs")
 }
