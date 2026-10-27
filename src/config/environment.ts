@@ -66,6 +66,10 @@ const environmentSchema = z
       (value) => (value === '' ? undefined : value),
       z.string().trim().min(1).optional(),
     ),
+    OPENAI_EXECUTOR_API_KEY: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z.string().trim().min(1).optional(),
+    ),
   })
   .superRefine((environment, context) => {
     if (!environment.OBSERVE_ENABLED) return;
@@ -97,6 +101,7 @@ export interface Environment {
   SWAGGER_ENABLED: boolean;
   OPENAI_API_KEY?: string;
   ACCOUNT_PASSWORD?: string;
+  OPENAI_EXECUTOR_API_KEY?: string;
 }
 
 export function validateEnvironment(

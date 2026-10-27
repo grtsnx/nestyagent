@@ -23,16 +23,17 @@ Swagger UI runs at `http://localhost:3000/api`, and Scalar runs at `http://local
 
 The application validates configuration before it starts. Invalid ports, booleans, and CORS origins stop startup.
 
-| Variable          | Default               | Purpose                                                                     |
-| ----------------- | --------------------- | --------------------------------------------------------------------------- |
-| `NODE_ENV`        | `development`         | Selects development, test, or production behavior.                          |
-| `PORT`            | `3000`                | Sets the HTTP port.                                                         |
-| `PLATFORM_NAME`   | `Agentic`             | Names the API and OpenAPI document.                                         |
-| `CORS_ORIGINS`    | empty                 | Lists exact, comma-separated browser origins. Empty disables CORS.          |
-| `SWAGGER_ENABLED` | on outside production | Enables Swagger, Scalar, and OpenAPI JSON. Set it explicitly in production. |
-| `OBSERVE_ENABLED` | `false`               | Enables NestJS Observe when valid credentials are present.                  |
-| `OPENAI_API_KEY`  | empty                 | Authenticates every OpenAI agent. Blank leaves the shared key unset.        |
-| `ACCOUNT_PASSWORD` | empty                | Login secret for every workspace. Blank starts a workspace without one.     |
+| Variable                  | Default               | Purpose                                                                     |
+| ------------------------- | --------------------- | --------------------------------------------------------------------------- |
+| `NODE_ENV`                | `development`         | Selects development, test, or production behavior.                          |
+| `PORT`                    | `3000`                | Sets the HTTP port.                                                         |
+| `PLATFORM_NAME`           | `Agentic`             | Names the API and OpenAPI document.                                         |
+| `CORS_ORIGINS`            | empty                 | Lists exact, comma-separated browser origins. Empty disables CORS.          |
+| `SWAGGER_ENABLED`         | on outside production | Enables Swagger, Scalar, and OpenAPI JSON. Set it explicitly in production. |
+| `OBSERVE_ENABLED`         | `false`               | Enables NestJS Observe when valid credentials are present.                  |
+| `OPENAI_API_KEY`          | empty                 | Authenticates every OpenAI agent. Blank leaves the shared key unset.        |
+| `ACCOUNT_PASSWORD`        | empty                 | Login secret for every workspace. Blank starts a workspace without one.     |
+| `OPENAI_EXECUTOR_API_KEY` | empty                 | Codex environment key from the platform Agents tab. Blank leaves the executor unset. |
 
 Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS origins without paths.
 
@@ -298,7 +299,7 @@ const agent = this.sandbox.createSandboxAgent(
 
 ### Create a manifest
 
-`createManifest` builds the starting contents of a workspace. Call it with no argument for an empty computer. Pass `files` for text files, `repo` for a GitHub boilerplate to clone, `entries` for a mount, and `environment` for values the workspace needs at startup. Give the result to `openSandbox`.
+`createManifest` builds the starting contents of a workspace. Call it with no argument for an empty computer. Pass `files` for text files, `localFiles` or `localDirs` to copy from this Mac, `repo` or a `github` mount for a GitHub boilerplate, `outputDirs` for empty folders, `mounts` for cloud storage or Google Drive, and `environment` for startup values. Give the result to `openSandbox`.
 
 An empty computer, for browsing:
 
@@ -504,7 +505,8 @@ const agent = this.sandbox.createSandboxAgent(
     model: 'gpt-6-astra',
     memory: {
       generate: {
-        extraPrompt: 'Remember account names and open questions. Skip passwords.',
+        extraPrompt:
+          'Remember account names and open questions. Skip passwords.',
       },
     },
   },
@@ -527,6 +529,90 @@ ACCOUNT_PASSWORD=the-login-secret
 5. The agent reads `$ACCOUNT_PASSWORD` inside the computer when a login form needs it. Other environment values on the manifest stay in place.
 
 Leave the variable empty and step 3 skips it. The workspace starts without a password. The value is not written into the prompt, and a person does not type it on each message. Every workspace this app opens receives the same secret.
+
+### Mount GitHub or Google Drive
+
+A `github`, `gitlab`, or `bitbucket` mount clones that repo into the folder you name. GitBucket uses the same `/tree/<branch>` shape as GitHub, so pass that URL with `provider: 'github'`. A `google-drive` mount uses rclone, because the SDK has no Drive client of its own. `remote` defaults to `gdrive:`. Point `configFile` at an rclone config when the token is not already on the machine.
+
+```typescript
+const workspace = await this.sandbox.openSandbox(
+  createManifest({
+    mounts: {
+      app: {
+        provider: 'github',
+        url: 'https://github.com/owner/next-starter',
+        ref: 'main',
+      },
+      api: {
+        provider: 'gitlab',
+        url: 'https://gitlab.com/owner/api/-/tree/main',
+      },
+      web: {
+        provider: 'bitbucket',
+        url: 'https://bitbucket.org/owner/web/src/main',
+      },
+      notes: {
+        provider: 'google-drive',
+        remote: 'gdrive:client-notes',
+      },
+    },
+  }),
+);
+```
+
+`s3`, `gcs`, `r2`, `azure`, and `box` use the same `mounts` field with their own `provider`.
+
+### Choose the computer
+
+Unix is the default. Docker uses `node:latest`, so a new Node release arrives with the image and this file stays as it is. Pass `image` when a workspace needs a fixed tag.
+
+```typescript
+const workspace = await this.sandbox.openSandbox(createManifest(), {
+  computer: 'docker',
+  ports: [3000],
+});
+
+await this.sandbox.runSandbox('Start the site on port 3000.', agent, {
+  workspace,
+});
+
+const preview = await this.sandbox.previewUrl(workspace, 3000);
+```
+
+### Self-hosted session
+
+OpenAI runs this harness. `SandboxService` creates the session. This app keeps two keys.
+
+`OPENAI_API_KEY` stays in this app. It creates the session and sends messages. Grant it Agents read, Agents write, and Responses write. Add Vaults read and write only when you store secrets in a vault.
+
+`OPENAI_EXECUTOR_API_KEY` is the Codex environment key. `codex exec-server` reads it as `CODEX_API_KEY`. Agent-generated code can see that value, so it must not be the application key.
+
+Get the Codex key:
+
+1. Open the [OpenAI platform dashboard](https://platform.openai.com) for the same organization, project, and user or service account that will own the session.
+2. Open the Agents tab and create an environment key.
+3. Leave every permission at None except the one that connects environments, `api.agents.environments.connect`.
+4. Copy the key into `.env` as `OPENAI_EXECUTOR_API_KEY` and restart this app.
+5. Keep it out of source files, container images, and logs. Rotate or revoke it when it leaks.
+
+If the organization has an IP allowlist, add the environment's outbound address. A general API key fails with `403 missing required scope api.agents.environments.connect`.
+
+Install `@openai/codex@alpha` inside the environment, and allow outbound traffic to `https://api.openai.com` and `wss://codex-cloud-environments.chatgpt.com`.
+
+```typescript
+const session = await this.sandbox.createHostedSession(
+  'Write clean code and verify that it works.',
+);
+
+const executor = this.sandbox.startHostedExecutor(session);
+await this.sandbox.waitForHostedConnection(session.sessionId);
+const answer = await this.sandbox.sendToHostedSession(
+  session.sessionId,
+  'Add a test for the homepage.',
+);
+```
+
+Store `session.sessionId` with the chat. One session needs its own executor. On another machine, run `hostedExecutorCommand(session)` there instead of `startHostedExecutor`. Use `remoteUrl` unchanged when the executor reconnects.
 
 </details>
 

@@ -22,6 +22,17 @@ describe('validateEnvironment', () => {
     ).toBeUndefined();
   });
 
+  it('keeps a trimmed executor key and treats a blank value as unset', () => {
+    expect(
+      validateEnvironment({ OPENAI_EXECUTOR_API_KEY: '  ek-test  ' })
+        .OPENAI_EXECUTOR_API_KEY,
+    ).toBe('ek-test');
+    expect(
+      validateEnvironment({ OPENAI_EXECUTOR_API_KEY: '' })
+        .OPENAI_EXECUTOR_API_KEY,
+    ).toBeUndefined();
+  });
+
   it('keeps a trimmed OpenAI API key and treats a blank value as unset', () => {
     expect(
       validateEnvironment({ OPENAI_API_KEY: '  sk-test  ' }).OPENAI_API_KEY,
