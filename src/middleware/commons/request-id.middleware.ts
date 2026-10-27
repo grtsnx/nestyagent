@@ -1,5 +1,6 @@
 import { Injectable, type NestMiddleware } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
+import { requestStore } from '@/lib/langfuse/langfuse.service.js';
 
 const validRequestId = /^[A-Za-z0-9._-]{1,64}$/;
 
@@ -27,6 +28,6 @@ export class RequestIdMiddleware implements NestMiddleware {
 
     request.requestId = requestId;
     response.setHeader('x-request-id', requestId);
-    next();
+    requestStore.run({ requestId }, () => next());
   }
 }

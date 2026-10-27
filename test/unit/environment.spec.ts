@@ -99,4 +99,24 @@ describe('validateEnvironment', () => {
       }).OBSERVE_ENABLED,
     ).toBe(true);
   });
+
+  it('requires the full Langfuse trio and accepts a self-hosted URL', () => {
+    expect(() =>
+      validateEnvironment({ LANGFUSE_PUBLIC_KEY: 'pk-lf-test' }),
+    ).toThrow(/LANGFUSE_SECRET_KEY/);
+    expect(() =>
+      validateEnvironment({
+        LANGFUSE_PUBLIC_KEY: 'pk-lf-test',
+        LANGFUSE_SECRET_KEY: 'sk-lf-test',
+        LANGFUSE_BASE_URL: 'notaurl',
+      }),
+    ).toThrow(/LANGFUSE_BASE_URL/);
+    expect(
+      validateEnvironment({
+        LANGFUSE_PUBLIC_KEY: 'pk-lf-test',
+        LANGFUSE_SECRET_KEY: 'sk-lf-test',
+        LANGFUSE_BASE_URL: 'http://localhost:3100',
+      }).LANGFUSE_ENABLED,
+    ).toBe(true);
+  });
 });

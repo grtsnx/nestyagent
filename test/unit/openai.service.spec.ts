@@ -872,6 +872,60 @@ describe('OpenaiService storage and limits', () => {
     run.mockRestore();
   });
 
+  it('names each turn and groups it by the chat', async () => {
+    const openai = service();
+    const agent = new Agent({
+      name: 'Menu helper',
+      instructions: 'Menu.',
+      model: 'gpt-6-astra',
+    });
+    const session = openai.createSession('chat-c-42');
+    const run = vi
+      .spyOn(Runner.prototype, 'run')
+      .mockResolvedValue({
+        interruptions: [],
+        finalOutput: 'Tomorrow.',
+      } as never);
+    try {
+      await openai.runAgent('Where is my order?', agent, {
+        session,
+        userId: 'user-7',
+      });
+      expect(run.mock.calls[0]?.[2]).toMatchObject({
+        workflowName: 'agent-turn',
+        groupId: 'chat-c-42',
+        traceMetadata: {
+          agent: 'Menu helper',
+          user_id: 'user-7',
+          model: 'gpt-6-astra',
+        },
+      });
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it('attaches hosted and private MCP servers', () => {
+    const openai = service();
+    const hosted = openai.hostedMcp({
+      serverLabel: 'git',
+      serverUrl: 'https://example.com/mcp',
+    });
+    const remote = openai.httpMcp({
+      url: 'https://example.com/mcp',
+      name: 'files',
+    });
+    const local = openai.stdioMcp({ command: 'echo', name: 'files' });
+
+    expect(hosted.name).toBe('hosted_mcp');
+    expect(remote.name).toBe('files');
+    expect(local.name).toBe('files');
+    expect(
+      openai.createAgent('Files', 'Read files.', { mcpServers: [remote] })
+        .mcpServers,
+    ).toEqual([remote]);
+  });
+
   it('makes the helper wait for a message check unless told otherwise', () => {
     const openai = service();
     const check = async () => ({ tripwireTriggered: false, outputInfo: null });

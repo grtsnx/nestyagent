@@ -70,6 +70,7 @@ The app checks these values before it starts. A bad port, a bad true/false value
 | `SWAGGER_ENABLED`                                             | on outside production | Turns the API docs on. Set it yourself in production.                                                    |
 | `OBSERVE_ENABLED`                                             | `false`               | Turns on NestJS Observe.                                                                                 |
 | `OBSERVE_APP_KEY`, `OBSERVE_APP_SECRET`, `OBSERVE_SERVICE_ID` | empty                 | NestJS Observe login. Needed when `OBSERVE_ENABLED` is on.                                               |
+| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` | empty            | Self-hosted Langfuse. Set all three to record traces there. Leave them empty to stay on the OpenAI dashboard. |
 | `OPENAI_API_KEY`                                              | required              | Your OpenAI key. Every helper uses it. The app does not start without it.                                |
 | `DATABASE_URL`                                                | empty                 | Your Postgres address. The app starts without it. Chats, saved approvals, and the webhook need it.       |
 | `OPENAI_HOSTED_MODEL`                                         | `gpt-6-astra`         | The model for a self-hosted session when you do not pick one.                                            |
@@ -182,6 +183,38 @@ const menuHelper = this.openai.createAgent(
 ```
 
 Keep your own tools in `src/config/tools`. `sample.tool.ts` there is a starting template.
+
+### Call another project's tools
+
+A public MCP server is a tool OpenAI calls for you. A private one is a server this app connects to. Connect it with `useMcp`, then pass the active servers to the helper.
+
+```typescript
+const git = this.openai.hostedMcp({
+  serverLabel: 'git',
+  serverUrl: 'https://gitmcp.io/openai/codex',
+});
+
+const files = this.openai.httpMcp({
+  url: 'https://tools.example/mcp',
+  name: 'files',
+});
+
+await this.openai.useMcp([files], async (servers) => {
+  const helper = this.openai.createAgent('Files', 'Read the project files.', {
+    tools: [git],
+    mcpServers: servers,
+  });
+  await this.openai.runAgent('List the files.', helper);
+});
+```
+
+`stdioMcp` starts a local command instead of calling an HTTP server. `useMcp` closes every server when the function finishes.
+
+### See the run
+
+Each customer message is a trace named `agent-turn`. A chat id groups those traces into one session. Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` to send that record to your Langfuse. Leave them empty and the same traces stay on the OpenAI dashboard, still without model and tool payloads.
+
+`traceWorkflow` puts several runs in one trace. `span` records a step the helper does not already record.
 
 ### Get a filled-in form back
 

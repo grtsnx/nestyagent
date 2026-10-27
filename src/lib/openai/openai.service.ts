@@ -1,6 +1,7 @@
 import {
   ConflictException,
   Injectable,
+  Optional,
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
@@ -12,10 +13,16 @@ import {
   Agent,
   AgentInputItem,
   AgentOutputType,
+  connectMcpServers,
   defineToolInputGuardrail,
   defineToolOutputGuardrail,
+  getCurrentTrace,
+  getOrCreateTrace,
+  hostedMcpTool,
   InputGuardrail,
   InputGuardrailTripwireTriggered,
+  MCPServerStdio,
+  MCPServerStreamableHttp,
   ModelSettings,
   OpenAIProvider,
   OutputGuardrail,
@@ -34,9 +41,13 @@ import {
   ToolGuardrailFunctionOutputFactory,
   ToolInputGuardrailTripwireTriggered,
   ToolOutputGuardrailTripwireTriggered,
+  withCustomSpan,
+  withTrace,
 } from '@openai/agents';
+import type { MCPServer } from '@openai/agents';
 import type { SandboxRunConfig } from '@openai/agents/sandbox';
 import type { Prisma } from '@/generated/prisma/client.js';
+import { LangfuseService, requestStore } from '../langfuse/langfuse.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 
 const RUN_GONE = 'This paused run was already taken or does not exist.';
@@ -61,6 +72,10 @@ type ResumeOptions = {
   signal?: AbortSignal;
   maxTurns?: number;
   previousResponseId?: string;
+  promptCacheKey?: string;
+  userId?: string;
+  workflowName?: string;
+  groupId?: string;
   outputGuardrailBlockedMessage?:
     string | OutputGuardrailBlockedMessageFormatter;
 };
@@ -81,6 +96,10 @@ const storedOptionsSchema = z.object({
   websocket: z.boolean().optional(),
   maxTurns: z.number().int().positive().optional(),
   outputGuardrailBlockedMessage: z.string().optional(),
+  promptCacheKey: z.string().optional(),
+  userId: z.string().optional(),
+  workflowName: z.string().optional(),
+  groupId: z.string().optional(),
   historyLimits: z
     .object({
       maxItems: z.number().int().positive().optional(),
@@ -101,6 +120,7 @@ type CreateAgentOptions<TSchema extends z.ZodObject | undefined = undefined> =
   AgentGuardrails & {
     model?: string;
     tools?: Tool[];
+    mcpServers?: MCPServer[];
     schema?: TSchema;
     handoffDescription?: string;
     modelSettings?: ModelSettings;
@@ -342,11 +362,12 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   private apiClient?: OpenAI;
   private readonly runMetadata = new WeakMap<object, RunMetadata>();
   private readonly shutdown = new AbortController();
-  private readonly socketProviders = new Set<OpenAIProvider>();
+  private socketModelProvider?: OpenAIProvider;
 
   constructor(
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
+    @Optional() private readonly langfuse?: LangfuseService,
   ) {}
 
   // Set the default OpenAI key
@@ -356,10 +377,9 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleDestroy() {
     this.shutdown.abort(new Error('Application is shutting down.'));
-    await Promise.allSettled(
-      [...this.socketProviders].map((provider) => provider.close()),
-    );
-    this.socketProviders.clear();
+    await this.socketModelProvider?.close().catch(() => undefined);
+    this.socketModelProvider = undefined;
+    this.socketRunner = undefined;
   }
 
   // One OpenAI client for the hosted session API. It uses the same key as the agents.
@@ -372,7 +392,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   //2. It applies to every later run in this app, so call it once at startup.
   createRunner(model: string) {
     this.runnerModel = model;
-    this.sharedRunner = new Runner({ model, traceIncludeSensitiveData: false });
+    this.sharedRunner = new Runner(this.runnerConfig());
     this.socketRunner = undefined;
     return this.sharedRunner;
   }
@@ -403,11 +423,71 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
       ...(options?.model && { model: options.model }),
       ...(options?.schema && { outputType: options.schema }),
       ...(options?.tools && { tools: options.tools }),
+      ...(options?.mcpServers && { mcpServers: options.mcpServers }),
       ...(options?.handoffDescription && {
         handoffDescription: options.handoffDescription,
       }),
       ...guardrailConfig(options),
     }) as unknown as Agent<unknown, OutputOf<TSchema>>;
+  }
+
+  // A public MCP server the model calls through OpenAI. This process does not open the connection.
+  hostedMcp(options: Parameters<typeof hostedMcpTool>[0]) {
+    return hostedMcpTool(options);
+  }
+
+  // A private MCP server this process starts. Call useMcp before the agent runs, and it closes the server after.
+  stdioMcp(options: ConstructorParameters<typeof MCPServerStdio>[0]) {
+    return new MCPServerStdio(options);
+  }
+
+  // A private MCP server this process reaches over HTTP. Call useMcp before the agent runs.
+  httpMcp(options: ConstructorParameters<typeof MCPServerStreamableHttp>[0]) {
+    return new MCPServerStreamableHttp(options);
+  }
+
+  //1. Connect every server, run the function with the ones that connected, then close them.
+  //2. Pass the active list to createAgent as mcpServers.
+  async useMcp<T>(
+    servers: MCPServer[],
+    run: (servers: MCPServer[]) => Promise<T>,
+  ) {
+    const group = await connectMcpServers(servers);
+    try {
+      return await run(group.active);
+    } finally {
+      await group.close();
+    }
+  }
+
+  // Several runs share one trace. Leave this out when each customer message should be its own trace.
+  async traceWorkflow<T>(
+    name: string,
+    run: () => Promise<T>,
+    options?: {
+      groupId?: string;
+      userId?: string;
+      metadata?: Record<string, string>;
+    },
+  ) {
+    return await withTrace(name, async () => run(), {
+      ...(options?.groupId && { groupId: options.groupId }),
+      metadata: {
+        ...options?.metadata,
+        ...(options?.userId && { user_id: options.userId }),
+      },
+    });
+  }
+
+  // A step the Agents SDK does not already record, such as claiming an approval.
+  async span<T>(
+    name: string,
+    run: () => Promise<T>,
+    data?: Record<string, string>,
+  ) {
+    return await withCustomSpan(async () => run(), {
+      data: { name, data: data ?? {} },
+    });
   }
 
   //1. Optional check before the agent starts. It runs only when this agent is first.
@@ -710,6 +790,12 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
           ...(typeof policy.outputGuardrailBlockedMessage === 'string' && {
             outputGuardrailBlockedMessage: policy.outputGuardrailBlockedMessage,
           }),
+          ...(policy.promptCacheKey && {
+            promptCacheKey: policy.promptCacheKey,
+          }),
+          ...(policy.userId && { userId: policy.userId }),
+          ...(policy.workflowName && { workflowName: policy.workflowName }),
+          ...(policy.groupId && { groupId: policy.groupId }),
           ...(session && { historyLimits: session.limits }),
         },
       },
@@ -850,7 +936,12 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
         );
       }
     }
-    const runner = this.runner(policy.websocket);
+    // One cache key per chat, as the prompt caching guide advises: separate cache use per customer.
+    const runner = this.runner(
+      policy.websocket,
+      agent,
+      policy.promptCacheKey ?? (await session?.getSessionId()),
+    );
     let deliver!: (result: StreamedRunResult<unknown, AnyAgent>) => void;
     let rejectDelivery!: (error: unknown) => void;
     const ready = policy.stream
@@ -883,96 +974,145 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
             'This chat has a pending approval or interrupted run. Resume or reconcile it first.',
           );
       }
-      if (saved) {
-        const claim = await this.prisma.db.pausedRun.updateMany({
-          where: { id: saved.id, version: saved.version, status: 'waiting' },
-          data: {
-            status: 'running',
-            state: (input as RunState<any, AnyAgent>).toString(),
-            version: { increment: 1 },
-          },
-        });
-        if (claim.count !== 1)
-          throw new ConflictException(
-            'This checkpoint is stale or already running. Reload the saved run.',
-          );
-        claimedVersion = saved.version + 1;
-      }
-      try {
-        const runOptions = {
-          context: policy.context,
-          session,
-          signal,
-          maxTurns: policy.maxTurns,
-          outputGuardrailBlockedMessage: policy.outputGuardrailBlockedMessage,
-          sandbox: policy.sandbox,
-          ...(input instanceof RunState || !policy.previousResponseId
-            ? {}
-            : { previousResponseId: policy.previousResponseId }),
-        };
-        const result = policy.stream
-          ? await runner.run(agent, input, { ...runOptions, stream: true })
-          : await runner.run(agent, input, runOptions);
-        if (policy.stream) {
-          const streamed = result as StreamedRunResult<unknown, AnyAgent>;
-          // Capture the SDK promise before exposing completion that includes persistence and unlock.
-          const sdkCompletion = streamed.completed;
-          deliver(streamed);
-          await sdkCompletion;
-        }
-        signal?.throwIfAborted();
-        if (result.state) {
-          this.runMetadata.set(result.state, {
-            options: policy,
-            agentName: agent.name,
-          });
-          if (saved) {
-            const persisted = await this.prisma.db.pausedRun.updateMany({
-              where: {
-                id: saved.id,
-                version: claimedVersion,
-                status: 'running',
-              },
-              data: {
-                state: result.state.toString(),
-                status: result.interruptions.length ? 'waiting' : 'completed',
-                version: { increment: 1 },
-              },
+      const sessionId =
+        policy.groupId ?? (session ? await session.getSessionId() : undefined);
+      const requestId = requestStore.getStore()?.requestId;
+      const model =
+        typeof agent.model === 'string' ? agent.model : this.runnerModel;
+      const traceMetadata: Record<string, string> = {
+        agent: agent.name,
+        ...(requestId && { request_id: requestId }),
+        ...(policy.userId && { user_id: policy.userId }),
+        ...(model && { model }),
+      };
+      const joined = getCurrentTrace();
+      const userText = userTurn(input);
+      return await getOrCreateTrace(
+        async () => {
+          const traceId = getCurrentTrace()?.traceId;
+          if (traceId) {
+            this.langfuse?.note(traceId, {
+              ...(userText !== undefined && { input: userText }),
+              ...(sessionId && { sessionId }),
+              ...(policy.userId && { userId: policy.userId }),
+              ...(requestId && { requestId }),
+              ...(model && { model }),
+              agent: agent.name,
             });
-            if (persisted.count !== 1)
-              throw new ConflictException(
-                'The run checkpoint changed before completion.',
-              );
-            this.runMetadata.set(result.state, {
-              options: policy,
-              agentName: agent.name,
-              saved: { id: saved.id, version: claimedVersion! + 1 },
-            });
-          } else if (
-            session instanceof DatabaseSession &&
-            result.interruptions.length
-          ) {
-            await this.saveRun(result, policy);
           }
-        }
-        return result;
-      } catch (error) {
-        if (saved && claimedVersion !== undefined) {
-          // Keep the last known checkpoint; never replay an uncertain side effect automatically.
-          await this.prisma.db.pausedRun
-            .updateMany({
-              where: {
-                id: saved.id,
-                version: claimedVersion,
-                status: 'running',
-              },
-              data: { status: 'recovery_required' },
-            })
-            .catch(() => {});
-          // If the database is down, the durable 'running' marker also requires reconciliation.
-        }
-        throw error;
-      }
+          if (saved) {
+            await this.span('claim-approval', async () => {
+              const claim = await this.prisma.db.pausedRun.updateMany({
+                where: {
+                  id: saved.id,
+                  version: saved.version,
+                  status: 'waiting',
+                },
+                data: {
+                  status: 'running',
+                  state: (input as RunState<any, AnyAgent>).toString(),
+                  version: { increment: 1 },
+                },
+              });
+              if (claim.count !== 1)
+                throw new ConflictException(
+                  'This checkpoint is stale or already running. Reload the saved run.',
+                );
+              claimedVersion = saved.version + 1;
+            });
+          }
+          try {
+            const runOptions = {
+              context: policy.context,
+              session,
+              signal,
+              maxTurns: policy.maxTurns,
+              outputGuardrailBlockedMessage:
+                policy.outputGuardrailBlockedMessage,
+              sandbox: policy.sandbox,
+              ...(joined
+                ? {}
+                : { workflowName: policy.workflowName ?? 'agent-turn' }),
+              ...(sessionId && { groupId: sessionId }),
+              traceMetadata,
+              ...(input instanceof RunState || !policy.previousResponseId
+                ? {}
+                : { previousResponseId: policy.previousResponseId }),
+            };
+            const result = policy.stream
+              ? await runner.run(agent, input, { ...runOptions, stream: true })
+              : await runner.run(agent, input, runOptions);
+            if (policy.stream) {
+              const streamed = result as StreamedRunResult<unknown, AnyAgent>;
+              // Capture the SDK promise before exposing completion that includes persistence and unlock.
+              const sdkCompletion = streamed.completed;
+              deliver(streamed);
+              await sdkCompletion;
+            }
+            if (traceId && result.finalOutput !== undefined)
+              this.langfuse?.note(traceId, { output: result.finalOutput });
+            signal?.throwIfAborted();
+            if (result.state) {
+              this.runMetadata.set(result.state, {
+                options: policy,
+                agentName: agent.name,
+              });
+              if (saved) {
+                const persisted = await this.prisma.db.pausedRun.updateMany({
+                  where: {
+                    id: saved.id,
+                    version: claimedVersion,
+                    status: 'running',
+                  },
+                  data: {
+                    state: result.state.toString(),
+                    status: result.interruptions.length
+                      ? 'waiting'
+                      : 'completed',
+                    version: { increment: 1 },
+                  },
+                });
+                if (persisted.count !== 1)
+                  throw new ConflictException(
+                    'The run checkpoint changed before completion.',
+                  );
+                this.runMetadata.set(result.state, {
+                  options: policy,
+                  agentName: agent.name,
+                  saved: { id: saved.id, version: claimedVersion! + 1 },
+                });
+              } else if (
+                session instanceof DatabaseSession &&
+                result.interruptions.length
+              ) {
+                await this.saveRun(result, policy);
+              }
+            }
+            return result;
+          } catch (error) {
+            if (saved && claimedVersion !== undefined) {
+              // Keep the last known checkpoint; never replay an uncertain side effect automatically.
+              await this.prisma.db.pausedRun
+                .updateMany({
+                  where: {
+                    id: saved.id,
+                    version: claimedVersion,
+                    status: 'running',
+                  },
+                  data: { status: 'recovery_required' },
+                })
+                .catch(() => {});
+              // If the database is down, the durable 'running' marker also requires reconciliation.
+            }
+            throw error;
+          }
+        },
+        {
+          name: policy.workflowName ?? 'agent-turn',
+          ...(sessionId && { groupId: sessionId }),
+          metadata: traceMetadata,
+        },
+      );
     };
     const locks = [
       ...(saved ? [`run:${saved.id}`] : []),
@@ -992,24 +1132,44 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
     return streamed;
   }
 
-  // The socket runner, the shared runner from createRunner, or the SDK's plain default.
-  private runner(websocket?: boolean) {
-    if (websocket) return this.webSocketRunner();
-    this.sharedRunner ??= new Runner({ traceIncludeSensitiveData: false });
-    return this.sharedRunner;
+  //1. The socket runner, the shared runner from createRunner, or the SDK's plain default.
+  //2. With a prompt cache key, a light runner for this one run sends prompt_cache_key.
+  //3. The key travels in providerData, which replaces an agent's own, so the agent's is copied in.
+  //   An agent reached by handoff keeps only the key, not its own providerData.
+  private runner(
+    websocket?: boolean,
+    agent?: AnyAgent,
+    promptCacheKey?: string,
+  ) {
+    const config = this.runnerConfig(websocket);
+    if (promptCacheKey)
+      return new Runner({
+        ...config,
+        modelSettings: {
+          providerData: {
+            ...agent?.modelSettings?.providerData,
+            prompt_cache_key: promptCacheKey,
+          },
+        },
+      });
+    if (websocket) return (this.socketRunner ??= new Runner(config));
+    return (this.sharedRunner ??= new Runner(config));
   }
 
-  // Built once and reused, so later runs share the same socket provider.
-  private webSocketRunner() {
-    if (this.socketRunner) return this.socketRunner;
-    const provider = new OpenAIProvider({ useResponsesWebSocket: true });
-    this.socketProviders.add(provider);
-    this.socketRunner = new Runner({
+  // What every runner shares. All socket runs reuse one socket provider.
+  private runnerConfig(websocket?: boolean) {
+    return {
       ...(this.runnerModel && { model: this.runnerModel }),
       traceIncludeSensitiveData: false,
-      modelProvider: provider,
+      ...(websocket && { modelProvider: this.socketProvider() }),
+    };
+  }
+
+  private socketProvider() {
+    this.socketModelProvider ??= new OpenAIProvider({
+      useResponsesWebSocket: true,
     });
-    return this.socketRunner;
+    return this.socketModelProvider;
   }
 
   private apiKey() {
@@ -1019,6 +1179,19 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
 
 function isUserMessage(item: AgentInputItem) {
   return 'role' in item && item.role === 'user';
+}
+
+function userTurn(
+  input: string | AgentInputItem[] | RunState<any, Agent<any, any>>,
+) {
+  if (typeof input === 'string') return input;
+  if (!Array.isArray(input)) return undefined;
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = input[index];
+    if (item && isUserMessage(item) && typeof item.content === 'string')
+      return item.content;
+  }
+  return undefined;
 }
 
 // Normalize object key order so JSONB round-trips preserve operation identity.

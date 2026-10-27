@@ -94,22 +94,54 @@ const environmentSchema = z
     OCI_SANDBOX_CREATE_URL: optionalString(),
     CLOUDFLARE_SANDBOX_WORKER_URL: optionalString(),
     CLOUDFLARE_SANDBOX_API_KEY: optionalString(),
+    LANGFUSE_PUBLIC_KEY: optionalString(),
+    LANGFUSE_SECRET_KEY: optionalString(),
+    LANGFUSE_BASE_URL: optionalString(),
   })
   .superRefine((environment, context) => {
-    if (!environment.OBSERVE_ENABLED) return;
+    if (environment.OBSERVE_ENABLED) {
+      for (const key of [
+        'OBSERVE_APP_KEY',
+        'OBSERVE_APP_SECRET',
+        'OBSERVE_SERVICE_ID',
+      ] as const) {
+        if (!environment[key]) {
+          context.addIssue({
+            code: 'custom',
+            message: `${key} is required when OBSERVE_ENABLED is true`,
+            path: [key],
+          });
+        }
+      }
+    }
 
-    for (const key of [
-      'OBSERVE_APP_KEY',
-      'OBSERVE_APP_SECRET',
-      'OBSERVE_SERVICE_ID',
-    ] as const) {
+    const langfuse = [
+      'LANGFUSE_PUBLIC_KEY',
+      'LANGFUSE_SECRET_KEY',
+      'LANGFUSE_BASE_URL',
+    ] as const;
+    const present = langfuse.filter((key) => environment[key]);
+    if (present.length === 0) return;
+    for (const key of langfuse) {
       if (!environment[key]) {
         context.addIssue({
           code: 'custom',
-          message: `${key} is required when OBSERVE_ENABLED is true`,
+          message: `${key} is required when Langfuse is configured`,
           path: [key],
         });
       }
+    }
+    if (!environment.LANGFUSE_BASE_URL) return;
+    try {
+      const url = new URL(environment.LANGFUSE_BASE_URL);
+      if (!['http:', 'https:'].includes(url.protocol))
+        throw new Error('protocol');
+    } catch {
+      context.addIssue({
+        code: 'custom',
+        message: 'LANGFUSE_BASE_URL must be an http(s) URL',
+        path: ['LANGFUSE_BASE_URL'],
+      });
     }
   });
 
@@ -121,6 +153,7 @@ export type Environment = Omit<
   CORS_ORIGINS: string[];
   OBSERVE_ENABLED: boolean;
   SWAGGER_ENABLED: boolean;
+  LANGFUSE_ENABLED: boolean;
 };
 
 export function validateEnvironment(
@@ -132,5 +165,10 @@ export function validateEnvironment(
     CORS_ORIGINS: corsOrigins(parsed.CORS_ORIGINS),
     OBSERVE_ENABLED: parsed.OBSERVE_ENABLED ?? false,
     SWAGGER_ENABLED: parsed.SWAGGER_ENABLED ?? parsed.NODE_ENV !== 'production',
+    LANGFUSE_ENABLED: Boolean(
+      parsed.LANGFUSE_PUBLIC_KEY &&
+      parsed.LANGFUSE_SECRET_KEY &&
+      parsed.LANGFUSE_BASE_URL,
+    ),
   };
 }
