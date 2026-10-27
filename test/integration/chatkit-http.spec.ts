@@ -390,22 +390,85 @@ describe('ChatKit over HTTP', () => {
       })
       .expect(200);
     const threadId = events(created.text)[0].thread.id as string;
-    const body = { userId, decision: 'cancel', note: 'Checked: nothing ran.' };
+    const operationPath = `/v1/chatkit/threads/${threadId}/operation`;
+    const recoverPath = `/v1/chatkit/threads/${threadId}/recover`;
+    const readOperation = (owner = userId) =>
+      http()
+        .get(operationPath)
+        .query({ userId: owner })
+        .set('x-admin-key', ADMIN_KEY);
+    const decide = (payload: object) =>
+      http().post(recoverPath).set('x-admin-key', ADMIN_KEY).send(payload);
+    const note = 'Checked: nothing ran.';
 
+    await http().get(operationPath).query({ userId }).expect(401);
+    await readOperation('someone-else').expect(404);
+    expect((await readOperation().expect(200)).body.data).toBeNull();
     await http()
-      .post(`/v1/chatkit/threads/${threadId}/recover`)
-      .send(body)
+      .post(recoverPath)
+      .send({
+        userId,
+        operationId: 'op-a',
+        attempt: 1,
+        decision: 'cancel',
+        note,
+      })
       .expect(401);
-    await http()
-      .post(`/v1/chatkit/threads/${threadId}/recover`)
-      .set('x-admin-key', ADMIN_KEY)
-      .send(body)
-      .expect(400);
-    await http()
-      .post(`/v1/chatkit/threads/${threadId}/recover`)
-      .set('x-admin-key', ADMIN_KEY)
-      .send({ ...body, userId: 'someone-else' })
-      .expect(404);
+    // The decision must name the operation and attempt that was checked.
+    await decide({ userId, decision: 'cancel', note }).expect(400);
+    await decide({
+      userId,
+      operationId: 'op-a',
+      attempt: 1,
+      decision: 'cancel',
+      note: '   ',
+    }).expect(400);
+    // Nothing is interrupted yet, so any decision is stale.
+    await decide({
+      userId,
+      operationId: 'op-a',
+      attempt: 1,
+      decision: 'cancel',
+      note,
+    }).expect(409);
+
+    // Put an interrupted operation on the stored thread, as a crash would leave it.
+    const store = app.get(ChatKitStore);
+    const owner = { userId, baseUrl: 'https://example.invalid' };
+    const interrupt = async (id: string) => {
+      const thread = await store.loadThread(threadId, owner);
+      thread.metadata._chatkit_operation = {
+        id,
+        kind: 'retry',
+        itemId: 'msg_1',
+        status: 'recovery_required',
+        attempt: 1,
+      };
+      await store.saveThread(thread, owner);
+    };
+    await interrupt('op-a');
+    const reviewedA = (await readOperation().expect(200)).body.data;
+    expect(reviewedA).toMatchObject({ id: 'op-a', attempt: 1 });
+    const cancelA = {
+      userId,
+      operationId: reviewedA.id,
+      attempt: reviewedA.attempt,
+      decision: 'cancel',
+      note,
+    };
+    await decide({ ...cancelA, userId: 'someone-else' }).expect(404);
+    await decide(cancelA).expect(200);
+    // The same request again finds A already settled.
+    await decide(cancelA).expect(409);
+
+    // Operation B is interrupted later. A delayed "retry A" must leave B alone.
+    await interrupt('op-b');
+    await decide({ ...cancelA, decision: 'retry' }).expect(409);
+    expect((await readOperation().expect(200)).body.data).toMatchObject({
+      id: 'op-b',
+      status: 'recovery_required',
+    });
+
     await http()
       .post(
         `/v1/chatkit/threads/${threadId}/approvals/0192f1e2-0000-7000-8000-000000000001/recover`,
@@ -435,10 +498,7 @@ describe('ChatKit over HTTP', () => {
     // Expected client mistakes are client errors, never 500.
     await recover(approval, { ...checked, version: 1 }).expect(409);
     await recover(approval, { ...checked, note: '   ' }).expect(400);
-    await recover(`/v1/chatkit/threads/${threadId}/recover`, {
-      ...body,
-      note: '   ',
-    }).expect(400);
+    await recover(recoverPath, { ...cancelA, note: '   ' }).expect(400);
     await recover(
       `/v1/chatkit/threads/${threadId}/approvals/not-a-uuid/recover`,
       checked,

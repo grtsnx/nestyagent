@@ -579,6 +579,14 @@ export class NotFoundError extends Error {
   }
 }
 
+// A request based on state that has since changed, such as a delayed recovery decision.
+export class ConflictError extends Error {
+  constructor(message = 'This changed since it was read.') {
+    super(message);
+    this.name = 'ConflictError';
+  }
+}
+
 // Durable continuation and retry receipts.
 export type ThreadOperation = {
   id: string;
@@ -589,6 +597,8 @@ export type ThreadOperation = {
   callId?: string;
   recoveryNote?: string;
   requestKey?: string;
+  // Goes up each time the operation starts running, so a decision names one exact attempt.
+  attempt?: number;
 };
 
 const key = '_chatkit_operation';
@@ -1211,11 +1221,18 @@ export abstract class ChatKitService<TContext> {
     return Promise.resolve();
   }
 
-  // Trusted operators must hold the same thread execution lock as HTTP requests.
-  // A retry is authorized only after reconciling possible external side effects.
+  //1. Trusted operators must hold the same thread execution lock as HTTP requests.
+  //2. A retry is authorized only after reconciling possible external side effects.
+  //3. The decision names the operation and attempt the operator reviewed. Anything else,
+  //   such as a later operation or a later attempt of the same one, is refused as stale.
   async recoverOperation(
     threadId: string,
-    recovery: { decision: 'retry' | 'cancel'; note: string },
+    recovery: {
+      operationId: string;
+      attempt: number;
+      decision: 'retry' | 'cancel';
+      note: string;
+    },
     context: TContext,
   ) {
     requireRecoveryNote(recovery.note);
@@ -1224,10 +1241,12 @@ export abstract class ChatKitService<TContext> {
       const operation = operationOf(thread);
       if (
         !operation ||
+        operation.id !== recovery.operationId ||
+        (operation.attempt ?? 0) !== recovery.attempt ||
         !['running', 'recovery_required'].includes(operation.status)
       )
-        throw new InvalidRequestError(
-          'No interrupted operation needs reconciliation.',
+        throw new ConflictError(
+          'This operation changed since it was checked. Read it again.',
         );
       if (recovery.decision === 'cancel') {
         for await (const item of this.itemsNewestFirst(threadId, context)) {
@@ -1251,6 +1270,11 @@ export abstract class ChatKitService<TContext> {
       operation.recoveryNote = recovery.note;
       await this.saveOperation(thread, operation, context, store);
     });
+  }
+
+  // What an operator reviews before recoverOperation: the thread's current operation.
+  async loadOperation(threadId: string, context: TContext) {
+    return operationOf(await this.store.loadThread(threadId, context)) ?? null;
   }
 
   // The thread's current operation and its retry receipt commit together.
@@ -1892,6 +1916,7 @@ export abstract class ChatKitService<TContext> {
       signal?.throwIfAborted();
       if (operation) {
         operation.status = 'running';
+        operation.attempt = (operation.attempt ?? 0) + 1;
         await this.saveOperation(thread, operation, context, this.store);
         saved = JSON.stringify(thread);
       }

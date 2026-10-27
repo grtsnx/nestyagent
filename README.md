@@ -706,15 +706,16 @@ The code is in three places:
 
 ### Routes
 
-| Route                                                         | Who calls it                     | What it does                                                            |
-| ------------------------------------------------------------- | -------------------------------- | ----------------------------------------------------------------------- |
-| `POST /v1/chatkit/tokens`                                     | Your backend, with the admin key | Gives one signed-in user a short-lived ChatKit token.                   |
-| `POST /v1/chatkit`                                            | The ChatKit window               | Every chat request: messages, history, actions, feedback, and voice.    |
-| `POST /v1/chatkit/attachments`                                | The ChatKit window               | Direct upload of one file.                                              |
-| `POST /v1/chatkit/attachments/:id/upload`                     | The ChatKit window               | Second step of a two-phase upload, through a signed link.               |
-| `GET /v1/chatkit/attachments/:id/content`                     | The browser                      | Shows an image, or downloads a file, through a signed link.             |
-| `POST /v1/chatkit/threads/:threadId/recover`                  | An admin, with the admin key     | Unpauses a chat after an interrupted browser tool or retry was checked. |
-| `POST /v1/chatkit/threads/:threadId/approvals/:runId/recover` | An admin, with the admin key     | Shows an interrupted approval's card again, after it was checked.       |
+| Route                                                         | Who calls it                     | What it does                                                                  |
+| ------------------------------------------------------------- | -------------------------------- | ----------------------------------------------------------------------------- |
+| `POST /v1/chatkit/tokens`                                     | Your backend, with the admin key | Gives one signed-in user a short-lived ChatKit token.                         |
+| `POST /v1/chatkit`                                            | The ChatKit window               | Every chat request: messages, history, actions, feedback, and voice.          |
+| `POST /v1/chatkit/attachments`                                | The ChatKit window               | Direct upload of one file.                                                    |
+| `POST /v1/chatkit/attachments/:id/upload`                     | The ChatKit window               | Second step of a two-phase upload, through a signed link.                     |
+| `GET /v1/chatkit/attachments/:id/content`                     | The browser                      | Shows an image, or downloads a file, through a signed link.                   |
+| `GET /v1/chatkit/threads/:threadId/operation`                 | An admin, with the admin key     | Shows the chat's current operation, with the id and attempt a recovery names. |
+| `POST /v1/chatkit/threads/:threadId/recover`                  | An admin, with the admin key     | Unpauses a chat after an interrupted browser tool or retry was checked.       |
+| `POST /v1/chatkit/threads/:threadId/approvals/:runId/recover` | An admin, with the admin key     | Shows an interrupted approval's card again, after it was checked.             |
 
 ### Give each user a token
 
@@ -977,7 +978,8 @@ When MsSuzie calls a tool that needs a yes, like `cancelOrder`, the run pauses a
 - **A new message means no.** If the customer types instead of clicking, the waiting request is cancelled without running, its card shows "Declined.", and MsSuzie answers the new message.
   - The checkpoint and the "Declined." card are saved in one database transaction. If that write fails, neither changes and the message is refused, so the customer can send it again.
   - The open window gets the new card right away (`thread.item.replaced`), only after it was saved.
-  - The decline is saved before the new message. If saving the message itself then fails, the decline stays and the customer sends the message again.
+  - The decline is saved before the new message. If saving the message itself then fails, the decline stays, and the window gets an error event (`stream.error`, with retry allowed) after the "Declined." card. The message was not saved, so the customer sends it again.
+  - In general, a failure before the first event is an HTTP error, such as 404. A failure after the first event cannot change the 200 that was already sent, so it arrives as a ChatKit error event. Whatever was sent before it is saved; the failed step is not.
 - **An interrupted action pauses the chat.** If a server stops while an approved action runs, nobody knows whether it happened. The chat shows "This chat is paused while the team checks an earlier action. Please try again later." until an admin checks it (see below).
 - Deleting the thread deletes its live approval checkpoints. Another thread cannot resume them. A second click cannot execute a completed checkpoint again.
 
@@ -1018,13 +1020,22 @@ For custom clients, set `metadata.client_tool_call_id` on every tool-result requ
 
 **Unpause a chat.** An admin first checks the real system, for example whether order 42 was really cancelled, then calls one of these with the admin key. Both take the same thread lock as chat requests and check the owner. Neither undoes an action, so check first.
 
-When a browser tool or a retry was interrupted, run it again (`retry`) or close it (`cancel`):
+When a browser tool or a retry was interrupted, first read the chat's current operation. It shows what was interrupted, with its `id` and `attempt`:
+
+```bash
+curl "https://api.sunnybakery.example/v1/chatkit/threads/thr_…/operation?userId=customer-42" \
+  -H "x-admin-key: $ADMIN_API_KEY"
+```
+
+After checking the real system, run it again (`retry`) or close it (`cancel`). The decision names the `operationId` and `attempt` you checked:
 
 ```bash
 curl -X POST https://api.sunnybakery.example/v1/chatkit/threads/thr_…/recover \
   -H "x-admin-key: $ADMIN_API_KEY" -H "content-type: application/json" \
-  -d '{"userId": "customer-42", "decision": "cancel", "note": "Checked: the basket was not changed."}'
+  -d '{"userId": "customer-42", "operationId": "<id>", "attempt": 1, "decision": "cancel", "note": "Checked: the basket was not changed."}'
 ```
+
+The id and attempt are checked inside the thread lock and the same transaction that saves the decision. If they no longer match the interrupted operation, the answer is 409 and nothing changes. That covers a decision sent twice, a delayed decision for an operation that was already settled, and a decision for an earlier attempt after the operation ran and was interrupted again. Read the operation again and check again.
 
 When an approved action was interrupted, show its card again so the customer can answer it. Take `version` from `GET /v1/admin/approvals`:
 
@@ -1034,7 +1045,7 @@ curl -X POST https://api.sunnybakery.example/v1/chatkit/threads/thr_…/approval
   -d '{"userId": "customer-42", "version": 1, "note": "Checked: order 42 was not cancelled."}'
 ```
 
-The new card is saved with a new version, and the customer sees it when the chat reloads. Older cards stay invalid. Both routes validate the same way: a blank note answers 400, and a run id that is not a UUID answers 400. A chat with nothing to recover answers 400. A `version` that no longer matches, because the run moved on since the admin checked it, answers 409; reload `GET /v1/admin/approvals` and check again. Another user's chat or run answers 404. The migration upgrades the latest legacy waiting card so existing threads can still answer their approvals. Historical usage rows without thread identity cannot be linked retrospectively.
+The new card is saved with a new version, and the customer sees it when the chat reloads. Older cards stay invalid. Both routes validate the same way: a blank note answers 400, and a run id that is not a UUID answers 400. A blank note or a missing `operationId` or `attempt` answers 400. A `version` that no longer matches, because the run moved on since the admin checked it, answers 409; reload `GET /v1/admin/approvals` and check again. Another user's chat or run answers 404. The migration upgrades the latest legacy waiting card so existing threads can still answer their approvals. Historical usage rows without thread identity cannot be linked retrospectively.
 
 ### @-mentions (entities)
 
@@ -1362,7 +1373,7 @@ const finished = await this.openai.resumeAgent(orderHelper, state);
 
 ### Nobody answers
 
-While a question waits, that chat takes no new messages. If the customer never answers, `cancelRun` settles the waiting checkpoint and its chat history in one database transaction. It removes unexecuted approval placeholders and adds a cancellation message without calling a model or tool. The placeholders are found in the saved checkpoint data alone. The agent is never rebuilt, so cancelling works even after a tool was removed or the agent changed, and no agent callback runs. The checkpoint becomes `completed` with recovery note `cancelled`, and the method returns `{ id, status: 'cancelled' }`. Repeating cancellation returns the same receipt; a stale resume is rejected. Interrupted actions must be reconciled before cancellation.
+While a question waits, that chat takes no new messages. If the customer never answers, `cancelRun` settles the waiting checkpoint and its chat history in one database transaction. It removes unexecuted approval placeholders and adds a cancellation message without calling a model or tool. It follows the SDK's own continuation history: tool calls left without a result go, with the reasoning items just before them; completed calls, their results, their reasoning, and messages stay. All of this is read from the saved checkpoint data alone. The agent is never rebuilt, so cancelling works even after a tool was removed or the agent changed, and no agent callback runs. The checkpoint becomes `completed` with recovery note `cancelled`, and the method returns `{ id, status: 'cancelled' }`. Repeating cancellation returns the same receipt; a stale resume is rejected. Interrupted actions must be reconciled before cancellation.
 
 ```typescript
 const receipt = await this.openai.cancelRun(orderHelper, runId, {

@@ -122,7 +122,7 @@ export class MsSuzieChatKitService extends ChatKitService<ChatKitContext> {
 
   async recoverOperation(
     threadId: string,
-    recovery: { decision: 'retry' | 'cancel'; note: string },
+    recovery: Parameters<ChatKitService<ChatKitContext>['recoverOperation']>[1],
     context: ChatKitContext,
   ) {
     return this.prisma.withLock(`chatkit:${threadId}`, () =>

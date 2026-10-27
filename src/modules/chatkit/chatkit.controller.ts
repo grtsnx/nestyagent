@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   Get,
   HttpCode,
@@ -40,10 +41,12 @@ import {
 import {
   ChatKitApprovalRecoveryDto,
   ChatKitRequestDto,
+  ChatKitThreadOwnerDto,
   ChatKitThreadRecoveryDto,
   ChatKitTokenDto,
 } from '@/dto/index.js';
 import {
+  ConflictError,
   InvalidRequestError,
   NotFoundError,
   parseRequest,
@@ -363,14 +366,20 @@ export class ChatKitController {
   })
   @ApiFailure(
     HttpStatus.BAD_REQUEST,
-    'The chat has no interrupted step that needs checking.',
-    'No interrupted operation needs reconciliation.',
+    'The note is blank, or a required field is missing.',
+    'A reconciliation note is required.',
     '/v1/chatkit/threads/thr_1/recover',
   )
   @ApiFailure(
     HttpStatus.NOT_FOUND,
     'The chat does not exist for this user.',
     'Thread not found.',
+    '/v1/chatkit/threads/thr_1/recover',
+  )
+  @ApiFailure(
+    HttpStatus.CONFLICT,
+    'The operation or attempt is no longer the interrupted one the admin checked.',
+    'This operation changed since it was checked. Read it again.',
     '/v1/chatkit/threads/thr_1/recover',
   )
   @UseGuards(AdminKeyGuard)
@@ -384,11 +393,53 @@ export class ChatKitController {
     await this.server
       .recoverOperation(
         threadId,
-        { decision: body.decision, note: body.note },
+        {
+          operationId: body.operationId,
+          attempt: body.attempt,
+          decision: body.decision,
+          note: body.note,
+        },
         { userId: body.userId, baseUrl: baseUrl(request) },
       )
       .catch(rethrow);
-    return { threadId, decision: body.decision };
+    return { threadId, operationId: body.operationId, decision: body.decision };
+  }
+
+  @ApiOperation({
+    summary: 'Show a chat operation',
+    description:
+      'An admin reads the chat’s current browser tool or retry operation here, with the id and attempt that a recovery must name.',
+  })
+  @ApiSecurity('admin')
+  @ApiSuccess(
+    'This is the chat’s current operation, or null when it has none.',
+    {
+      id: '0192f1e2-0000-7000-8000-000000000003',
+      kind: 'retry',
+      itemId: 'msg_0123456789abcdef0123456789abcdef',
+      status: 'recovery_required',
+      attempt: 1,
+    },
+  )
+  @ApiFailure(
+    HttpStatus.NOT_FOUND,
+    'The chat does not exist for this user.',
+    'Thread not found.',
+    '/v1/chatkit/threads/thr_1/operation',
+  )
+  @UseGuards(AdminKeyGuard)
+  @Get('threads/:threadId/operation')
+  async operation(
+    @Param('threadId') threadId: string,
+    @Query() query: ChatKitThreadOwnerDto,
+    @Req() request: ChatKitRequest,
+  ) {
+    return await this.server
+      .loadOperation(threadId, {
+        userId: query.userId,
+        baseUrl: baseUrl(request),
+      })
+      .catch(rethrow);
   }
 
   @ApiOperation({
@@ -539,6 +590,8 @@ export class ChatKitController {
 function rethrow(error: unknown): never {
   if (error instanceof NotFoundError)
     throw new NotFoundException(error.message);
+  if (error instanceof ConflictError)
+    throw new ConflictException(error.message);
   if (error instanceof InvalidRequestError || error instanceof RangeError)
     throw new BadRequestException(error.message);
   throw error;

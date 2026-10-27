@@ -2,6 +2,7 @@ import { vi } from 'vitest';
 import {
   ChatKitService,
   CHAT_PAUSED,
+  ConflictError,
   CustomStreamError,
   MemoryStore,
   StreamError,
@@ -39,6 +40,12 @@ async function send(
   for await (const event of result.stream)
     events.push(JSON.parse(event.slice(6)));
   return events;
+}
+// What an operator reads before deciding: the current operation's id and attempt.
+async function reviewed(server: Server) {
+  const operation = await server.loadOperation(thread.id, undefined);
+  if (!operation) throw new Error('Expected an operation.');
+  return { operationId: operation.id, attempt: operation.attempt ?? 0 };
 }
 async function fixture() {
   const store = new MemoryStore<undefined>();
@@ -85,6 +92,7 @@ describe('ChatKit durable operations', () => {
     await server.recoverOperation(
       thread.id,
       {
+        ...(await reviewed(server)),
         decision: 'cancel',
         note: 'Reconciled and abandoned the browser action.',
       },
@@ -173,6 +181,91 @@ describe('ChatKit durable operations', () => {
     ).not.toHaveProperty('_chatkit_retry_receipts');
   });
 
+  it('applies a recovery decision only to the operation it reviewed', async () => {
+    const { store, server } = await fixture();
+    await call(store);
+    server.failure = new Error('Unknown external outcome.');
+    await send(server, 'threads.add_client_tool_output', {
+      thread_id: thread.id,
+      result: 'a',
+    });
+    const a = await reviewed(server);
+    const note = 'Checked operation A.';
+    await server.recoverOperation(
+      thread.id,
+      { ...a, decision: 'cancel', note },
+      undefined,
+    );
+    // Repeating the same decision finds A already settled.
+    await expect(
+      server.recoverOperation(
+        thread.id,
+        { ...a, decision: 'cancel', note },
+        undefined,
+      ),
+    ).rejects.toThrow(ConflictError);
+
+    // Operation B starts and is interrupted too.
+    await store.saveItem(thread.id, {
+      id: 'tool_2',
+      thread_id: thread.id,
+      created_at: thread.created_at,
+      type: 'client_tool_call',
+      name: 'browser',
+      call_id: 'call_2',
+      arguments: {},
+      status: 'pending',
+    });
+    await send(
+      server,
+      'threads.add_client_tool_output',
+      { thread_id: thread.id, result: 'b' },
+      { client_tool_call_id: 'call_2' },
+    );
+    const b = await server.loadOperation(thread.id, undefined);
+    expect(b).toMatchObject({ status: 'recovery_required' });
+    expect(b?.id).not.toBe(a.operationId);
+
+    // A delayed "retry A" must not make B retryable.
+    await expect(
+      server.recoverOperation(
+        thread.id,
+        { ...a, decision: 'retry', note },
+        undefined,
+      ),
+    ).rejects.toThrow(ConflictError);
+    expect(await server.loadOperation(thread.id, undefined)).toEqual(b);
+  });
+
+  it('refuses a decision made for an earlier attempt of the same operation', async () => {
+    const { store, server } = await fixture();
+    await call(store);
+    server.failure = new Error('Unknown external outcome.');
+    const params = { thread_id: thread.id, result: 'value' };
+    await send(server, 'threads.add_client_tool_output', params);
+    const first = await reviewed(server);
+    expect(first.attempt).toBe(1);
+    const retry = {
+      ...first,
+      decision: 'retry' as const,
+      note: 'Checked attempt 1: nothing happened.',
+    };
+    await server.recoverOperation(thread.id, retry, undefined);
+    // The resend is attempt 2, and it is interrupted again.
+    await send(server, 'threads.add_client_tool_output', params);
+    const second = await server.loadOperation(thread.id, undefined);
+    expect(second).toMatchObject({
+      id: first.operationId,
+      attempt: 2,
+      status: 'recovery_required',
+    });
+    // The duplicate of the attempt-1 decision arrives late and must not retry attempt 2.
+    await expect(
+      server.recoverOperation(thread.id, retry, undefined),
+    ).rejects.toThrow(ConflictError);
+    expect(await server.loadOperation(thread.id, undefined)).toEqual(second);
+  });
+
   it('retains completed retry receipts across new user turns', async () => {
     const { server } = await fixture();
     await send(server, 'threads.add_user_message', {
@@ -231,7 +324,11 @@ describe('ChatKit durable operations', () => {
     });
     await server.recoverOperation(
       thread.id,
-      { decision: 'retry', note: 'Reconciled the incomplete attempt.' },
+      {
+        ...(await reviewed(server)),
+        decision: 'retry',
+        note: 'Reconciled the incomplete attempt.',
+      },
       undefined,
     );
     server.failure = undefined;
@@ -363,6 +460,7 @@ describe('ChatKit durable operations', () => {
     await server.recoverOperation(
       thread.id,
       {
+        ...(await reviewed(server)),
         decision: 'cancel',
         note: 'Inspected the remote action and retained its outcome.',
       },
@@ -422,6 +520,7 @@ describe('ChatKit durable operations', () => {
     await server.recoverOperation(
       thread.id,
       {
+        ...(await reviewed(server)),
         decision: 'retry',
         note: 'Verified that no external side effect occurred.',
       },

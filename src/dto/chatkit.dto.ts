@@ -76,12 +76,40 @@ class ChatKitRecoveryDto {
 export class ChatKitThreadRecoveryDto extends ChatKitRecoveryDto {
   @ApiProperty({
     description:
+      'This is the id of the interrupted operation the admin checked, from the chat operation route.',
+    example: '0192f1e2-0000-7000-8000-000000000003',
+  })
+  @IsString()
+  @Length(1, 128)
+  operationId: string;
+
+  @ApiProperty({
+    description:
+      'This is the attempt of that operation the admin checked, so a later attempt is never changed by mistake.',
+    example: 1,
+  })
+  @IsInt()
+  @Min(0)
+  attempt: number;
+
+  @ApiProperty({
+    description:
       'This says whether to run the interrupted step again or to close it as cancelled.',
     enum: ['retry', 'cancel'],
     example: 'cancel',
   })
   @IsIn(['retry', 'cancel'])
   decision: 'retry' | 'cancel';
+}
+
+export class ChatKitThreadOwnerDto {
+  @ApiProperty({
+    description: 'This is the id of the user who owns the chat.',
+    example: 'guardian-7',
+  })
+  @IsString()
+  @Length(1, 128)
+  userId: string;
 }
 
 export class ChatKitApprovalRecoveryDto extends ChatKitRecoveryDto {
