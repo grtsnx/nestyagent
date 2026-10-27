@@ -20,8 +20,6 @@
     "types": ["vitest/globals", "node"],
     "paths": {
       "@/app": ["./src/app/app.module.ts"],
-      "@/dto": ["./src/dto/index.ts"],
-      "@/lib": ["./src/lib/index.ts"],
       "@/middleware": ["./src/middleware/index.ts"],
       "@/*": ["./src/*"]
     }

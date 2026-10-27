@@ -17,8 +17,8 @@ import {
 } from '@nestjs/swagger';
 import { SkipThrottle } from '@nestjs/throttler';
 import type { Request } from 'express';
-import { HostedWebhookResponseDto } from '@/dto';
-import { SandboxService } from '@/lib';
+import { HostedWebhookResponseDto } from '@/dto/index.js';
+import { SandboxService } from '@/lib/index.js';
 
 @ApiTags('Webhook')
 @Controller({ path: 'webhook', version: '1' })
