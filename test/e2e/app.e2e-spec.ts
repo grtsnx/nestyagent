@@ -115,6 +115,23 @@ describe('AppController (e2e)', () => {
     expect(responses.every(({ status }) => status === 200)).toBe(true);
   });
 
+  it('uses the address the docs were opened from as the base URL', async () => {
+    const direct = await request(app.getHttpServer())
+      .get('/api/v1-json')
+      .set('Host', 'localhost:3000')
+      .expect(200);
+    const proxied = await request(app.getHttpServer())
+      .get('/api/v2-json')
+      .set('X-Forwarded-Proto', 'https')
+      .set('X-Forwarded-Host', 'api.sunnybakery.com')
+      .expect(200);
+
+    expect(direct.body.servers).toEqual([{ url: 'http://localhost:3000' }]);
+    expect(proxied.body.servers).toEqual([
+      { url: 'https://api.sunnybakery.com' },
+    ]);
+  });
+
   it('serves populated, version-specific OpenAPI documents', async () => {
     const v1 = await request(app.getHttpServer())
       .get('/api/v1-json')

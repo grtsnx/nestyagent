@@ -184,32 +184,6 @@ const menuHelper = this.openai.createAgent(
 
 Keep your own tools in `src/config/tools`. `sample.tool.ts` there is a starting template.
 
-### Call another project's tools
-
-A public MCP server is a tool OpenAI calls for you. A private one is a server this app connects to. Connect it with `useMcp`, then pass the active servers to the helper.
-
-```typescript
-const git = this.openai.hostedMcp({
-  serverLabel: 'git',
-  serverUrl: 'https://gitmcp.io/openai/codex',
-});
-
-const files = this.openai.httpMcp({
-  url: 'https://tools.example/mcp',
-  name: 'files',
-});
-
-await this.openai.useMcp([files], async (servers) => {
-  const helper = this.openai.createAgent('Files', 'Read the project files.', {
-    tools: [git],
-    mcpServers: servers,
-  });
-  await this.openai.runAgent('List the files.', helper);
-});
-```
-
-`stdioMcp` starts a local command instead of calling an HTTP server. `useMcp` closes every server when the function finishes.
-
 ### See the run
 
 Each customer message is a trace named `agent-turn`. A chat id groups those traces into one session. Traces always go to the OpenAI dashboard, without model and tool payloads.
@@ -536,6 +510,63 @@ await this.openai.runAgent('Two croissants for Saturday, please.', frontDesk);
 </details>
 
 <details>
+<summary><h2>🔌 MCP</h2></summary>
+
+MCP lets a helper use tools that live in another project, like a recipe store or a supplier's catalog. There are three kinds:
+
+| Kind   | Make it with | Who connects                                 | Use it for                               |
+| ------ | ------------ | -------------------------------------------- | ---------------------------------------- |
+| Hosted | `hostedMcp`  | OpenAI calls the server for you              | A public server on the internet          |
+| HTTP   | `httpMcp`    | This app connects over HTTP                  | A private server only this app can reach |
+| Local  | `stdioMcp`   | This app starts a command on its own machine | A tool you run next to the app           |
+
+### A public server
+
+A hosted server is just a tool. Pass it to the helper like any other tool.
+
+```typescript
+const supplier = this.openai.hostedMcp({
+  serverLabel: 'supplier',
+  serverUrl: 'https://flour-supplier.example/mcp',
+});
+
+const stockHelper = this.openai.createAgent(
+  'Stock helper',
+  'You check flour and sugar stock for Sunny Bakery.',
+  { tools: [supplier] },
+);
+```
+
+### A private server
+
+`useMcp` connects the servers, runs your code with the ones that connected, then closes them, even when the run fails. Pass those servers to the helper as `mcpServers`.
+
+```typescript
+const recipes = this.openai.httpMcp({
+  name: 'recipes',
+  url: 'https://recipes.internal.example/mcp',
+});
+const notes = this.openai.stdioMcp({
+  name: 'notes',
+  fullCommand: 'npx -y @modelcontextprotocol/server-filesystem ./notes',
+});
+
+await this.openai.useMcp([recipes, notes], async (servers) => {
+  const recipeHelper = this.openai.createAgent(
+    'Recipe helper',
+    'You answer questions about Sunny Bakery recipes.',
+    { mcpServers: servers },
+  );
+  await this.openai.runAgent(
+    'How much butter goes in a croissant?',
+    recipeHelper,
+  );
+});
+```
+
+</details>
+
+<details>
 <summary><h2>🚧 Safety checks (guardrails)</h2></summary>
 
 A guardrail is a safety check. Every check here is optional. Leave them out when you do not need them.
@@ -798,7 +829,7 @@ try {
 </details>
 
 <details>
-<summary><h2>💻 Sandbox (a helper with its own computer)</h2></summary>
+<summary><h2>💻 Sandbox</h2></summary>
 
 `SandboxService` gives a helper a small computer, called a workspace. The helper can make files, run commands, and use a browser there. In this guide, `siteHelper` uses one to build the Sunny Bakery website.
 
@@ -1251,7 +1282,7 @@ const link = await this.sandbox.previewUrl(workspace, 3000);
 </details>
 
 <details>
-<summary><h2>🖥️ Self-hosted (OpenAI runs the helper, you run the computer)</h2></summary>
+<summary><h2>🖥️ Self-hosted</h2></summary>
 
 Here OpenAI runs the helper, and the computer is yours. A small program called the executor runs on your computer and does the work OpenAI asks for.
 

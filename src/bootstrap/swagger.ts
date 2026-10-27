@@ -1,10 +1,21 @@
 import type { INestApplication } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { apiReference } from '@scalar/nestjs-api-reference';
+import type { Request, Response } from 'express';
 import type { Environment } from '@/config/index.js';
 
 const apiVersions = ['1', '2'] as const;
 type ApiVersion = (typeof apiVersions)[number];
+
+// The site the docs were opened from, so "Try it" calls the same place.
+// Behind a proxy like Coolify, the forwarded headers give the public https address.
+function baseUrl(request: Request) {
+  const first = (header: string) =>
+    request.get(header)?.split(',')[0]?.trim() || undefined;
+  const protocol = first('x-forwarded-proto') ?? request.protocol;
+  const host = first('x-forwarded-host') ?? request.get('host');
+  return `${protocol}://${host}`;
+}
 
 export function configureSwagger(
   app: INestApplication,
@@ -38,10 +49,11 @@ export function configureSwagger(
 
   const freshDocument = (
     version: ApiVersion,
-    response: { setHeader(name: string, value: string): void },
+    request: Request,
+    response: Response,
   ) => {
     response.setHeader('Cache-Control', 'no-store');
-    return buildDocument(version);
+    return { ...buildDocument(version), servers: [{ url: baseUrl(request) }] };
   };
 
   for (const version of apiVersions) {
@@ -49,11 +61,8 @@ export function configureSwagger(
       ui: false,
       raw: ['json'],
       jsonDocumentUrl: `api/v${version}-json`,
-      patchDocumentOnRequest: (_request, response) =>
-        freshDocument(
-          version,
-          response as { setHeader(name: string, value: string): void },
-        ),
+      patchDocumentOnRequest: (request, response) =>
+        freshDocument(version, request as Request, response as Response),
     });
   }
 
@@ -142,11 +151,8 @@ export function configureSwagger(
         }
       },
     },
-    patchDocumentOnRequest: (_request, response) =>
-      freshDocument(
-        '1',
-        response as { setHeader(name: string, value: string): void },
-      ),
+    patchDocumentOnRequest: (request, response) =>
+      freshDocument('1', request as Request, response as Response),
   });
 
   app.use(
