@@ -62,6 +62,10 @@ const environmentSchema = z
       (value) => (value === '' ? undefined : value),
       z.string().trim().min(1).optional(),
     ),
+    ACCOUNT_PASSWORD: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z.string().trim().min(1).optional(),
+    ),
   })
   .superRefine((environment, context) => {
     if (!environment.OBSERVE_ENABLED) return;
@@ -92,6 +96,7 @@ export interface Environment {
   OBSERVE_SERVICE_ID?: string;
   SWAGGER_ENABLED: boolean;
   OPENAI_API_KEY?: string;
+  ACCOUNT_PASSWORD?: string;
 }
 
 export function validateEnvironment(

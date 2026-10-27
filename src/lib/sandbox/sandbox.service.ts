@@ -26,6 +26,8 @@ export class SandboxService {
 
   constructor(private readonly configService: ConfigService) {}
 
+  // Create a sandbox agent. Leave model out to use the default model.
+  // manifest is optional starting files. skills and memory are optional.
   createSandboxAgent(
     name: string,
     instructions: string,
@@ -40,8 +42,10 @@ export class SandboxService {
     });
   }
 
-  // Shell, filesystem, and compaction are always on.
-  // Skills and memory are added only when the caller asks for them.
+  //1. Shell, filesystem, and compaction are always on.
+  //2. Skills and memory are added only when the caller asks for them.
+  //3. skills takes one source: text in the call, a folder, or a git repo.
+  //4. memory: true reads old lessons and writes new ones.
   private capabilities(options?: CreateSandboxAgentOptions): Capability[] {
     return [
       ...Capabilities.default(),
@@ -52,6 +56,8 @@ export class SandboxService {
     ];
   }
 
+  // Open a workspace computer. Pass a manifest to start with files or a cloned repo.
+  // ACCOUNT_PASSWORD is added only when it is set in the server environment.
   async openSandbox(manifest = new Manifest()) {
     const password = this.configService.get<string>('ACCOUNT_PASSWORD');
 
@@ -65,6 +71,9 @@ export class SandboxService {
     });
   }
 
+  //1. Run a prompt on a sandbox agent inside a workspace.
+  //2. Pass the same workspace on the next run to keep the files and the browser.
+  //3. chat is optional. Reuse one session to continue the messages.
   async runSandbox(
     prompt: string,
     agent: SandboxAgent,

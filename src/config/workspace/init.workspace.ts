@@ -19,6 +19,8 @@ type CreateManifestOptions = {
   repo?: string | RepoLink;
 };
 
+// Build the starting contents of a workspace. Call it with no argument for an empty computer.
+// files are text files. repo clones a GitHub link. entries and environment are optional.
 export function createManifest(options?: CreateManifestOptions) {
   const files = Object.fromEntries(
     Object.entries(options?.files ?? {}).map(([path, content]) => [
@@ -37,6 +39,7 @@ export function createManifest(options?: CreateManifestOptions) {
   });
 }
 
+// Turn a GitHub link into a cloned folder. path and ref override the folder name and branch.
 function repoEntry(repo: string | RepoLink) {
   const link = typeof repo === 'string' ? { url: repo } : repo;
   const parsed = parseRepoLink(link.url);
@@ -49,6 +52,8 @@ function repoEntry(repo: string | RepoLink) {
   };
 }
 
+//1. Accept an owner/name slug, an https link, or a git@ clone address.
+//2. A /tree/<branch> link sets the branch. The folder name comes from the repo name.
 function parseRepoLink(link: string) {
   const trimmed = link.trim();
   if (!trimmed) throw new Error('Repo link must not be empty.');

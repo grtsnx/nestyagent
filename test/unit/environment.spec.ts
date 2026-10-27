@@ -13,6 +13,15 @@ describe('validateEnvironment', () => {
     });
   });
 
+  it('keeps a trimmed account password and treats a blank value as unset', () => {
+    expect(
+      validateEnvironment({ ACCOUNT_PASSWORD: '  secret  ' }).ACCOUNT_PASSWORD,
+    ).toBe('secret');
+    expect(
+      validateEnvironment({ ACCOUNT_PASSWORD: '' }).ACCOUNT_PASSWORD,
+    ).toBeUndefined();
+  });
+
   it('keeps a trimmed OpenAI API key and treats a blank value as unset', () => {
     expect(
       validateEnvironment({ OPENAI_API_KEY: '  sk-test  ' }).OPENAI_API_KEY,

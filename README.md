@@ -32,6 +32,7 @@ The application validates configuration before it starts. Invalid ports, boolean
 | `SWAGGER_ENABLED` | on outside production | Enables Swagger, Scalar, and OpenAPI JSON. Set it explicitly in production. |
 | `OBSERVE_ENABLED` | `false`               | Enables NestJS Observe when valid credentials are present.                  |
 | `OPENAI_API_KEY`  | empty                 | Authenticates every OpenAI agent. Blank leaves the shared key unset.        |
+| `ACCOUNT_PASSWORD` | empty                | Login secret for every workspace. Blank starts a workspace without one.     |
 
 Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS origins without paths.
 
@@ -510,7 +511,17 @@ const agent = this.sandbox.createSandboxAgent(
 );
 ```
 
-`ACCOUNT_PASSWORD` is optional. Set it in the server environment when the workspace should receive a login secret. Leave it unset and the workspace starts without one.
+### Account password
+
+`ACCOUNT_PASSWORD` is one server secret. Put it in `.env` once:
+
+```bash
+ACCOUNT_PASSWORD=the-login-secret
+```
+
+`openSandbox` reads that value and places it in the workspace environment. The agent can use it from the computer when a site asks for a password. Leave the variable empty and the workspace starts without it.
+
+A person does not type it on each message, and it is not written into the prompt. Every workspace this server opens receives the same secret.
 
 </details>
 
