@@ -52,7 +52,16 @@ export class OpenaiService implements OnModuleInit {
 
   // Run a prompt on an agent. For triage, pass the agent from createTriageAgent.
   // That agent reads the prompt and hands it to one specialist in its handoffs.
-  async runAgent(prompt: string, agent: Agent) {
-    return await run(agent, prompt);
+  // context is optional data for your code. The model does not see it.
+  async runAgent<TContext>(
+    prompt: string,
+    agent: Agent,
+    context?: TContext,
+  ) {
+    return await run(
+      agent,
+      prompt,
+      context === undefined ? undefined : { context },
+    );
   }
 }
