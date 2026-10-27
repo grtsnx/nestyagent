@@ -314,6 +314,53 @@ await this.openai.runAgent('It was a birthday cake.', helper, {
 
 Send every message to `frontDesk` instead when each one should be sorted again.
 
+### One customer, start to finish
+
+`reply` runs one message. Pass the same `session` so the chat is remembered. `fallback` is optional. `turn.helper` is who should take the next message. `turn.output` is the answer.
+
+When a tool pauses, `turn.waiting` is true and `turn.output` is empty. `finish(turn, 'approve')` or `finish(turn, 'reject')` continues that same run. `message` on a rejection is optional.
+
+```typescript
+const chat = this.openai.createSession();
+
+const orderHelper = this.openai.createAgent(
+  'Order helper',
+  'You track and cancel Sunny Bakery orders.',
+  {
+    handoffDescription: 'Questions about an existing order',
+    tools: [cancelOrder],
+  },
+);
+
+const frontDesk = this.openai.createTriageAgent(
+  'Front desk',
+  'Read the message and pass it to the right helper.',
+  [orderHelper],
+  'Greets every Sunny Bakery customer',
+);
+
+let turn = await this.openai.reply('Where is my birthday cake?', frontDesk, {
+  session: chat,
+  fallback: frontDesk,
+});
+
+turn.output; // the order helper's reply
+turn.helper; // orderHelper
+
+turn = await this.openai.reply('Cancel it. It is order 123.', turn.helper, {
+  session: chat,
+  fallback: frontDesk,
+});
+
+if (turn.waiting) {
+  turn = await this.openai.finish(turn, 'approve');
+}
+
+turn.output; // "Order 123 is cancelled."
+```
+
+Say no instead with `this.openai.finish(turn, 'reject', { message: 'The cake is already baked.' })`.
+
 ### Use a helper as a tool
 
 Sometimes one helper should do a small job for another and hand the result back, instead of taking over the chat. `asTool` does that. The main helper still writes the answer.

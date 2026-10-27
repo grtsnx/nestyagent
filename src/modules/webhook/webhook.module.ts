@@ -5,6 +5,5 @@ import { WebhookController } from './webhook.controller.js';
 @Module({
   imports: [SandboxModule],
   controllers: [WebhookController],
-  exports: [SandboxModule],
 })
 export class WebhookModule {}

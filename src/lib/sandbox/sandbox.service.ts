@@ -31,6 +31,7 @@ import {
   OpenaiService,
   type AgentGuardrails,
 } from '../openai/openai.service.js';
+import { isUniqueViolation, PrismaService } from '../prisma/prisma.service.js';
 
 type SandboxComputer =
   | 'unix'
@@ -88,9 +89,6 @@ const DEFAULT_HOSTED_MODEL = 'gpt-6-astra';
 const CONNECT_TIMEOUT_MS = 120_000;
 // A claim older than this belongs to a create that crashed, so a retry may take over.
 const CLAIM_TTL_MS = 10 * 60_000;
-const CLAIM_PREFIX = 'pending:';
-// How many recent sessions to search when an environment expires.
-const EXPIRED_SCAN_LIMIT = 500;
 // The only variables the executor inherits from this app, besides CODEX_API_KEY.
 const EXECUTOR_ENV_KEYS = ['PATH', 'HOME', 'USER', 'LANG', 'TMPDIR', 'SHELL'];
 const runFile = promisify(execFile);
@@ -139,6 +137,7 @@ export class SandboxService {
   constructor(
     private readonly configService: ConfigService,
     private readonly openaiService: OpenaiService,
+    private readonly prisma: PrismaService,
   ) {}
 
   // Create a sandbox agent. Leave model out to use the default model.
@@ -461,7 +460,7 @@ export class SandboxService {
       return;
     }
     if (event.type === 'agent.environment.expired') {
-      await this.releaseEnvironmentMachine(event.data.id);
+      await this.releaseMachine({ environmentId: event.data.id });
     }
   }
 
@@ -476,9 +475,9 @@ export class SandboxService {
     return await task;
   }
 
-  //1. Claim the session in its metadata before creating anything. Re-read so only one claim goes ahead.
-  //2. Create the machine. A failure clears the claim so OpenAI's retry can try again.
-  //3. Record the machine id. If that fails, delete the machine so nothing runs unrecorded.
+  //1. Claim the session in Postgres before creating anything. Only one claim can win.
+  //2. Create the machine. A failure removes the claim so OpenAI's retry can try again.
+  //3. Record the machine id on that claim. If that fails, delete the machine so nothing runs unrecorded.
   private async connectRemoteMachine(sessionId: string) {
     const session =
       await this.openai().beta.agents.sessions.retrieve(sessionId);
@@ -486,8 +485,7 @@ export class SandboxService {
     const needsConnection = session.required_actions.some(
       (action) => action.type === 'environment_connection',
     );
-    const current = session.metadata.remote_machine_id;
-    if (!needsConnection || (current && !isStaleClaim(current))) return;
+    if (!needsConnection) return;
 
     const request = {
       sessionId: session.id,
@@ -495,79 +493,101 @@ export class SandboxService {
       remoteUrl: session.environment.remote_url,
       executorKey: this.executorKey(),
     };
-    const claim = `${CLAIM_PREFIX}${Date.now()}:${randomUUID()}`;
-    await this.setMachineId(session.id, session.metadata, claim);
-    const claimed =
-      await this.openai().beta.agents.sessions.retrieve(sessionId);
-    if (claimed.metadata.remote_machine_id !== claim) return;
+    const claimToken = await this.claimMachine(
+      request.sessionId,
+      request.environmentId,
+    );
+    if (!claimToken) return;
 
     let machineId: string;
     try {
       machineId = await this.createRemoteMachine(request);
     } catch (error) {
-      await this.setMachineId(session.id, session.metadata);
-      throw error;
-    }
-
-    try {
-      await this.setMachineId(session.id, session.metadata, machineId);
-    } catch (error) {
-      await this.deleteRemoteMachine(machineId).catch((cleanup: unknown) => {
-        throw new AggregateError(
-          [error, cleanup],
-          `Remote machine ${machineId} was created but could not be recorded or deleted.`,
-        );
+      await this.db().remoteMachine.deleteMany({
+        where: { sessionId: request.sessionId, claimToken, machineId: null },
       });
       throw error;
     }
+
+    let recorded: number;
+    try {
+      ({ count: recorded } = await this.db().remoteMachine.updateMany({
+        where: { sessionId: request.sessionId, claimToken },
+        data: { machineId },
+      }));
+    } catch (error) {
+      return await this.discardMachine(machineId, error);
+    }
+    if (recorded !== 1) {
+      await this.discardMachine(
+        machineId,
+        new Error('Another webhook took over this claim during the create.'),
+      );
+    }
   }
 
-  // Replace remote_machine_id and keep the other metadata. Leave machineId out to remove it.
-  private async setMachineId(
-    sessionId: string,
-    metadata: Record<string, string>,
-    machineId?: string,
-  ) {
-    const next = { ...metadata };
-    delete next.remote_machine_id;
-    if (machineId) next.remote_machine_id = machineId;
-    await this.openai().beta.agents.sessions.update(sessionId, {
-      metadata: next,
+  //1. Insert a claim row. The session id is the key, so a second insert fails and that webhook stops.
+  //2. A claim with no machine that is older than CLAIM_TTL_MS belongs to a crashed create. One update takes it over.
+  private async claimMachine(sessionId: string, environmentId: string) {
+    const claimToken = randomUUID();
+    try {
+      await this.db().remoteMachine.create({
+        data: { sessionId, environmentId, claimToken },
+      });
+      return claimToken;
+    } catch (error) {
+      if (!isUniqueViolation(error)) throw error;
+    }
+    const takeover = await this.db().remoteMachine.updateMany({
+      where: {
+        sessionId,
+        machineId: null,
+        claimedAt: { lt: new Date(Date.now() - CLAIM_TTL_MS) },
+      },
+      data: { claimToken, claimedAt: new Date(), environmentId },
     });
+    return takeover.count === 1 ? claimToken : undefined;
   }
 
+  // Delete a machine that could not be recorded, then report why.
+  private async discardMachine(
+    machineId: string,
+    error: unknown,
+  ): Promise<never> {
+    try {
+      await this.deleteRemoteMachine(machineId);
+    } catch (cleanup) {
+      throw new AggregateError(
+        [error, cleanup],
+        `Remote machine ${machineId} was created but could not be recorded or deleted.`,
+      );
+    }
+    throw error;
+  }
+
+  // A failed or deleted session gives its machine back.
   private async releaseSessionMachine(sessionId: string) {
     try {
       const session =
         await this.openai().beta.agents.sessions.retrieve(sessionId);
       if (session.status !== 'failed') return;
-      await this.releaseMachine(session.metadata.remote_machine_id);
     } catch (error) {
-      if (error instanceof APIError && error.status === 404) return;
-      throw error;
+      if (!(error instanceof APIError && error.status === 404)) throw error;
     }
+    await this.releaseMachine({ sessionId });
   }
 
-  // The expired event names only the environment, so find its session among the recent ones.
-  private async releaseEnvironmentMachine(environmentId: string) {
-    let scanned = 0;
-    for await (const session of this.openai().beta.agents.sessions.list({
-      order: 'desc',
-    })) {
-      if (
-        session.environment.type === 'self_hosted' &&
-        session.environment.id === environmentId
-      ) {
-        await this.releaseMachine(session.metadata.remote_machine_id);
-        return;
-      }
-      if (++scanned >= EXPIRED_SCAN_LIMIT) return;
-    }
-  }
-
-  private async releaseMachine(machineId?: string) {
-    if (!machineId || machineId.startsWith(CLAIM_PREFIX)) return;
-    await this.deleteRemoteMachine(machineId);
+  //1. Delete the machine first, then its row. If the delete fails, the row stays and the next event retries.
+  //2. A row with no machine yet is a create in progress, so it is left alone.
+  private async releaseMachine(
+    where: { sessionId: string } | { environmentId: string },
+  ) {
+    const row = await this.db().remoteMachine.findUnique({ where });
+    if (!row?.machineId) return;
+    await this.deleteRemoteMachine(row.machineId);
+    await this.db().remoteMachine.deleteMany({
+      where: { sessionId: row.sessionId, machineId: row.machineId },
+    });
   }
 
   // The id prefix says which provider created the machine, so delete still works if the setting changes.
@@ -867,6 +887,10 @@ export class SandboxService {
     return this.openaiService.client();
   }
 
+  private db() {
+    return this.prisma.db;
+  }
+
   private executorKey() {
     return this.configService
       .getOrThrow<string>('OPENAI_EXECUTOR_API_KEY')
@@ -899,12 +923,6 @@ function isRemoteMachineProvider(
   provider: string,
 ): provider is RemoteMachineProvider {
   return (remoteMachineProviders as readonly string[]).includes(provider);
-}
-
-function isStaleClaim(machineId: string) {
-  if (!machineId.startsWith(CLAIM_PREFIX)) return false;
-  const claimedAt = Number(machineId.slice(CLAIM_PREFIX.length).split(':')[0]);
-  return !(Date.now() - claimedAt < CLAIM_TTL_MS);
 }
 
 export function executorEnvironment(extra: Record<string, string>) {

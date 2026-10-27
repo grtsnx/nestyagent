@@ -1,0 +1,53 @@
+// The app's database. Run `bun run db:migrate` after you change it.
+
+generator client {
+  provider               = "prisma-client"
+  output                 = "../src/generated/prisma"
+  runtime                = "nodejs"
+  moduleFormat           = "esm"
+  generatedFileExtension = "ts"
+  importFileExtension    = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// One message or tool step in a chat. Ordered by id.
+model ChatItem {
+  id        BigInt   @id @default(autoincrement())
+  chatId    String   @map("chat_id")
+  item      Json
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([chatId, id])
+  @@map("chat_items")
+}
+
+enum PausedRunStatus {
+  waiting
+  taken
+}
+
+// A run that stopped for a person to approve. It can be taken once.
+model PausedRun {
+  id        String          @id @default(uuid())
+  state     String
+  status    PausedRunStatus @default(waiting)
+  createdAt DateTime        @default(now()) @map("created_at")
+  updatedAt DateTime        @updatedAt @map("updated_at")
+
+  @@map("paused_runs")
+}
+
+// The machine a self-hosted session runs on. One row per session.
+// claimToken marks which webhook owns the create. machineId is set once the machine exists.
+model RemoteMachine {
+  sessionId     String   @id @map("session_id")
+  environmentId String   @unique @map("environment_id")
+  claimToken    String   @map("claim_token")
+  claimedAt     DateTime @default(now()) @map("claimed_at")
+  machineId     String?  @map("machine_id")
+
+  @@map("remote_machines")
+}

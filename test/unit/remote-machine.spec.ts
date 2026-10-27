@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ConfigService } from '@nestjs/config';
 import { Manifest, type SandboxClient } from '@openai/agents/sandbox';
 import type { OpenaiService } from '@/lib/openai/openai.service.js';
+import { fakePrisma } from './fake-prisma.js';
 import {
   awsRunArgs,
   awsTerminateArgs,
@@ -13,7 +14,8 @@ import {
 
 function sandboxService(
   settings: Record<string, string>,
-  sessions: Record<string, unknown> = {},
+  api: Record<string, unknown> = {},
+  prisma = fakePrisma().prisma,
 ) {
   const config = {
     get: (key: string) => settings[key],
@@ -22,47 +24,43 @@ function sandboxService(
       return settings[key];
     },
   } as unknown as ConfigService;
-  const openai = { client: () => sessions } as unknown as OpenaiService;
-  return new SandboxService(config, openai);
+  const openai = { client: () => api } as unknown as OpenaiService;
+  return new SandboxService(config, openai, prisma);
 }
 
-// A self-hosted session that waits for its machine, with metadata kept like the API keeps it.
-function hostedApi() {
-  let metadata: Record<string, string> = {};
-  const session = () => ({
-    id: 'sess_1',
-    status: 'idle',
-    environment: {
-      type: 'self_hosted',
-      id: 'env_1',
-      remote_url: 'wss://example.com',
-    },
-    required_actions: [{ type: 'environment_connection' }],
-    metadata: { ...metadata },
-  });
-  const update = vi.fn(
-    async (_id: string, body: { metadata: Record<string, string> }) => {
-      metadata = body.metadata;
-    },
-  );
+// A self-hosted session that waits for its machine.
+function hostedApi(status = 'idle') {
   return {
-    metadata: () => metadata,
-    update,
-    api: {
-      webhooks: { unwrap: async (body: string) => JSON.parse(body) },
-      beta: {
-        agents: {
-          sessions: {
-            retrieve: async () => session(),
-            update,
-            list: async function* () {
-              yield session();
+    webhooks: { unwrap: async (body: string) => JSON.parse(body) },
+    beta: {
+      agents: {
+        sessions: {
+          retrieve: async () => ({
+            id: 'sess_1',
+            status,
+            environment: {
+              type: 'self_hosted',
+              id: 'env_1',
+              remote_url: 'wss://example.com',
             },
-          },
+            required_actions: [{ type: 'environment_connection' }],
+          }),
         },
       },
     },
   };
+}
+
+// DigitalOcean answers a create with do_1 and a delete with an empty 200.
+function digitalOcean() {
+  const fetchMock = vi.fn(
+    async (_url: URL | string, init?: RequestInit) =>
+      new Response(
+        init?.method === 'DELETE' ? null : JSON.stringify({ id: 'do_1' }),
+      ),
+  );
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
 }
 
 const remoteSettings = {
@@ -154,78 +152,125 @@ describe('self-hosted machines', () => {
   });
 
   it('creates one machine per session and records it', async () => {
-    const hosted = hostedApi();
-    const fetchMock = vi.fn(
-      async () => new Response(JSON.stringify({ id: 'do_1' })),
-    );
-    vi.stubGlobal('fetch', fetchMock);
-    const service = sandboxService(remoteSettings, hosted.api);
+    const fetchMock = digitalOcean();
+    const { db, prisma } = fakePrisma();
+    const service = sandboxService(remoteSettings, hostedApi(), prisma);
 
     await service.handleHostedWebhook(connectEvent, {});
     await service.handleHostedWebhook(connectEvent, {});
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(hosted.metadata()).toEqual({
-      remote_machine_id: 'digitalocean:do_1',
-    });
+    expect(db.remoteMachine.rows).toMatchObject([
+      {
+        sessionId: 'sess_1',
+        environmentId: 'env_1',
+        machineId: 'digitalocean:do_1',
+      },
+    ]);
   });
 
-  it('clears the claim when the machine cannot be created', async () => {
-    const hosted = hostedApi();
+  it('creates one machine when two servers get the webhook at once', async () => {
+    const fetchMock = digitalOcean();
+    const { db, prisma } = fakePrisma();
+    const first = sandboxService(remoteSettings, hostedApi(), prisma);
+    const second = sandboxService(remoteSettings, hostedApi(), prisma);
+
+    await Promise.all([
+      first.handleHostedWebhook(connectEvent, {}),
+      second.handleHostedWebhook(connectEvent, {}),
+    ]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(db.remoteMachine.rows).toHaveLength(1);
+  });
+
+  it('removes the claim when the machine cannot be created', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => new Response('', { status: 500 })),
     );
-    const service = sandboxService(remoteSettings, hosted.api);
+    const { db, prisma } = fakePrisma();
+    const service = sandboxService(remoteSettings, hostedApi(), prisma);
 
     await expect(service.handleHostedWebhook(connectEvent, {})).rejects.toThrow(
       /status 500/,
     );
-    expect(hosted.metadata()).toEqual({});
+    expect(db.remoteMachine.rows).toEqual([]);
   });
 
   it('deletes the machine when its id cannot be recorded', async () => {
-    const hosted = hostedApi();
-    const write = hosted.update.getMockImplementation();
-    hosted.update
-      .mockImplementationOnce(write!)
-      .mockRejectedValueOnce(new Error('metadata write failed'));
-    const fetchMock = vi.fn(
-      async (_url: URL | string, init?: RequestInit) =>
-        new Response(
-          init?.method === 'DELETE' ? null : JSON.stringify({ id: 'do_1' }),
-        ),
-    );
-    vi.stubGlobal('fetch', fetchMock);
-    const service = sandboxService(remoteSettings, hosted.api);
+    const fetchMock = digitalOcean();
+    const { db, prisma } = fakePrisma();
+    db.remoteMachine.updateMany = async () => {
+      throw new Error('database write failed');
+    };
+    const service = sandboxService(remoteSettings, hostedApi(), prisma);
 
     await expect(service.handleHostedWebhook(connectEvent, {})).rejects.toThrow(
-      'metadata write failed',
+      'database write failed',
     );
     expect(fetchMock.mock.calls.at(-1)?.[1]?.method).toBe('DELETE');
   });
 
-  it('deletes the machine when its environment expires', async () => {
-    const hosted = hostedApi();
-    await hosted.update('sess_1', {
-      metadata: { remote_machine_id: 'digitalocean:do_1' },
+  it('takes over a claim left by a crashed create', async () => {
+    const fetchMock = digitalOcean();
+    const { db, prisma } = fakePrisma();
+    await db.remoteMachine.create({
+      data: {
+        sessionId: 'sess_1',
+        environmentId: 'env_1',
+        claimToken: 'crashed',
+        claimedAt: new Date(Date.now() - 11 * 60_000),
+      },
     });
-    const fetchMock = vi.fn(async () => new Response(null));
-    vi.stubGlobal('fetch', fetchMock);
-    const service = sandboxService(remoteSettings, hosted.api);
+    const service = sandboxService(remoteSettings, hostedApi(), prisma);
 
-    await service.handleHostedWebhook(
-      JSON.stringify({
-        type: 'agent.environment.expired',
-        data: { id: 'env_1' },
-      }),
-      {},
-    );
+    await service.handleHostedWebhook(connectEvent, {});
 
-    expect(fetchMock).toHaveBeenCalledWith(
-      'https://api.digitalocean.com/v2/agents/sessions/do_1',
-      expect.objectContaining({ method: 'DELETE' }),
-    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(db.remoteMachine.rows[0]).toMatchObject({
+      machineId: 'digitalocean:do_1',
+    });
+  });
+
+  it('leaves a fresh claim alone', async () => {
+    const fetchMock = digitalOcean();
+    const { db, prisma } = fakePrisma();
+    await db.remoteMachine.create({
+      data: { sessionId: 'sess_1', environmentId: 'env_1', claimToken: 'busy' },
+    });
+    const service = sandboxService(remoteSettings, hostedApi(), prisma);
+
+    await service.handleHostedWebhook(connectEvent, {});
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('deletes the machine when its environment expires or its session fails', async () => {
+    for (const [event, status] of [
+      [{ type: 'agent.environment.expired', data: { id: 'env_1' } }, 'idle'],
+      [{ type: 'agent.session.failed', data: { id: 'sess_1' } }, 'failed'],
+    ] as const) {
+      const fetchMock = digitalOcean();
+      const { db, prisma } = fakePrisma();
+      await db.remoteMachine.create({
+        data: {
+          sessionId: 'sess_1',
+          environmentId: 'env_1',
+          claimToken: 'done',
+          machineId: 'digitalocean:do_1',
+        },
+      });
+      const service = sandboxService(remoteSettings, hostedApi(status), prisma);
+
+      await service.handleHostedWebhook(JSON.stringify(event), {});
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        'https://api.digitalocean.com/v2/agents/sessions/do_1',
+        expect.objectContaining({ method: 'DELETE' }),
+      );
+      expect(db.remoteMachine.rows).toEqual([]);
+    }
   });
 
   it('gives the executor its key and none of the app secrets', () => {

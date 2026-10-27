@@ -1,15 +1,16 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { randomUUID } from 'node:crypto';
 import OpenAI from 'openai';
 import { z } from 'zod';
 import {
   Agent,
+  AgentInputItem,
   AgentOutputType,
   defineToolInputGuardrail,
   defineToolOutputGuardrail,
   InputGuardrail,
   InputGuardrailTripwireTriggered,
-  MemorySession,
   ModelSettings,
   OpenAIProvider,
   OutputGuardrail,
@@ -28,6 +29,8 @@ import {
   ToolInputGuardrailTripwireTriggered,
   ToolOutputGuardrailTripwireTriggered,
 } from '@openai/agents';
+import type { Prisma } from '@/generated/prisma/client.js';
+import { PrismaService } from '../prisma/prisma.service.js';
 
 // Any agent, whatever its context or output type.
 type AnyAgent = Agent<any, any>;
@@ -42,6 +45,8 @@ export type AgentGuardrails = {
 
 type ResumeOptions = {
   websocket?: boolean;
+  signal?: AbortSignal;
+  maxTurns?: number;
   outputGuardrailBlockedMessage?:
     string | OutputGuardrailBlockedMessageFormatter;
 };
@@ -85,6 +90,74 @@ type RejectionChoice = {
   message?: string;
 };
 
+type ChatTurn = {
+  output: unknown;
+  helper: AnyAgent;
+  agent: AnyAgent;
+  waiting: boolean;
+  result: RunResult<any, AnyAgent>;
+};
+
+type ReplyOptions<TContext> = RunAgentOptions<TContext> & {
+  fallback?: AnyAgent;
+};
+
+//1. A chat history kept in Postgres. It survives a restart and is shared by every copy of the app.
+//2. Every write is one statement, so two messages at once cannot lose or mix up items.
+export class DatabaseSession implements Session {
+  constructor(
+    private readonly prisma: PrismaService,
+    readonly chatId: string,
+  ) {}
+
+  async getSessionId() {
+    return this.chatId;
+  }
+
+  // Oldest first. With limit, only the newest items, still oldest first.
+  async getItems(limit?: number) {
+    const rows = await this.prisma.db.chatItem.findMany({
+      where: { chatId: this.chatId },
+      orderBy: { id: limit === undefined ? 'asc' : 'desc' },
+      ...(limit !== undefined && { take: limit }),
+      select: { item: true },
+    });
+    const items = rows.map((row) => row.item as unknown as AgentInputItem);
+    return limit === undefined ? items : items.reverse();
+  }
+
+  async addItems(items: AgentInputItem[]) {
+    if (items.length === 0) return;
+    await this.prisma.db.chatItem.createMany({
+      data: items.map((item) => ({
+        chatId: this.chatId,
+        item: item as unknown as Prisma.InputJsonValue,
+      })),
+    });
+  }
+
+  // Removes and returns the newest item. SKIP LOCKED lets two pops at once take different items.
+  async popItem() {
+    const rows = await this.prisma.db.$queryRaw<{ item: AgentInputItem }[]>`
+      DELETE FROM chat_items
+      WHERE id = (
+        SELECT id FROM chat_items
+        WHERE chat_id = ${this.chatId}
+        ORDER BY id DESC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+      )
+      RETURNING item`;
+    return rows[0]?.item;
+  }
+
+  async clearSession() {
+    await this.prisma.db.chatItem.deleteMany({
+      where: { chatId: this.chatId },
+    });
+  }
+}
+
 // The guardrail fields for any agent constructor. A list left out becomes the SDK default of none.
 export function guardrailConfig(options?: AgentGuardrails): AgentGuardrails {
   return {
@@ -100,7 +173,10 @@ export class OpenaiService implements OnModuleInit {
   private socketRunner?: Runner;
   private apiClient?: OpenAI;
 
-  constructor(private readonly configService: ConfigService) {}
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly prisma: PrismaService,
+  ) {}
 
   // Set the default OpenAI key
   onModuleInit() {
@@ -122,9 +198,10 @@ export class OpenaiService implements OnModuleInit {
     return this.sharedRunner;
   }
 
-  // A notebook for one chat. Pass the same session on every later message.
-  createSession() {
-    return new MemorySession();
+  //1. The history for one chat, kept in Postgres. Pass the same session on every later message.
+  //2. Store chatId with your user. Pass it back later, even after a restart, to continue the chat.
+  createSession(chatId: string = randomUUID()) {
+    return new DatabaseSession(this.prisma, chatId);
   }
 
   // Create a new agent. Leave model out to use the runner model.
@@ -155,8 +232,8 @@ export class OpenaiService implements OnModuleInit {
   }
 
   //1. Optional check before the agent starts. It runs only when this agent is first.
-  //2. runInParallel is optional. Leave it out to run the check alongside the agent.
-  //3. Pass false when the agent must wait until the check finishes.
+  //2. The agent waits for the check, so no tool runs before a blocked request stops.
+  //3. Pass runInParallel: true to run both at once. It is faster, but a tool may run before the check stops it.
   inputGuardrail(
     name: string,
     execute: InputGuardrail['execute'],
@@ -165,9 +242,7 @@ export class OpenaiService implements OnModuleInit {
     return {
       name,
       execute,
-      ...(options?.runInParallel !== undefined && {
-        runInParallel: options.runInParallel,
-      }),
+      runInParallel: options?.runInParallel ?? false,
     };
   }
 
@@ -299,7 +374,9 @@ export class OpenaiService implements OnModuleInit {
   //5. websocket is optional. Turn it on when this run will call the model many times.
   //6. stream is optional. stream: true returns a streamed result. Wait for completed, then approve or reject.
   //7. outputGuardrailBlockedMessage is optional. It replaces a blocked tool result.
-  //8. When a tool pauses, the result carries interruptions. approve or reject, then resumeAgent.
+  //8. signal is optional. Abort it to stop the run, for example when the caller disconnects.
+  //9. maxTurns is optional. It stops a run that loops longer than that many model turns.
+  //10. When a tool pauses, the result carries interruptions. approve or reject, then resumeAgent.
   runAgent<TAgent extends AnyAgent, TContext = unknown>(
     prompt: string,
     agent: TAgent,
@@ -324,6 +401,59 @@ export class OpenaiService implements OnModuleInit {
     return result.lastAgent ?? fallback;
   }
 
+  //1. One customer message. session is optional and keeps the chat.
+  //2. fallback is optional. It is who answers next when nobody took over.
+  //3. waiting is true when a tool paused. output is empty until finish.
+  async reply<TContext>(
+    prompt: string,
+    agent: AnyAgent,
+    options?: ReplyOptions<TContext>,
+  ): Promise<ChatTurn> {
+    const result = await this.runAgent(prompt, agent, {
+      ...(options?.context !== undefined && { context: options.context }),
+      ...(options?.session && { session: options.session }),
+      ...(options?.websocket && { websocket: options.websocket }),
+      ...(options?.outputGuardrailBlockedMessage !== undefined && {
+        outputGuardrailBlockedMessage: options.outputGuardrailBlockedMessage,
+      }),
+    });
+    return this.chatTurn(agent, options?.fallback ?? agent, result);
+  }
+
+  //1. Finish a paused reply. Pass approve or reject.
+  //2. message is optional and is only sent when the decision is reject.
+  async finish(
+    turn: ChatTurn,
+    decision: 'approve' | 'reject',
+    options?: { message?: string },
+  ): Promise<ChatTurn> {
+    const state =
+      decision === 'reject'
+        ? this.reject(turn.result, {
+            ...(options?.message !== undefined && {
+              message: options.message,
+            }),
+          })
+        : this.approve(turn.result);
+    const result = await this.resumeAgent(turn.agent, state);
+    return this.chatTurn(turn.agent, turn.helper, result);
+  }
+
+  private chatTurn(
+    agent: AnyAgent,
+    fallback: AnyAgent,
+    result: RunResult<any, AnyAgent>,
+  ): ChatTurn {
+    const waiting = (result.interruptions?.length ?? 0) > 0;
+    return {
+      output: waiting ? undefined : result.finalOutput,
+      helper: this.nextAgent(result, fallback),
+      agent,
+      waiting,
+      result,
+    };
+  }
+
   //1. Optional. Approve a paused tool call, then pass the returned state to resumeAgent.
   //2. Leave interruptions out to approve every pause on the result.
   //3. alwaysApprove is optional. It allows that tool for the rest of this run.
@@ -346,7 +476,7 @@ export class OpenaiService implements OnModuleInit {
   }
 
   // Continue a paused run from the state approve or reject returned.
-  // websocket, stream, and outputGuardrailBlockedMessage are optional.
+  // websocket, stream, signal, maxTurns, and outputGuardrailBlockedMessage are optional.
   resumeAgent<TAgent extends AnyAgent>(
     agent: TAgent,
     state: PausedRun['state'],
@@ -365,14 +495,34 @@ export class OpenaiService implements OnModuleInit {
     return await this.executeRun(agent, state, options);
   }
 
-  // Optional. Store this string when a person will decide later.
-  saveRun(result: PausedRun) {
-    return result.state.toString();
+  //1. Optional. Store a paused run in Postgres when a person will decide later. Returns its id.
+  //2. The run survives a restart. Keep the id with the request that needs the decision.
+  async saveRun(result: PausedRun) {
+    const row = await this.prisma.db.pausedRun.create({
+      data: { state: result.state.toString() },
+      select: { id: true },
+    });
+    return row.id;
   }
 
-  // Load a string from saveRun. Pass the same agent that started the run.
-  async loadRun(agent: AnyAgent, saved: string) {
-    return RunState.fromString(agent, saved);
+  //1. Load a paused run by the id from saveRun. Pass the same agent that started the run.
+  //2. A run can be taken once. A second load throws, so a double click cannot run a tool twice.
+  //3. If the state does not fit the agent, the transaction rolls back and the run stays waiting.
+  async loadRun(agent: AnyAgent, id: string) {
+    return await this.prisma.db.$transaction(async (tx) => {
+      const taken = await tx.pausedRun.updateMany({
+        where: { id, status: 'waiting' },
+        data: { status: 'taken' },
+      });
+      if (taken.count !== 1) {
+        throw new Error('This paused run was already taken or does not exist.');
+      }
+      const run = await tx.pausedRun.findUniqueOrThrow({
+        where: { id },
+        select: { state: true },
+      });
+      return await RunState.fromString(agent, run.state);
+    });
   }
 
   //1. Approve or reject each chosen pause, then hand back the state to resume.
@@ -396,6 +546,8 @@ export class OpenaiService implements OnModuleInit {
     const runOptions = {
       context: options?.context,
       session: options?.session,
+      signal: options?.signal,
+      maxTurns: options?.maxTurns,
       outputGuardrailBlockedMessage: options?.outputGuardrailBlockedMessage,
     };
     const runner = this.runner(options?.websocket);

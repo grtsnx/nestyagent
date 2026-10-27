@@ -75,6 +75,7 @@ const environmentSchema = z
     OBSERVE_APP_SECRET: z.string().trim().optional(),
     OBSERVE_SERVICE_ID: z.string().trim().optional(),
     SWAGGER_ENABLED: booleanValue('SWAGGER_ENABLED').optional(),
+    DATABASE_URL: optionalString(),
     OPENAI_API_KEY: optionalString(),
     OPENAI_HOSTED_MODEL: optionalString(),
     ACCOUNT_PASSWORD: optionalString(),

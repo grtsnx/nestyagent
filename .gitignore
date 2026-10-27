@@ -57,3 +57,5 @@ pids
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
 /docs/*
+# Prisma client, made by `bun run db:generate`
+/src/generated

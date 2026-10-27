@@ -1,10 +1,12 @@
 import { ConfigService } from '@nestjs/config';
 import {
   Agent,
+  type AgentInputItem,
   getHandoff,
   handoff,
   InputGuardrailTripwireTriggered,
   OutputGuardrailTripwireTriggered,
+  Runner,
   RunState,
   RunToolApprovalItem,
   ToolInputGuardrailTripwireTriggered,
@@ -14,11 +16,13 @@ import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { z } from 'zod';
 import { OpenaiService } from '@/lib/openai/openai.service.js';
 import { SandboxService } from '@/lib/sandbox/sandbox.service.js';
+import { fakePrisma } from './fake-prisma.js';
 
-function service() {
-  return new OpenaiService({
-    getOrThrow: () => 'sk-test',
-  } as unknown as ConfigService);
+function service(prisma = fakePrisma().prisma) {
+  return new OpenaiService(
+    { getOrThrow: () => 'sk-test' } as unknown as ConfigService,
+    prisma,
+  );
 }
 
 describe('OpenaiService orchestration', () => {
@@ -122,6 +126,7 @@ describe('OpenaiService orchestration', () => {
     const sandbox = new SandboxService(
       { getOrThrow: () => 'sk-test' } as unknown as ConfigService,
       openai,
+      fakePrisma().prisma,
     );
     const guard = openai.outputGuardrail(
       'Keep the recipe secret',
@@ -154,7 +159,7 @@ describe('OpenaiService orchestration', () => {
       { runInParallel: false },
     );
 
-    expect(check.runInParallel).toBeUndefined();
+    expect(check.runInParallel).toBe(false);
     expect(blocking.runInParallel).toBe(false);
 
     const plain = new Agent({
@@ -240,7 +245,6 @@ describe('OpenaiService orchestration', () => {
     expect(state.reject).toHaveBeenCalledWith(second, {
       message: 'A person declined this.',
     });
-    expect(openai.saveRun(result)).toBe('saved-run');
   });
 
   it('uses the state pauses when the result has no interruption list', () => {
@@ -268,6 +272,7 @@ describe('OpenaiService orchestration', () => {
     const sandbox = new SandboxService(
       { getOrThrow: () => 'sk-test' } as unknown as ConfigService,
       openai,
+      fakePrisma().prisma,
     );
 
     const agent = sandbox.createSandboxAgent(
@@ -323,5 +328,184 @@ describe('OpenaiService orchestration', () => {
         new ToolOutputGuardrailTripwireTriggered('blocked', {} as never),
       ),
     ).toBe('tool-output');
+  });
+
+  it('answers one message and names the helper for the next one', async () => {
+    const openai = service();
+    const frontDesk = new Agent({ name: 'Front desk', instructions: 'Greet.' });
+    const orderHelper = new Agent({
+      name: 'Order helper',
+      instructions: 'Orders.',
+    });
+    openai.runAgent = async () =>
+      ({
+        finalOutput: 'Your cake is ready tomorrow.',
+        lastAgent: orderHelper,
+        interruptions: [],
+      }) as never;
+
+    const turn = await openai.reply('Where is my birthday cake?', frontDesk, {
+      fallback: frontDesk,
+    });
+
+    expect(turn.waiting).toBe(false);
+    expect(turn.output).toBe('Your cake is ready tomorrow.');
+    expect(turn.helper).toBe(orderHelper);
+    expect(turn.agent).toBe(frontDesk);
+  });
+
+  it('waits on a pause and finishes when the person says yes', async () => {
+    const openai = service();
+    const orderHelper = new Agent({
+      name: 'Order helper',
+      instructions: 'Orders.',
+    });
+    const state = { approve: vi.fn(), reject: vi.fn() };
+    openai.runAgent = async () =>
+      ({
+        finalOutput: undefined,
+        lastAgent: orderHelper,
+        interruptions: [{}],
+        state,
+      }) as never;
+    openai.resumeAgent = async () =>
+      ({
+        finalOutput: 'Order 123 is cancelled.',
+        lastAgent: orderHelper,
+        interruptions: [],
+      }) as never;
+
+    const waiting = await openai.reply(
+      'Cancel it. It is order 123.',
+      orderHelper,
+    );
+
+    expect(waiting.waiting).toBe(true);
+    expect(waiting.output).toBeUndefined();
+
+    const done = await openai.finish(waiting, 'approve');
+
+    expect(state.approve).toHaveBeenCalledOnce();
+    expect(done.waiting).toBe(false);
+    expect(done.output).toBe('Order 123 is cancelled.');
+  });
+});
+
+describe('OpenaiService storage and limits', () => {
+  const message = (text: string) =>
+    ({ role: 'user', content: text }) as AgentInputItem;
+
+  it('keeps a chat in the database and reopens it by id', async () => {
+    const { prisma } = fakePrisma();
+    const chat = service(prisma).createSession('chat-c-42');
+    await chat.addItems([
+      message('I ordered a cake.'),
+      message('Is it ready?'),
+    ]);
+
+    const reopened = service(prisma).createSession('chat-c-42');
+
+    expect(await reopened.getSessionId()).toBe('chat-c-42');
+    expect(await reopened.getItems()).toEqual([
+      message('I ordered a cake.'),
+      message('Is it ready?'),
+    ]);
+    expect(await reopened.getItems(1)).toEqual([message('Is it ready?')]);
+    expect(await reopened.popItem()).toEqual(message('Is it ready?'));
+    expect(await reopened.getItems()).toEqual([message('I ordered a cake.')]);
+
+    await reopened.clearSession();
+    expect(await reopened.getItems()).toEqual([]);
+    expect(await service(prisma).createSession('other').getItems()).toEqual([]);
+  });
+
+  it('gives each new chat its own id', async () => {
+    const openai = service();
+    const first = await openai.createSession().getSessionId();
+    const second = await openai.createSession().getSessionId();
+
+    expect(first).not.toBe(second);
+  });
+
+  it('lets a saved run be taken only once', async () => {
+    const { db, prisma } = fakePrisma();
+    const openai = service(prisma);
+    const agent = new Agent({ name: 'Order helper', instructions: 'Orders.' });
+    const loaded = { loaded: true } as unknown as RunState<unknown, Agent>;
+    const fromString = vi
+      .spyOn(RunState, 'fromString')
+      .mockResolvedValue(loaded);
+
+    const id = await openai.saveRun({
+      state: { toString: () => 'paused' } as unknown as RunState<
+        unknown,
+        Agent
+      >,
+    });
+
+    const attempts = await Promise.allSettled([
+      openai.loadRun(agent, id),
+      openai.loadRun(agent, id),
+    ]);
+
+    expect(attempts.map((attempt) => attempt.status).sort()).toEqual([
+      'fulfilled',
+      'rejected',
+    ]);
+    expect(fromString).toHaveBeenCalledWith(agent, 'paused');
+    expect(db.pausedRun.rows[0]).toMatchObject({ status: 'taken' });
+    fromString.mockRestore();
+  });
+
+  it('keeps a saved run waiting when it does not fit the agent', async () => {
+    const { db, prisma } = fakePrisma();
+    const openai = service(prisma);
+    const agent = new Agent({ name: 'Menu helper', instructions: 'Menu.' });
+    const fromString = vi
+      .spyOn(RunState, 'fromString')
+      .mockRejectedValue(new Error('Wrong agent.'));
+    const id = await openai.saveRun({
+      state: { toString: () => 'paused' } as unknown as RunState<
+        unknown,
+        Agent
+      >,
+    });
+
+    await expect(openai.loadRun(agent, id)).rejects.toThrow('Wrong agent.');
+    expect(db.pausedRun.rows[0]).toMatchObject({ status: 'waiting' });
+    fromString.mockRestore();
+  });
+
+  it('passes signal and maxTurns to the run', async () => {
+    const run = vi
+      .spyOn(Runner.prototype, 'run')
+      .mockResolvedValue({} as never);
+    const signal = new AbortController().signal;
+    const agent = new Agent({ name: 'Order helper', instructions: 'Orders.' });
+
+    await service().runAgent('Where is my order?', agent, {
+      signal,
+      maxTurns: 3,
+    });
+
+    expect(run).toHaveBeenCalledWith(
+      agent,
+      'Where is my order?',
+      expect.objectContaining({ signal, maxTurns: 3 }),
+    );
+    run.mockRestore();
+  });
+
+  it('makes the helper wait for a message check unless told otherwise', () => {
+    const openai = service();
+    const check = async () => ({ tripwireTriggered: false, outputInfo: null });
+
+    expect(openai.inputGuardrail('Bakery only', check).runInParallel).toBe(
+      false,
+    );
+    expect(
+      openai.inputGuardrail('Bakery only', check, { runInParallel: true })
+        .runInParallel,
+    ).toBe(true);
   });
 });
