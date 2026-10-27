@@ -8,6 +8,7 @@ import { validateEnvironment } from '@/config/index.js';
 import { HttpExceptionFilter, ResponseInterceptor } from '@/middleware';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
+import { LibModule } from '@/lib/lib.module.js';
 
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
 
@@ -33,6 +34,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
       throttlers: [{ ttl: 60_000, limit: 100 }],
     }),
     TerminusModule,
+    LibModule,
   ],
   controllers: [AppController],
   providers: [
