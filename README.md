@@ -269,6 +269,84 @@ const result = await this.openai.runAgent(
 
 </details>
 
+<details>
+<summary><h2>Sandbox</h2></summary>
+
+`SandboxService` opens a workspace computer. The chat stays in `OpenaiService`. A workspace is where files, commands, and a logged-in browser live.
+
+Every sandbox agent starts with three capabilities:
+
+- `shell` runs commands.
+- `filesystem` reads and edits files.
+- `compaction` shortens a long run so it can continue.
+
+`skills` and `memory` are optional. Pass `skills` when the agent should load a skill folder or repo. Pass `memory: true` when a later run should read lessons from earlier workspace work.
+
+### Create a sandbox agent
+
+```typescript
+const agent = this.sandbox.createSandboxAgent(
+  'Workspace agent',
+  'Use this computer. Browse, edit files, and continue work already in the workspace.',
+  { model: 'gpt-6-astra' },
+);
+```
+
+### Open a workspace and run
+
+`openSandbox` starts the computer. Pass the same workspace on the next run to keep the same files and browser. `chat` is optional and comes from `this.openai.createSession()`.
+
+```typescript
+const workspace = await this.sandbox.openSandbox();
+
+const result = await this.sandbox.runSandbox(
+  'Check the latest comment on my account.',
+  agent,
+  { workspace },
+);
+```
+
+### Continue in the same workspace
+
+```typescript
+const chat = this.openai.createSession();
+const workspace = await this.sandbox.openSandbox();
+
+await this.sandbox.runSandbox(
+  'Check the latest comment on my account.',
+  agent,
+  {
+    chat,
+    workspace,
+  },
+);
+
+await this.sandbox.runSandbox('Reply that I will call tomorrow.', agent, {
+  chat,
+  workspace,
+});
+```
+
+### Add skills or memory
+
+```typescript
+import { gitRepo } from '@openai/agents/sandbox';
+
+const agent = this.sandbox.createSandboxAgent(
+  'Workspace agent',
+  'Use the skill, then keep useful lessons for the next run.',
+  {
+    model: 'gpt-6-astra',
+    skills: { from: gitRepo({ repo: 'owner/workspace-skills', ref: 'main' }) },
+    memory: true,
+  },
+);
+```
+
+`ACCOUNT_PASSWORD` is optional. Set it in the server environment when the workspace should receive a login secret. Leave it unset and the workspace starts without one.
+
+</details>
+
 ## Health checks
 
 - `GET /v1/health/live` proves that the process can answer requests.
