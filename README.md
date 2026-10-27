@@ -18,7 +18,8 @@ bun run start:dev
 
 Swagger UI runs at `http://localhost:3000/api`, and Scalar runs at `http://localhost:3000/docs`. Both use the version-specific OpenAPI documents at `/api/v1-json` and `/api/v2-json`. The application prints every enabled documentation URL when it starts.
 
-## Configuration
+<details>
+<summary><h2>Configuration</h2></summary>
 
 The application validates configuration before it starts. Invalid ports, booleans, and CORS origins stop startup.
 
@@ -36,7 +37,10 @@ The application validates configuration before it starts. Invalid ports, boolean
 
 Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS origins without paths.
 
-## OpenAI agents
+</details>
+
+<details>
+<summary><h2>OpenAI agents</h2></summary>
 
 `OpenaiService` is global. Inject it where you create or run an agent. `OPENAI_API_KEY` is registered once at startup and is shared by every agent.
 
@@ -268,7 +272,10 @@ const result = await this.openai.runAgent(
 );
 ```
 
-## Sandbox
+</details>
+
+<details>
+<summary><h2>Sandbox</h2></summary>
 
 `SandboxService` opens a workspace computer. The chat stays in `OpenaiService`. A workspace is where files, commands, and a logged-in browser live.
 
@@ -916,14 +923,20 @@ Store `session.sessionId` with the chat. One session needs its own executor. Use
 
 On this Mac, `startHostedExecutor` runs the executor. On Lambda, Databricks, DigitalOcean, OCI, or another host, that machine runs `hostedExecutorCommand(session)` after it is up. When OpenAI posts `agent.session.created` for a self-hosted session, pass the event to `onHostedSessionCreated` to start the executor on this Mac. A webhook that creates or deletes a remote machine belongs to that provider.
 
-## Health checks
+</details>
+
+<details>
+<summary><h2>Health checks</h2></summary>
 
 - `GET /v1/health/live` proves that the process can answer requests.
 - `GET /v1/health/ready` checks the process's memory limits.
 
 Both routes also support API version 2. The checks do not depend on external websites, databases, or Redis.
 
-## Verification
+</details>
+
+<details>
+<summary><h2>Verification</h2></summary>
 
 All tests live under `test/`.
 
@@ -937,7 +950,10 @@ bun run test:cov
 bun run build
 ```
 
-## Container deployment
+</details>
+
+<details>
+<summary><h2>Container deployment</h2></summary>
 
 Build and run the same OCI image on Docker, Kubernetes, Nomad, ECS, Cloud Run, Fly.io, Railway, Render, or any compatible platform:
 
@@ -948,7 +964,10 @@ docker run --rm --read-only --tmpfs /tmp --publish 3000:3000 agentic:local
 
 The image uses pinned Bun and Node digests, contains production dependencies only, and runs as the unprivileged `node` user.
 
-## CI/CD
+</details>
+
+<details>
+<summary><h2>CI/CD</h2></summary>
 
 `.github/workflows/ci.yml` installs the lockfile exactly, checks formatting and types, runs all tests, audits dependencies, builds the application and container, and scans the runtime image. Every external action is pinned to a full commit SHA.
 
@@ -962,6 +981,8 @@ git push origin v1.0.0
 ```
 
 The workflow delivers a portable image. Each hosting platform can deploy that immutable image digest with its own native rollout and rollback controls.
+
+</details>
 
 ## Reliability and state
 

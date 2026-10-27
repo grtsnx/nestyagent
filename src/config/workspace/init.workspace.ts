@@ -13,15 +13,20 @@ import {
   ManifestEnvironment,
   mount,
   r2Mount,
+  s3FilesMount,
   s3Mount,
   SandboxGroupInit,
   SandboxUserInit,
 } from '@openai/agents/sandbox';
 
+type GitHost = 'github' | 'gitlab' | 'bitbucket';
+
 type RepoLink = {
   url: string;
   path?: string;
   ref?: string;
+  token?: string;
+  username?: string;
 };
 
 type MountSpec =
@@ -33,15 +38,30 @@ type MountSpec =
       accessKeyId?: string;
       secretAccessKey?: string;
       sessionToken?: string;
+      endpointUrl?: string;
+      s3Provider?: string;
+      readOnly?: boolean;
+    }
+  | {
+      provider: 's3-files';
+      fileSystemId: string;
+      subpath?: string;
+      mountTargetIp?: string;
+      accessPoint?: string;
+      region?: string;
       readOnly?: boolean;
     }
   | {
       provider: 'gcs';
       bucket: string;
       prefix?: string;
+      region?: string;
+      endpointUrl?: string;
       accessId?: string;
       secretAccessKey?: string;
       serviceAccountFile?: string;
+      serviceAccountCredentials?: string;
+      accessToken?: string;
       readOnly?: boolean;
     }
   | {
@@ -66,12 +86,22 @@ type MountSpec =
       clientId?: string;
       clientSecret?: string;
       accessToken?: string;
+      token?: string;
+      boxConfigFile?: string;
+      configCredentials?: string;
+      boxSubType?: 'user' | 'enterprise';
+      rootFolderId?: string;
+      impersonate?: string;
+      ownedBy?: string;
+      path?: string;
       readOnly?: boolean;
     }
   | {
       provider: 'github' | 'gitlab' | 'bitbucket';
       url: string;
       ref?: string;
+      token?: string;
+      username?: string;
     }
   | {
       provider: 'google-drive';
@@ -156,6 +186,19 @@ function mountEntry(spec: MountSpec) {
             secretAccessKey: spec.secretAccessKey,
           }),
           ...(spec.sessionToken && { sessionToken: spec.sessionToken }),
+          ...(spec.endpointUrl && { endpointUrl: spec.endpointUrl }),
+          ...(spec.s3Provider && { s3Provider: spec.s3Provider }),
+        }),
+        spec.readOnly,
+      );
+    case 's3-files':
+      return attached(
+        s3FilesMount({
+          fileSystemId: spec.fileSystemId,
+          ...(spec.subpath && { subpath: spec.subpath }),
+          ...(spec.mountTargetIp && { mountTargetIp: spec.mountTargetIp }),
+          ...(spec.accessPoint && { accessPoint: spec.accessPoint }),
+          ...(spec.region && { region: spec.region }),
         }),
         spec.readOnly,
       );
@@ -168,9 +211,15 @@ function mountEntry(spec: MountSpec) {
           ...(spec.secretAccessKey && {
             secretAccessKey: spec.secretAccessKey,
           }),
+          ...(spec.region && { region: spec.region }),
+          ...(spec.endpointUrl && { endpointUrl: spec.endpointUrl }),
           ...(spec.serviceAccountFile && {
             serviceAccountFile: spec.serviceAccountFile,
           }),
+          ...(spec.serviceAccountCredentials && {
+            serviceAccountCredentials: spec.serviceAccountCredentials,
+          }),
+          ...(spec.accessToken && { accessToken: spec.accessToken }),
         }),
         spec.readOnly,
       );
@@ -203,6 +252,16 @@ function mountEntry(spec: MountSpec) {
           ...(spec.clientId && { clientId: spec.clientId }),
           ...(spec.clientSecret && { clientSecret: spec.clientSecret }),
           ...(spec.accessToken && { accessToken: spec.accessToken }),
+          ...(spec.token && { token: spec.token }),
+          ...(spec.boxConfigFile && { boxConfigFile: spec.boxConfigFile }),
+          ...(spec.configCredentials && {
+            configCredentials: spec.configCredentials,
+          }),
+          ...(spec.boxSubType && { boxSubType: spec.boxSubType }),
+          ...(spec.rootFolderId && { rootFolderId: spec.rootFolderId }),
+          ...(spec.impersonate && { impersonate: spec.impersonate }),
+          ...(spec.ownedBy && { ownedBy: spec.ownedBy }),
+          ...(spec.path && { path: spec.path }),
         }),
         spec.readOnly,
       );
@@ -211,7 +270,7 @@ function mountEntry(spec: MountSpec) {
     case 'bitbucket': {
       const parsed = parseRepoLink(spec.url);
       return gitRepo({
-        repo: parsed.repo,
+        repo: withGitCredentials(parsed.repo, spec, spec.provider),
         ...((spec.ref ?? parsed.ref) ? { ref: spec.ref ?? parsed.ref } : {}),
       });
     }
@@ -247,10 +306,54 @@ function repoEntry(repo: string | RepoLink) {
 
   return {
     [link.path ? workspacePath(link.path) : parsed.path]: gitRepo({
-      repo: parsed.repo,
+      repo: withGitCredentials(parsed.repo, link),
       ...((link.ref ?? parsed.ref) ? { ref: link.ref ?? parsed.ref } : {}),
     }),
   };
+}
+
+// Put a private-repo token in the clone URL. GitHub uses x-access-token, GitLab uses oauth2, and Bitbucket uses the username.
+function withGitCredentials(
+  repo: string,
+  auth: { token?: string; username?: string },
+  host?: GitHost,
+) {
+  if (!auth.token) return repo;
+  if (repo.startsWith('git@')) {
+    throw new Error('A private token needs an https repo URL.');
+  }
+
+  const kind = host ?? gitHost(repo);
+  const href = repo.includes('://')
+    ? repo
+    : `https://${defaultGitHost(kind)}/${repo}.git`;
+  const url = new URL(href);
+  url.username = gitUsername(kind, auth.username);
+  url.password = auth.token;
+  return url.toString();
+}
+
+function gitHost(repo: string): GitHost {
+  if (!repo.includes('://')) return 'github';
+  const host = new URL(repo).hostname;
+  if (host === 'gitlab.com' || host.endsWith('.gitlab.com') || host.includes('gitlab')) {
+    return 'gitlab';
+  }
+  if (host === 'bitbucket.org' || host.endsWith('.bitbucket.org')) return 'bitbucket';
+  return 'github';
+}
+
+function defaultGitHost(host: GitHost) {
+  if (host === 'gitlab') return 'gitlab.com';
+  if (host === 'bitbucket') return 'bitbucket.org';
+  return 'github.com';
+}
+
+function gitUsername(host: GitHost, username?: string) {
+  if (username) return username;
+  if (host === 'gitlab') return 'oauth2';
+  if (host === 'bitbucket') return 'x-token-auth';
+  return 'x-access-token';
 }
 
 //1. Accept an owner/name slug, an https link, or a git@ clone address.
