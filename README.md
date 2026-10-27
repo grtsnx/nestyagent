@@ -96,6 +96,34 @@ const historyTutor = this.openai.createAgent(
 );
 ```
 
+### Shared runner model
+
+Call `createRunner` only when agents should share a fallback model. An agent that sets `model` keeps its own model. An agent that leaves `model` out uses the runner model. Skip `createRunner` when every agent sets its own model.
+
+```typescript
+this.openai.createRunner('gpt-6-astra');
+
+const fastAgent = this.openai.createAgent(
+  'Fast support agent',
+  'Handle routine support questions.',
+  'gpt-5.6-terra',
+);
+
+const generalAgent = this.openai.createAgent(
+  'General support agent',
+  'Handle support questions carefully.',
+);
+
+await this.openai.runAgent('Summarize ticket 123.', fastAgent);
+
+const result = await this.openai.runAgent(
+  'Investigate the billing issue on account 456.',
+  generalAgent,
+);
+```
+
+The first run uses `gpt-5.6-terra`. The second run uses `gpt-6-astra`. `result.finalOutput` is the billing answer.
+
 ### Run an agent
 
 ```typescript
