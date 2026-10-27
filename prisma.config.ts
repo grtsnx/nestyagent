@@ -1,6 +1,7 @@
 import { defineConfig } from 'prisma/config';
 
-// Bun scripts load .env, so DATABASE_URL is set for migrate. generate does not need it.
+// DATABASE_URL comes from .env in Bun scripts, and from the host's settings in the container.
+// generate does not need it.
 export default defineConfig({
   schema: 'prisma/schema.prisma',
   migrations: { path: 'prisma/migrations' },

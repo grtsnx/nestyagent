@@ -102,10 +102,10 @@ The app only connects the first time one of these is used. Without `DATABASE_URL
 | Command               | When to run it                                                    |
 | --------------------- | ----------------------------------------------------------------- |
 | `bun run db:migrate`  | On your machine, after you change `prisma/schema.prisma`.         |
-| `bun run db:deploy`   | Before a new release starts. It applies new tables in production. |
+| `bun run db:deploy`   | Applies new tables. The container already runs it when it starts. |
 | `bun run db:generate` | Rebuilds the database client. `bun install` already does this.    |
 
-The production image does not include the Prisma command line tool. Run `bun run db:deploy` from your release step, with `DATABASE_URL` pointing at production.
+You do not need a release step for the database. When the container starts with `DATABASE_URL` set, it applies any new migrations first, then starts the app. If a migration fails, the app does not start, so it never runs against the wrong tables. Two copies starting at once are safe: Postgres lets one migrate while the other waits.
 
 </details>
 
@@ -1232,12 +1232,28 @@ docker run --rm --read-only --tmpfs /tmp --publish 3000:3000 agentic:local
 
 The image uses pinned Bun and Node versions, has only production packages, and runs as the `node` user, not as root.
 
+On start, the image applies new database migrations, then starts the app (see Database). Give it `DATABASE_URL` and nothing else is needed:
+
+```bash
+docker run --rm --read-only --tmpfs /tmp --publish 3000:3000 \
+  --env DATABASE_URL=postgresql://user:password@db-host:5432/agentic \
+  --env OPENAI_API_KEY=sk-... \
+  agentic:local
+```
+
+**Coolify:** create a Postgres database in the same project, then add the app from this repository with the **Dockerfile** build pack and port `3000`. Paste the database's internal URL into `DATABASE_URL` and add your other settings. Every deploy runs the migrations by itself. Other hosts work the same way: build the Dockerfile and set `DATABASE_URL`.
+
+> [!NOTE]
+> The health check waits up to a minute after start, so a slow first migration does not mark the container unhealthy.
+
 </details>
 
 <details>
 <summary><h2>🚀 CI/CD</h2></summary>
 
 `.github/workflows/ci.yml` installs the exact lockfile, checks formatting and types, runs every test, checks packages for known problems, builds the app and the image, and scans the image. Every outside action is pinned to an exact commit.
+
+When a package deep inside the tree pins a version with a known problem, `overrides` in `package.json` forces the fixed version. Today that is `zod` and `js-yaml`. Remove an override once the package that pins it ships a fix.
 
 `.github/workflows/release.yml` runs when you push a version tag. It publishes images for Linux AMD64 and ARM64 to GitHub Container Registry, with a list of what is inside (SBOM) and a signed record of how it was built. Set up protection rules and reviewers on the `production` environment before your first release.
 
