@@ -1,2 +1,2 @@
-export { validateEnvironment } from './environment.js';
-export type { Environment } from './environment.js';
+export { remoteMachineProviders, validateEnvironment } from './environment.js';
+export type { Environment, RemoteMachineProvider } from './environment.js';

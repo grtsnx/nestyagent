@@ -312,7 +312,9 @@ function repoEntry(repo: string | RepoLink) {
   };
 }
 
-// Put a private-repo token in the clone URL. GitHub uses x-access-token, GitLab uses oauth2, and Bitbucket uses the username.
+//1. Keep a private-repo token out of the clone URL, so it never lands in saved state, snapshots, .git/config, or errors.
+//2. The SDK clones on this machine with this process's environment, so a git header scoped to this one URL reaches the clone.
+//3. GitHub uses x-access-token, GitLab uses oauth2, and Bitbucket uses x-token-auth unless username is set.
 function withGitCredentials(
   repo: string,
   auth: { token?: string; username?: string },
@@ -328,9 +330,26 @@ function withGitCredentials(
     ? repo
     : `https://${defaultGitHost(kind)}/${repo}.git`;
   const url = new URL(href);
-  url.username = gitUsername(kind, auth.username);
-  url.password = auth.token;
-  return url.toString();
+  url.username = '';
+  url.password = '';
+  const clean = url.toString();
+  const basic = Buffer.from(
+    `${gitUsername(kind, auth.username)}:${auth.token}`,
+  ).toString('base64');
+  setGitConfig(`http.${clean}.extraHeader`, `Authorization: Basic ${basic}`);
+  return clean;
+}
+
+// Add or replace one git setting for this process. Git reads GIT_CONFIG_COUNT, GIT_CONFIG_KEY_n, and GIT_CONFIG_VALUE_n.
+function setGitConfig(key: string, value: string) {
+  const count = Number(process.env.GIT_CONFIG_COUNT ?? 0);
+  let index = count;
+  for (let i = 0; i < count; i++) {
+    if (process.env[`GIT_CONFIG_KEY_${i}`] === key) index = i;
+  }
+  process.env[`GIT_CONFIG_KEY_${index}`] = key;
+  process.env[`GIT_CONFIG_VALUE_${index}`] = value;
+  if (index === count) process.env.GIT_CONFIG_COUNT = String(count + 1);
 }
 
 function gitHost(repo: string): GitHost {

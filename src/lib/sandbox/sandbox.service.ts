@@ -1,6 +1,7 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import { run, Session } from '@openai/agents';
 import OpenAI, { APIError } from 'openai';
@@ -18,10 +19,14 @@ import {
 } from '@openai/agents/sandbox';
 import {
   DockerSandboxClient,
-  DockerSandboxSession,
   UnixLocalSandboxClient,
-  UnixLocalSandboxSession,
 } from '@openai/agents/sandbox/local';
+import {
+  remoteMachineProviders,
+  type Environment,
+  type RemoteMachineProvider,
+} from '@/config/index.js';
+import { OpenaiService } from '../openai/openai.service.js';
 
 type SandboxComputer =
   | 'unix'
@@ -38,21 +43,12 @@ type OpenSandboxOptions = {
   snapshotDir?: string;
   computer?: SandboxComputer;
   image?: string;
-  client?: WorkspaceClient;
+  client?: SandboxClient;
   password?: string;
   workerUrl?: string;
 };
 
-type WorkspaceClient = {
-  create: (args: { manifest: Manifest }) => Promise<SandboxSession>;
-  resume?: (state: SandboxSession['state']) => Promise<SandboxSession>;
-  serializeSessionState?: (
-    state: SandboxSession['state'],
-  ) => Promise<Record<string, unknown>>;
-  deserializeSessionState?: (
-    state: Record<string, unknown>,
-  ) => Promise<SandboxSession['state']>;
-};
+type FreshSandboxOptions = OpenSandboxOptions & { manifest?: Manifest };
 
 type CreateSandboxAgentOptions = {
   model?: string;
@@ -79,10 +75,18 @@ export type HostedSession = {
 
 // Follows the current Node release. Pass image when a workspace needs a fixed tag.
 const DOCKER_IMAGE = 'node:latest';
+// Used when neither the call nor OPENAI_HOSTED_MODEL names a model.
+const DEFAULT_HOSTED_MODEL = 'gpt-6-astra';
+// How long to wait for an executor to connect before giving up.
+const CONNECT_TIMEOUT_MS = 120_000;
+// A claim older than this belongs to a create that crashed, so a retry may take over.
+const CLAIM_TTL_MS = 10 * 60_000;
+const CLAIM_PREFIX = 'pending:';
+// How many recent sessions to search when an environment expires.
+const EXPIRED_SCAN_LIMIT = 500;
+// The only variables the executor inherits from this app, besides CODEX_API_KEY.
+const EXECUTOR_ENV_KEYS = ['PATH', 'HOME', 'USER', 'LANG', 'TMPDIR', 'SHELL'];
 const runFile = promisify(execFile);
-
-type RemoteMachineProvider =
-  'local' | 'aws' | 'digitalocean' | 'databricks' | 'oci';
 
 type MachineRequest = {
   sessionId: string;
@@ -91,13 +95,44 @@ type MachineRequest = {
   executorKey: string;
 };
 
+type MachineDriver = {
+  create: (request: MachineRequest) => Promise<string> | string;
+  delete: (id: string) => Promise<void> | void;
+};
+
 @Injectable()
 export class SandboxService {
-  private hostedClient?: OpenAI;
   private readonly machineLocks = new Map<string, Promise<void>>();
   private readonly localExecutors = new Map<string, ChildProcess>();
 
-  constructor(private readonly configService: ConfigService) {}
+  // Each provider creates a machine that starts codex, and deletes it by the id it returned.
+  private readonly machines: Record<RemoteMachineProvider, MachineDriver> = {
+    local: {
+      create: (request) => this.createLocalMachine(request),
+      delete: (id) => this.deleteLocalMachine(id),
+    },
+    aws: {
+      create: (request) => this.createAwsMachine(request),
+      delete: (id) => this.deleteAwsMachine(id),
+    },
+    digitalocean: {
+      create: (request) => this.createDigitalOceanMachine(request),
+      delete: (id) => this.deleteDigitalOceanMachine(id),
+    },
+    databricks: {
+      create: (request) => this.createDatabricksMachine(request),
+      delete: (id) => this.deleteDatabricksMachine(id),
+    },
+    oci: {
+      create: (request) => this.createOciMachine(request),
+      delete: (id) => this.deleteOciMachine(id),
+    },
+  };
+
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly openaiService: OpenaiService,
+  ) {}
 
   // Create a sandbox agent. Leave model out to use the default model.
   // manifest, skills, memory, and handoffDescription are optional.
@@ -138,44 +173,12 @@ export class SandboxService {
   //4. password replaces ACCOUNT_PASSWORD for this workspace. Leave it out to use the shared secret.
   //5. computer can be unix, docker, modal, vercel, cloudflare, e2b, daytona, or blaxel.
   async openSandbox(manifest = new Manifest(), options?: OpenSandboxOptions) {
-    const password =
-      options?.password !== undefined
-        ? options.password.trim() || undefined
-        : this.configService.get<string>('ACCOUNT_PASSWORD');
-    const nextManifest = new Manifest({
-      entries: manifest.entries,
-      environment: {
-        ...manifest.environment,
-        ...(password !== undefined && {
-          ACCOUNT_PASSWORD: { value: password, ephemeral: true },
-        }),
-      },
-      users: manifest.users,
-      groups: manifest.groups,
-    });
-
-    if (options?.client)
-      return await options.client.create({ manifest: nextManifest });
-
-    if (options?.computer && isHostedComputer(options.computer)) {
-      const client = await this.providerClient(options.computer, options);
-      if (!client.create) {
-        throw new Error('This computer cannot open a workspace.');
-      }
-      return await client.create({ manifest: nextManifest });
-    }
-
-    const clientOptions = this.clientOptions(options);
-    if (options?.computer === 'docker') {
-      return await new DockerSandboxClient({
-        image: options.image ?? DOCKER_IMAGE,
-        ...clientOptions,
-      }).create({ manifest: nextManifest });
-    }
-
-    return await new UnixLocalSandboxClient(clientOptions).create({
-      manifest: nextManifest,
-    });
+    const client = await this.sandboxClient(options);
+    if (!client.create)
+      throw new Error('This computer cannot open a workspace.');
+    return (await client.create({
+      manifest: this.workspaceManifest(manifest, options?.password),
+    })) as SandboxWorkspace;
   }
 
   // Close the workspace. Memory writes its lessons during this close.
@@ -205,19 +208,13 @@ export class SandboxService {
     return `${scheme}://${endpoint.host}:${endpoint.port}`;
   }
 
-  // Save the live session so a later process can resume the same files.
-  async saveSandbox(workspace: SandboxWorkspace, client?: WorkspaceClient) {
-    if (client?.serializeSessionState) {
-      return await client.serializeSessionState(workspace.state);
+  // Save the live session so a later process can resume the same files. Pass the same options used to open it.
+  async saveSandbox(workspace: SandboxWorkspace, options?: OpenSandboxOptions) {
+    const client = await this.sandboxClient(options);
+    if (!client.serializeSessionState) {
+      throw new Error('This computer cannot save a workspace.');
     }
-    if (this.isDocker(workspace)) {
-      return await new DockerSandboxClient().serializeSessionState(
-        workspace.state as DockerSandboxSession['state'],
-      );
-    }
-    return await new UnixLocalSandboxClient().serializeSessionState(
-      workspace.state as UnixLocalSandboxSession['state'],
-    );
+    return await client.serializeSessionState(workspace.state);
   }
 
   // Resume a saved session. Pass the same computer, client, and snapshotDir used to open it.
@@ -225,28 +222,12 @@ export class SandboxService {
     saved: Record<string, unknown>,
     options?: OpenSandboxOptions,
   ) {
-    if (options?.client?.resume && options.client.deserializeSessionState) {
-      const state = await options.client.deserializeSessionState(saved);
-      return await options.client.resume(state);
+    const client = await this.sandboxClient(options);
+    if (!client.resume || !client.deserializeSessionState) {
+      throw new Error('This computer cannot resume a saved workspace.');
     }
-    if (options?.computer && isHostedComputer(options.computer)) {
-      const client = await this.providerClient(options.computer, options);
-      if (!client.resume || !client.deserializeSessionState) {
-        throw new Error('This computer cannot resume a saved workspace.');
-      }
-      const state = await client.deserializeSessionState(saved);
-      return await client.resume(state);
-    }
-    if (options?.computer === 'docker') {
-      const client = new DockerSandboxClient({
-        image: options.image ?? DOCKER_IMAGE,
-        ...this.clientOptions(options),
-      });
-      return await client.resume(await client.deserializeSessionState(saved));
-    }
-
-    const client = new UnixLocalSandboxClient(this.clientOptions(options));
-    return await client.resume(await client.deserializeSessionState(saved));
+    const state = await client.deserializeSessionState(saved);
+    return (await client.resume(state)) as SandboxWorkspace;
   }
 
   //1. Run a prompt on a sandbox agent inside a workspace.
@@ -266,37 +247,24 @@ export class SandboxService {
     });
   }
 
-  // Run once and let the SDK delete the workspace. Use this when the files do not need to survive.
+  //1. Run once and let the SDK delete the workspace. Use this when the files do not need to survive.
+  //2. Takes the same computer options as openSandbox. manifest replaces the agent's default manifest.
   async runSandboxOnce(
     prompt: string,
     agent: SandboxAgent,
-    options?: {
-      chat?: Session;
-      manifest?: Manifest;
-      computer?: SandboxComputer;
-      image?: string;
-    },
+    options?: FreshSandboxOptions & { chat?: Session },
   ) {
-    const client =
-      options?.computer && isHostedComputer(options.computer)
-        ? await this.providerClient(options.computer, options)
-        : options?.computer === 'docker'
-          ? new DockerSandboxClient({ image: options.image ?? DOCKER_IMAGE })
-          : new UnixLocalSandboxClient();
-
     return await run(agent, prompt, {
-      sandbox: {
-        client,
-        ...(options?.manifest && { manifest: options.manifest }),
-      },
+      sandbox: await this.freshSandbox(agent, options),
       ...(options?.chat && { session: options.chat }),
     });
   }
 
-  // Call the sandbox agent as a tool. Pass a workspace to keep its files. Leave it out for a fresh Unix workspace.
-  asTool(
+  //1. Call the sandbox agent as a tool. Pass a workspace to keep its files.
+  //2. Leave workspace out for a fresh workspace on each call, built from the same options as openSandbox.
+  async asTool(
     agent: SandboxAgent,
-    options?: {
+    options?: FreshSandboxOptions & {
       toolName?: string;
       toolDescription?: string;
       workspace?: SandboxWorkspace;
@@ -310,7 +278,7 @@ export class SandboxService {
       runConfig: {
         sandbox: options?.workspace
           ? { session: options.workspace }
-          : { client: new UnixLocalSandboxClient() },
+          : await this.freshSandbox(agent, options),
       },
     });
   }
@@ -323,7 +291,10 @@ export class SandboxService {
   ): Promise<HostedSession> {
     const session = await this.openai().beta.agents.sessions.create({
       agent: {
-        model: options?.model ?? 'gpt-6-astra',
+        model:
+          options?.model ??
+          this.configService.get<string>('OPENAI_HOSTED_MODEL') ??
+          DEFAULT_HOSTED_MODEL,
         instructions,
       },
       environment: {
@@ -360,40 +331,79 @@ export class SandboxService {
         '--environment-id',
         session.environmentId,
       ],
-      env: {
-        CODEX_API_KEY: this.configService
-          .getOrThrow<string>('OPENAI_EXECUTOR_API_KEY')
-          .trim(),
-      },
+      env: { CODEX_API_KEY: this.executorKey() },
     };
   }
 
-  // Start the executor on this machine. A remote environment runs hostedExecutorCommand there instead.
+  //1. Start the executor on this machine. A remote environment runs hostedExecutorCommand there instead.
+  //2. The executor gets CODEX_API_KEY and a few basics only. This app's own keys stay out of reach of agent code.
   startHostedExecutor(
     session: Pick<HostedSession, 'environmentId' | 'remoteUrl'>,
   ) {
     const spec = this.hostedExecutorCommand(session);
     return spawn(spec.command, spec.args, {
-      env: { ...process.env, ...spec.env },
+      env: executorEnvironment(spec.env),
       stdio: 'inherit',
     });
   }
 
-  //1. Read the session event stream until the executor connects.
-  //2. pending means it has not connected yet. failed carries the environment error.
-  async waitForHostedConnection(sessionId: string) {
-    const stream =
-      await this.openai().beta.agents.sessions.events.stream(sessionId);
+  //1. Open the event stream, start the executor on this machine, then wait for it to connect.
+  //2. The executor is stopped if it fails or does not connect within timeoutMs.
+  async connectHostedSession(
+    session: Pick<HostedSession, 'sessionId' | 'environmentId' | 'remoteUrl'>,
+    timeoutMs?: number,
+  ) {
+    let executor: ChildProcess | undefined;
+    try {
+      await this.waitForHostedConnection(session.sessionId, {
+        timeoutMs,
+        onListening: () => {
+          executor = this.startHostedExecutor(session);
+        },
+      });
+    } catch (error) {
+      executor?.kill();
+      throw error;
+    }
+    if (!executor) throw new Error('The executor did not start.');
+    return executor;
+  }
 
-    for await (const event of stream) {
-      if (event.type === 'agent.session.environment.connected') return;
-      if (
-        event.type === 'agent.session.environment.failed' ||
-        event.type === 'agent.session.environment.expired'
-      ) {
-        const message = event.environment.error?.message;
-        throw new Error(message ?? 'The self-hosted environment failed.');
+  //1. Read the session event stream until the executor connects.
+  //2. onListening runs once the stream is open. Start a remote executor there so the connected event is not missed.
+  //3. failed or expired carries the environment error. Waiting stops after timeoutMs.
+  async waitForHostedConnection(
+    sessionId: string,
+    options?: {
+      timeoutMs?: number;
+      onListening?: () => unknown;
+    },
+  ) {
+    const signal = AbortSignal.timeout(
+      options?.timeoutMs ?? CONNECT_TIMEOUT_MS,
+    );
+    try {
+      const stream = await this.openai().beta.agents.sessions.events.stream(
+        sessionId,
+        { signal },
+      );
+      await options?.onListening?.();
+
+      for await (const event of stream) {
+        if (event.type === 'agent.session.environment.connected') return;
+        if (
+          event.type === 'agent.session.environment.failed' ||
+          event.type === 'agent.session.environment.expired'
+        ) {
+          const message = event.environment.error?.message;
+          throw new Error(message ?? 'The self-hosted environment failed.');
+        }
       }
+    } catch (error) {
+      if (signal.aborted) {
+        throw new Error('The self-hosted environment did not connect in time.');
+      }
+      throw error;
     }
 
     throw new Error('The event stream ended before the environment connected.');
@@ -409,31 +419,10 @@ export class SandboxService {
     return result.output_text;
   }
 
-  // A self-hosted session event for this Mac. Another machine runs hostedExecutorCommand instead.
-  onHostedSessionCreated(event: {
-    type: string;
-    data?: {
-      environment_type?: string;
-      environment_id?: string;
-      connect?: { remote_url?: string };
-    };
-  }) {
-    if (event.type !== 'agent.session.created') return;
-    if (event.data?.environment_type !== 'self_hosted') return;
-
-    const environmentId = event.data.environment_id;
-    const remoteUrl = event.data.connect?.remote_url;
-    if (!environmentId || !remoteUrl) {
-      throw new Error(
-        'Self-hosted session event is missing the executor address.',
-      );
-    }
-
-    return this.startHostedExecutor({ environmentId, remoteUrl });
-  }
-
   //1. Verify the OpenAI webhook, then create or delete the remote machine.
-  //2. action_required with environment_connection starts the machine. failed deletes it.
+  //2. action_required with environment_connection creates the machine.
+  //3. A failed session or an expired environment deletes it.
+  //4. Work finishes before the reply, so a failure returns an error and OpenAI sends the event again.
   async handleHostedWebhook(
     rawBody: string,
     headers: Record<string, string | string[] | undefined>,
@@ -454,10 +443,15 @@ export class SandboxService {
       return;
     }
     if (event.type === 'agent.session.failed') {
-      await this.releaseRemoteMachine(event.data.id);
+      await this.releaseSessionMachine(event.data.id);
+      return;
+    }
+    if (event.type === 'agent.environment.expired') {
+      await this.releaseEnvironmentMachine(event.data.id);
     }
   }
 
+  // One create per session in this process. connectRemoteMachine guards across processes.
   private async ensureRemoteMachine(sessionId: string) {
     const current = this.machineLocks.get(sessionId);
     if (current) return await current;
@@ -468,6 +462,9 @@ export class SandboxService {
     return await task;
   }
 
+  //1. Claim the session in its metadata before creating anything. Re-read so only one claim goes ahead.
+  //2. Create the machine. A failure clears the claim so OpenAI's retry can try again.
+  //3. Record the machine id. If that fails, delete the machine so nothing runs unrecorded.
   private async connectRemoteMachine(sessionId: string) {
     const session =
       await this.openai().beta.agents.sessions.retrieve(sessionId);
@@ -475,91 +472,125 @@ export class SandboxService {
     const needsConnection = session.required_actions.some(
       (action) => action.type === 'environment_connection',
     );
-    if (!needsConnection || session.metadata.remote_machine_id) return;
+    const current = session.metadata.remote_machine_id;
+    if (!needsConnection || (current && !isStaleClaim(current))) return;
 
-    const machineId = await this.createRemoteMachine({
+    const request = {
       sessionId: session.id,
       environmentId: session.environment.id,
       remoteUrl: session.environment.remote_url,
-      executorKey:
-        this.configService.get<string>('OPENAI_EXECUTOR_API_KEY') ?? '',
-    });
-    await this.openai().beta.agents.sessions.update(session.id, {
-      metadata: { ...session.metadata, remote_machine_id: machineId },
+      executorKey: this.executorKey(),
+    };
+    const claim = `${CLAIM_PREFIX}${Date.now()}:${randomUUID()}`;
+    await this.setMachineId(session.id, session.metadata, claim);
+    const claimed =
+      await this.openai().beta.agents.sessions.retrieve(sessionId);
+    if (claimed.metadata.remote_machine_id !== claim) return;
+
+    let machineId: string;
+    try {
+      machineId = await this.createRemoteMachine(request);
+    } catch (error) {
+      await this.setMachineId(session.id, session.metadata);
+      throw error;
+    }
+
+    try {
+      await this.setMachineId(session.id, session.metadata, machineId);
+    } catch (error) {
+      await this.deleteRemoteMachine(machineId).catch((cleanup: unknown) => {
+        throw new AggregateError(
+          [error, cleanup],
+          `Remote machine ${machineId} was created but could not be recorded or deleted.`,
+        );
+      });
+      throw error;
+    }
+  }
+
+  // Replace remote_machine_id and keep the other metadata. Leave machineId out to remove it.
+  private async setMachineId(
+    sessionId: string,
+    metadata: Record<string, string>,
+    machineId?: string,
+  ) {
+    const next = { ...metadata };
+    delete next.remote_machine_id;
+    if (machineId) next.remote_machine_id = machineId;
+    await this.openai().beta.agents.sessions.update(sessionId, {
+      metadata: next,
     });
   }
 
-  private async releaseRemoteMachine(sessionId: string) {
+  private async releaseSessionMachine(sessionId: string) {
     try {
       const session =
         await this.openai().beta.agents.sessions.retrieve(sessionId);
       if (session.status !== 'failed') return;
-      const machineId = session.metadata.remote_machine_id;
-      if (!machineId) return;
-      await this.deleteRemoteMachine(machineId);
+      await this.releaseMachine(session.metadata.remote_machine_id);
     } catch (error) {
       if (error instanceof APIError && error.status === 404) return;
       throw error;
     }
   }
 
-  //1. local starts codex on this Mac. The other providers create a machine that starts codex itself.
-  //2. The id prefix says which provider created the machine, so delete still works if the setting changes.
-  private async createRemoteMachine(request: MachineRequest) {
-    switch (this.remoteProvider()) {
-      case 'local':
-        return this.createLocalMachine(request);
-      case 'aws':
-        return this.createAwsMachine(request);
-      case 'digitalocean':
-        return this.createDigitalOceanMachine(request);
-      case 'databricks':
-        return this.createDatabricksMachine(request);
-      case 'oci':
-        return this.createOciMachine(request);
+  // The expired event names only the environment, so find its session among the recent ones.
+  private async releaseEnvironmentMachine(environmentId: string) {
+    let scanned = 0;
+    for await (const session of this.openai().beta.agents.sessions.list({
+      order: 'desc',
+    })) {
+      if (
+        session.environment.type === 'self_hosted' &&
+        session.environment.id === environmentId
+      ) {
+        await this.releaseMachine(session.metadata.remote_machine_id);
+        return;
+      }
+      if (++scanned >= EXPIRED_SCAN_LIMIT) return;
     }
+  }
+
+  private async releaseMachine(machineId?: string) {
+    if (!machineId || machineId.startsWith(CLAIM_PREFIX)) return;
+    await this.deleteRemoteMachine(machineId);
+  }
+
+  // The id prefix says which provider created the machine, so delete still works if the setting changes.
+  private async createRemoteMachine(request: MachineRequest) {
+    const provider = this.remoteProvider();
+    return `${provider}:${await this.machines[provider].create(request)}`;
   }
 
   private async deleteRemoteMachine(machineId: string) {
     const separator = machineId.indexOf(':');
     const provider = machineId.slice(0, separator);
-    const id = machineId.slice(separator + 1);
-    if (provider === 'local') return this.deleteLocalMachine(id);
-    if (provider === 'aws') return this.deleteAwsMachine(id);
-    if (provider === 'digitalocean') return this.deleteDigitalOceanMachine(id);
-    if (provider === 'databricks') return this.deleteDatabricksMachine(id);
-    if (provider === 'oci') return this.deleteOciMachine(id);
-    throw new Error(`Unknown remote machine ${provider}.`);
+    if (!isRemoteMachineProvider(provider)) {
+      throw new Error(`Unknown remote machine ${provider}.`);
+    }
+    await this.machines[provider].delete(machineId.slice(separator + 1));
   }
 
   private createLocalMachine(request: MachineRequest) {
     const child = this.startHostedExecutor(request);
-    const pid = child.pid;
-    if (!pid) throw new Error('The local executor did not start.');
-    this.localExecutors.set(String(pid), child);
-    return `local:${pid}`;
+    if (!child.pid) throw new Error('The local executor did not start.');
+    const pid = String(child.pid);
+    this.localExecutors.set(pid, child);
+    child.once('exit', () => this.localExecutors.delete(pid));
+    return pid;
   }
 
+  // Only stop an executor this process started. After a restart the pid may belong to another program.
   private deleteLocalMachine(pid: string) {
-    const child = this.localExecutors.get(pid);
-    if (child) child.kill();
-    else process.kill(Number(pid));
+    this.localExecutors.get(pid)?.kill();
     this.localExecutors.delete(pid);
   }
 
   private async createAwsMachine(request: MachineRequest) {
-    const image = requiredSetting(
-      this.configService.get<string>('AWS_MICROVM_IMAGE_ARN'),
-      'AWS_MICROVM_IMAGE_ARN',
-    );
-    const secretArn = requiredSetting(
-      this.configService.get<string>('AWS_MICROVM_SECRET_ARN'),
-      'AWS_MICROVM_SECRET_ARN',
-    );
     const result = await runFile(
       'aws',
       awsRunArgs({
-        image,
+        image: this.setting('AWS_MICROVM_IMAGE_ARN'),
         region: this.configService.get<string>('AWS_REGION'),
         executionRole: this.configService.get<string>(
           'AWS_MICROVM_EXECUTION_ROLE',
@@ -567,14 +598,14 @@ export class SandboxService {
         payload: JSON.stringify({
           environmentId: request.environmentId,
           remoteUrl: request.remoteUrl,
-          secretArn,
+          secretArn: this.setting('AWS_MICROVM_SECRET_ARN'),
         }),
       }),
       { timeout: 120_000, maxBuffer: 1_000_000 },
     );
     const body = JSON.parse(result.stdout) as { microvmId?: string };
     if (!body.microvmId) throw new Error('AWS did not return a MicroVM id.');
-    return `aws:${body.microvmId}`;
+    return body.microvmId;
   }
 
   private async deleteAwsMachine(id: string) {
@@ -586,51 +617,39 @@ export class SandboxService {
   }
 
   private async createDigitalOceanMachine(request: MachineRequest) {
-    const token = requiredSetting(
-      this.configService.get<string>('DIGITALOCEAN_TOKEN'),
-      'DIGITALOCEAN_TOKEN',
-    );
-    requiredSetting(request.executorKey, 'OPENAI_EXECUTOR_API_KEY');
     const url = new URL('https://api.digitalocean.com/v2/agents/sessions');
     url.searchParams.set('openai_session_id', request.sessionId);
     const response = await fetch(url, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${this.setting('DIGITALOCEAN_TOKEN')}`,
         'Content-Type': 'application/x-yaml',
       },
       body: digitalOceanManifest(request),
     });
     const id = readId(await readJson(response));
     if (!id) throw new Error('DigitalOcean did not return a session id.');
-    return `digitalocean:${id}`;
+    return id;
   }
 
   private async deleteDigitalOceanMachine(id: string) {
-    const token = requiredSetting(
-      this.configService.get<string>('DIGITALOCEAN_TOKEN'),
-      'DIGITALOCEAN_TOKEN',
-    );
     const response = await fetch(
       `https://api.digitalocean.com/v2/agents/sessions/${encodeURIComponent(id)}`,
-      { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } },
+      {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${this.setting('DIGITALOCEAN_TOKEN')}`,
+        },
+      },
     );
-    if (!response.ok && response.status !== 404) {
-      throw new Error(
-        `DigitalOcean delete failed with status ${response.status}.`,
-      );
-    }
+    assertDeleted(response, 'DigitalOcean');
   }
 
+  //1. The sandbox id comes from the session id, so a retry finds the same sandbox instead of making a second one.
+  //2. 409 means that sandbox already exists. The start command runs again on it.
   private async createDatabricksMachine(request: MachineRequest) {
-    const host = databricksHost(
-      this.configService.get<string>('DATABRICKS_HOST'),
-    );
-    const token = requiredSetting(
-      this.configService.get<string>('DATABRICKS_TOKEN'),
-      'DATABRICKS_TOKEN',
-    );
-    requiredSetting(request.executorKey, 'OPENAI_EXECUTOR_API_KEY');
+    const host = databricksHost(this.setting('DATABRICKS_HOST'));
+    const token = this.setting('DATABRICKS_TOKEN');
     const sandboxId = databricksSandboxId(request.sessionId);
     const created = await fetch(
       `${host}/api/2.0/sandboxes?sandbox_id=${encodeURIComponent(sandboxId)}`,
@@ -642,7 +661,7 @@ export class SandboxService {
         }),
       },
     );
-    const body = await readJson(created);
+    const body = created.status === 409 ? undefined : await readJson(created);
     const name =
       typeof body === 'object' &&
       body &&
@@ -650,59 +669,44 @@ export class SandboxService {
       typeof body.name === 'string'
         ? body.name
         : `sandboxes/${sandboxId}`;
-    await fetch(`${host}/api/2.0/sandbox-exec/${name}/exec-sync`, {
-      method: 'POST',
-      headers: databricksHeaders(token),
-      body: JSON.stringify({
-        cmd: '/bin/bash',
-        args: ['-lc', databricksExecutorScript(request)],
-        envs: { CODEX_API_KEY: request.executorKey, RUST_LOG: 'info' },
-        execution_timeout: '120s',
-      }),
-    });
-    return `databricks:${name}`;
+    const started = await fetch(
+      `${host}/api/2.0/sandbox-exec/${name}/exec-sync`,
+      {
+        method: 'POST',
+        headers: databricksHeaders(token),
+        body: JSON.stringify({
+          cmd: '/bin/bash',
+          args: ['-lc', databricksExecutorScript(request)],
+          envs: { CODEX_API_KEY: request.executorKey, RUST_LOG: 'info' },
+          execution_timeout: '120s',
+        }),
+      },
+    );
+    await readJson(started);
+    return name;
   }
 
   private async deleteDatabricksMachine(name: string) {
-    const host = databricksHost(
-      this.configService.get<string>('DATABRICKS_HOST'),
-    );
-    const token = requiredSetting(
-      this.configService.get<string>('DATABRICKS_TOKEN'),
-      'DATABRICKS_TOKEN',
-    );
+    const host = databricksHost(this.setting('DATABRICKS_HOST'));
     const response = await fetch(`${host}/api/2.0/${name}`, {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      headers: {
+        Authorization: `Bearer ${this.setting('DATABRICKS_TOKEN')}`,
+        Accept: 'application/json',
+      },
     });
-    if (!response.ok && response.status !== 404) {
-      throw new Error(
-        `Databricks delete failed with status ${response.status}.`,
-      );
-    }
+    assertDeleted(response, 'Databricks');
   }
 
   private async createOciMachine(request: MachineRequest) {
-    const endpoint = requiredSetting(
-      this.configService.get<string>('OCI_SANDBOX_CREATE_URL'),
-      'OCI_SANDBOX_CREATE_URL',
-    );
-    const projectId = requiredSetting(
-      this.configService.get<string>('OCI_SANDBOX_PROJECT_ID'),
-      'OCI_SANDBOX_PROJECT_ID',
-    );
-    const token = requiredSetting(
-      this.configService.get<string>('OCI_SANDBOX_TOKEN'),
-      'OCI_SANDBOX_TOKEN',
-    );
-    const response = await fetch(endpoint, {
+    const response = await fetch(this.setting('OCI_SANDBOX_CREATE_URL'), {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${this.setting('OCI_SANDBOX_TOKEN')}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        projectId,
+        projectId: this.setting('OCI_SANDBOX_PROJECT_ID'),
         displayName: `openai-${request.sessionId}`,
         freeformTags: {
           environmentId: request.environmentId,
@@ -712,25 +716,21 @@ export class SandboxService {
     });
     const id = readId(await readJson(response));
     if (!id) throw new Error('OCI did not return a sandbox id.');
-    return `oci:${id}`;
+    return id;
   }
 
   private async deleteOciMachine(id: string) {
-    const endpoint = requiredSetting(
-      this.configService.get<string>('OCI_SANDBOX_CREATE_URL'),
-      'OCI_SANDBOX_CREATE_URL',
-    );
-    const token = requiredSetting(
-      this.configService.get<string>('OCI_SANDBOX_TOKEN'),
-      'OCI_SANDBOX_TOKEN',
-    );
+    const endpoint = this.setting('OCI_SANDBOX_CREATE_URL');
     const response = await fetch(
       `${endpoint.replace(/\/$/, '')}/${encodeURIComponent(id)}`,
-      { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } },
+      {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${this.setting('OCI_SANDBOX_TOKEN')}`,
+        },
+      },
     );
-    if (!response.ok && response.status !== 404) {
-      throw new Error(`OCI delete failed with status ${response.status}.`);
-    }
+    assertDeleted(response, 'OCI');
   }
 
   private remoteProvider(): RemoteMachineProvider {
@@ -739,6 +739,62 @@ export class SandboxService {
         'REMOTE_MACHINE_PROVIDER',
       ) ?? 'local'
     );
+  }
+
+  //1. One place picks the client, so open, save, resume, runSandboxOnce, and asTool always agree.
+  //2. client wins, then a hosted computer, then Docker, then Unix.
+  private async sandboxClient(
+    options?: OpenSandboxOptions,
+  ): Promise<SandboxClient> {
+    if (options?.client) return options.client;
+    if (options?.computer && isHostedComputer(options.computer)) {
+      return await this.providerClient(options.computer, options);
+    }
+    const clientOptions = this.clientOptions(options);
+    if (options?.computer === 'docker') {
+      return new DockerSandboxClient({
+        image: options.image ?? DOCKER_IMAGE,
+        ...clientOptions,
+      });
+    }
+    return new UnixLocalSandboxClient(clientOptions);
+  }
+
+  // A client and manifest for a workspace the SDK creates and deletes on its own.
+  private async freshSandbox(
+    agent: SandboxAgent,
+    options?: FreshSandboxOptions,
+  ) {
+    return {
+      client: await this.sandboxClient(options),
+      manifest: this.workspaceManifest(
+        options?.manifest ?? agent.defaultManifest ?? new Manifest(),
+        options?.password,
+      ),
+    };
+  }
+
+  //1. Add ACCOUNT_PASSWORD to the manifest environment. ephemeral keeps it out of saved state.
+  //2. Every other manifest field is kept. With no password, the manifest is returned unchanged.
+  private workspaceManifest(manifest: Manifest, password?: string) {
+    const secret =
+      password !== undefined
+        ? password.trim() || undefined
+        : this.configService.get<string>('ACCOUNT_PASSWORD');
+    if (secret === undefined) return manifest;
+    return new Manifest({
+      version: manifest.version,
+      root: manifest.root,
+      entries: manifest.entries,
+      environment: {
+        ...manifest.environment,
+        ACCOUNT_PASSWORD: { value: secret, ephemeral: true },
+      },
+      users: manifest.users,
+      groups: manifest.groups,
+      extraPathGrants: manifest.extraPathGrants,
+      remoteMountCommandAllowlist: manifest.remoteMountCommandAllowlist,
+    });
   }
 
   private async providerClient(
@@ -794,11 +850,19 @@ export class SandboxService {
   }
 
   private openai() {
-    const apiKey = this.configService
-      .getOrThrow<string>('OPENAI_API_KEY')
+    return this.openaiService.client();
+  }
+
+  private executorKey() {
+    return this.configService
+      .getOrThrow<string>('OPENAI_EXECUTOR_API_KEY')
       .trim();
-    this.hostedClient ??= new OpenAI({ apiKey });
-    return this.hostedClient;
+  }
+
+  private setting(name: keyof Environment) {
+    const value = this.configService.get<string>(name);
+    if (!value) throw new Error(`${name} is required for this remote machine.`);
+    return value;
   }
 
   private clientOptions(options?: OpenSandboxOptions) {
@@ -809,18 +873,32 @@ export class SandboxService {
       }),
     };
   }
-
-  private isDocker(
-    workspace: SandboxWorkspace,
-  ): workspace is DockerSandboxSession {
-    return 'containerId' in workspace.state;
-  }
 }
 
 function isHostedComputer(
   computer: SandboxComputer,
 ): computer is Exclude<SandboxComputer, 'unix' | 'docker'> {
   return computer !== 'unix' && computer !== 'docker';
+}
+
+function isRemoteMachineProvider(
+  provider: string,
+): provider is RemoteMachineProvider {
+  return (remoteMachineProviders as readonly string[]).includes(provider);
+}
+
+function isStaleClaim(machineId: string) {
+  if (!machineId.startsWith(CLAIM_PREFIX)) return false;
+  const claimedAt = Number(machineId.slice(CLAIM_PREFIX.length).split(':')[0]);
+  return !(Date.now() - claimedAt < CLAIM_TTL_MS);
+}
+
+export function executorEnvironment(extra: Record<string, string>) {
+  const basics = EXECUTOR_ENV_KEYS.flatMap((key) => {
+    const value = process.env[key];
+    return value ? [[key, value] as const] : [];
+  });
+  return { ...Object.fromEntries(basics), ...extra };
 }
 
 export function awsRunArgs(input: {
@@ -855,6 +933,7 @@ export function awsTerminateArgs(id: string, region?: string) {
   ];
 }
 
+// Values are double-quoted, so a key with :, #, or a newline cannot break the YAML.
 export function digitalOceanManifest(request: MachineRequest) {
   return [
     'agent: codex-agentapi',
@@ -862,9 +941,9 @@ export function digitalOceanManifest(request: MachineRequest) {
     '  - api.openai.com',
     '  - codex-cloud-environments.chatgpt.com',
     'env:',
-    `  CODEX_ENVIRONMENT_ID: ${request.environmentId}`,
+    `  CODEX_ENVIRONMENT_ID: ${JSON.stringify(request.environmentId)}`,
     'secrets:',
-    `  CODEX_API_KEY: ${request.executorKey}`,
+    `  CODEX_API_KEY: ${JSON.stringify(request.executorKey)}`,
     '',
   ].join('\n');
 }
@@ -887,8 +966,7 @@ function databricksSandboxId(sessionId: string) {
   return `openai-${cleaned || 'session'}`;
 }
 
-function databricksHost(host: string | undefined) {
-  const value = requiredSetting(host, 'DATABRICKS_HOST');
+function databricksHost(value: string) {
   const url = new URL(value);
   if (url.protocol !== 'https:') {
     throw new Error('DATABRICKS_HOST must be https.');
@@ -904,11 +982,6 @@ function databricksHeaders(token: string) {
   };
 }
 
-function requiredSetting(value: string | undefined, name: string) {
-  if (!value) throw new Error(`${name} is required for this remote machine.`);
-  return value;
-}
-
 async function readJson(response: Response) {
   if (!response.ok) {
     throw new Error(
@@ -916,6 +989,15 @@ async function readJson(response: Response) {
     );
   }
   return (await response.json()) as unknown;
+}
+
+// A machine that is already gone counts as deleted.
+function assertDeleted(response: Response, provider: string) {
+  if (!response.ok && response.status !== 404) {
+    throw new Error(
+      `${provider} delete failed with status ${response.status}.`,
+    );
+  }
 }
 
 function readId(body: unknown) {

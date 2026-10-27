@@ -2,6 +2,15 @@ import { z } from 'zod';
 
 const environments = ['development', 'production', 'test'] as const;
 
+export const remoteMachineProviders = [
+  'local',
+  'aws',
+  'digitalocean',
+  'databricks',
+  'oci',
+] as const;
+export type RemoteMachineProvider = (typeof remoteMachineProviders)[number];
+
 const booleanValue = (name: string) =>
   z.preprocess(
     (value) => {
@@ -16,7 +25,8 @@ const booleanValue = (name: string) =>
     z.boolean({ error: `${name} must be a boolean` }),
   );
 
-function optionalSecret() {
+// Blank values are treated as unset.
+function optionalString() {
   return z.preprocess(
     (value) => (value === '' ? undefined : value),
     z.string().trim().min(1).optional(),
@@ -65,34 +75,24 @@ const environmentSchema = z
     OBSERVE_APP_SECRET: z.string().trim().optional(),
     OBSERVE_SERVICE_ID: z.string().trim().optional(),
     SWAGGER_ENABLED: booleanValue('SWAGGER_ENABLED').optional(),
-    OPENAI_API_KEY: z.preprocess(
-      (value) => (value === '' ? undefined : value),
-      z.string().trim().min(1).optional(),
-    ),
-    ACCOUNT_PASSWORD: z.preprocess(
-      (value) => (value === '' ? undefined : value),
-      z.string().trim().min(1).optional(),
-    ),
-    OPENAI_EXECUTOR_API_KEY: z.preprocess(
-      (value) => (value === '' ? undefined : value),
-      z.string().trim().min(1).optional(),
-    ),
-    OPENAI_WEBHOOK_SECRET: optionalSecret(),
-    REMOTE_MACHINE_PROVIDER: z
-      .enum(['local', 'aws', 'digitalocean', 'databricks', 'oci'])
-      .optional(),
-    AWS_MICROVM_IMAGE_ARN: optionalSecret(),
-    AWS_MICROVM_EXECUTION_ROLE: optionalSecret(),
-    AWS_MICROVM_SECRET_ARN: optionalSecret(),
-    AWS_REGION: optionalSecret(),
-    DIGITALOCEAN_TOKEN: optionalSecret(),
-    DATABRICKS_HOST: optionalSecret(),
-    DATABRICKS_TOKEN: optionalSecret(),
-    OCI_SANDBOX_PROJECT_ID: optionalSecret(),
-    OCI_SANDBOX_TOKEN: optionalSecret(),
-    OCI_SANDBOX_CREATE_URL: optionalSecret(),
-    CLOUDFLARE_SANDBOX_WORKER_URL: optionalSecret(),
-    CLOUDFLARE_SANDBOX_API_KEY: optionalSecret(),
+    OPENAI_API_KEY: optionalString(),
+    OPENAI_HOSTED_MODEL: optionalString(),
+    ACCOUNT_PASSWORD: optionalString(),
+    OPENAI_EXECUTOR_API_KEY: optionalString(),
+    OPENAI_WEBHOOK_SECRET: optionalString(),
+    REMOTE_MACHINE_PROVIDER: z.enum(remoteMachineProviders).optional(),
+    AWS_MICROVM_IMAGE_ARN: optionalString(),
+    AWS_MICROVM_EXECUTION_ROLE: optionalString(),
+    AWS_MICROVM_SECRET_ARN: optionalString(),
+    AWS_REGION: optionalString(),
+    DIGITALOCEAN_TOKEN: optionalString(),
+    DATABRICKS_HOST: optionalString(),
+    DATABRICKS_TOKEN: optionalString(),
+    OCI_SANDBOX_PROJECT_ID: optionalString(),
+    OCI_SANDBOX_TOKEN: optionalString(),
+    OCI_SANDBOX_CREATE_URL: optionalString(),
+    CLOUDFLARE_SANDBOX_WORKER_URL: optionalString(),
+    CLOUDFLARE_SANDBOX_API_KEY: optionalString(),
   })
   .superRefine((environment, context) => {
     if (!environment.OBSERVE_ENABLED) return;
@@ -112,35 +112,15 @@ const environmentSchema = z
     }
   });
 
-export interface Environment {
-  NODE_ENV: (typeof environments)[number];
-  PORT: number;
-  PLATFORM_NAME: string;
+// The parsed values, with the defaults validateEnvironment fills in.
+export type Environment = Omit<
+  z.output<typeof environmentSchema>,
+  'CORS_ORIGINS' | 'OBSERVE_ENABLED' | 'SWAGGER_ENABLED'
+> & {
   CORS_ORIGINS: string[];
   OBSERVE_ENABLED: boolean;
-  OBSERVE_APP_KEY?: string;
-  OBSERVE_APP_SECRET?: string;
-  OBSERVE_SERVICE_ID?: string;
   SWAGGER_ENABLED: boolean;
-  OPENAI_API_KEY?: string;
-  ACCOUNT_PASSWORD?: string;
-  OPENAI_EXECUTOR_API_KEY?: string;
-  OPENAI_WEBHOOK_SECRET?: string;
-  REMOTE_MACHINE_PROVIDER?:
-    'local' | 'aws' | 'digitalocean' | 'databricks' | 'oci';
-  AWS_MICROVM_IMAGE_ARN?: string;
-  AWS_MICROVM_EXECUTION_ROLE?: string;
-  AWS_MICROVM_SECRET_ARN?: string;
-  AWS_REGION?: string;
-  DIGITALOCEAN_TOKEN?: string;
-  DATABRICKS_HOST?: string;
-  DATABRICKS_TOKEN?: string;
-  OCI_SANDBOX_PROJECT_ID?: string;
-  OCI_SANDBOX_TOKEN?: string;
-  OCI_SANDBOX_CREATE_URL?: string;
-  CLOUDFLARE_SANDBOX_WORKER_URL?: string;
-  CLOUDFLARE_SANDBOX_API_KEY?: string;
-}
+};
 
 export function validateEnvironment(
   values: Record<string, unknown>,

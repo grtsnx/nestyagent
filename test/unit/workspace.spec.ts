@@ -106,7 +106,7 @@ describe('createManifest', () => {
 
     expect(manifest.entries.private).toMatchObject({
       type: 'git_repo',
-      repo: 'https://x-access-token:github-token@github.com/owner/private.git',
+      repo: 'https://github.com/owner/private.git',
     });
     expect(manifest.entries.files).toMatchObject({
       type: 's3_files_mount',
@@ -124,8 +124,29 @@ describe('createManifest', () => {
       rootFolderId: '0',
     });
     expect(manifest.entries.lab).toMatchObject({
-      repo: 'https://oauth2:gitlab-token@gitlab.com/group/api.git',
+      repo: 'https://gitlab.com/group/api.git',
     });
+    expect(JSON.stringify(manifest.entries)).not.toContain('token');
+  });
+
+  it('gives the clone a git header for that one repo instead of a token in the URL', () => {
+    createManifest({
+      repo: { url: 'https://github.com/owner/secret', token: 'first' },
+    });
+    createManifest({
+      repo: { url: 'https://github.com/owner/secret', token: 'second' },
+    });
+
+    const key = 'http.https://github.com/owner/secret.git.extraHeader';
+    const index = Array.from(
+      { length: Number(process.env.GIT_CONFIG_COUNT) },
+      (_, i) => i,
+    ).filter((i) => process.env[`GIT_CONFIG_KEY_${i}`] === key);
+
+    expect(index).toHaveLength(1);
+    expect(process.env[`GIT_CONFIG_VALUE_${index[0]}`]).toBe(
+      `Authorization: Basic ${Buffer.from('x-access-token:second').toString('base64')}`,
+    );
   });
 
   it('keeps sandbox users and groups', () => {

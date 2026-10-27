@@ -26,17 +26,18 @@ Swagger UI runs at `http://localhost:3000/api`, and Scalar runs at `http://local
 
 The application validates configuration before it starts. Invalid ports, booleans, and CORS origins stop startup.
 
-| Variable                  | Default               | Purpose                                                                              |
-| ------------------------- | --------------------- | ------------------------------------------------------------------------------------ |
-| `NODE_ENV`                | `development`         | Selects development, test, or production behavior.                                   |
-| `PORT`                    | `3000`                | Sets the HTTP port.                                                                  |
-| `PLATFORM_NAME`           | `Agentic`             | Names the API and OpenAPI document.                                                  |
-| `CORS_ORIGINS`            | empty                 | Lists exact, comma-separated browser origins. Empty disables CORS.                   |
-| `SWAGGER_ENABLED`         | on outside production | Enables Swagger, Scalar, and OpenAPI JSON. Set it explicitly in production.          |
-| `OBSERVE_ENABLED`         | `false`               | Enables NestJS Observe when valid credentials are present.                           |
-| `OPENAI_API_KEY`          | empty                 | Authenticates every OpenAI agent. Blank leaves the shared key unset.                 |
-| `ACCOUNT_PASSWORD`        | empty                 | Login secret for every workspace. Blank starts a workspace without one.              |
-| `OPENAI_EXECUTOR_API_KEY` | empty                 | Codex environment key from the platform Agents tab. Blank leaves the executor unset. |
+| Variable                  | Default               | Purpose                                                                                |
+| ------------------------- | --------------------- | -------------------------------------------------------------------------------------- |
+| `NODE_ENV`                | `development`         | Selects development, test, or production behavior.                                     |
+| `PORT`                    | `3000`                | Sets the HTTP port.                                                                    |
+| `PLATFORM_NAME`           | `Agentic`             | Names the API and OpenAPI document.                                                    |
+| `CORS_ORIGINS`            | empty                 | Lists exact, comma-separated browser origins. Empty disables CORS.                     |
+| `SWAGGER_ENABLED`         | on outside production | Enables Swagger, Scalar, and OpenAPI JSON. Set it explicitly in production.            |
+| `OBSERVE_ENABLED`         | `false`               | Enables NestJS Observe when valid credentials are present.                             |
+| `OPENAI_API_KEY`          | required              | Authenticates every OpenAI agent and the hosted session API. The app stops without it. |
+| `OPENAI_HOSTED_MODEL`     | `gpt-6-astra`         | Model for `createHostedSession` when the call does not pass one.                       |
+| `ACCOUNT_PASSWORD`        | empty                 | Login secret for every workspace. Blank starts a workspace without one.                |
+| `OPENAI_EXECUTOR_API_KEY` | empty                 | Codex environment key from the platform Agents tab. Blank leaves the executor unset.   |
 
 > [!CAUTION]
 > Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS origins without paths.
@@ -133,7 +134,7 @@ The first run uses `gpt-5.6-terra`. The second run uses `gpt-6-astra`. `result.f
 
 ### Reasoning effort
 
-Every agent starts at medium reasoning effort. Pass `modelSettings` to change it. Reasoning effort changes how long the model thinks.
+An agent sends no reasoning setting unless you pass one, so the model uses its own default. Pass `modelSettings` to set the effort. Reasoning effort changes how long the model thinks.
 
 ```typescript
 const fastAgent = this.openai.createAgent(
@@ -146,7 +147,7 @@ const fastAgent = this.openai.createAgent(
 );
 ```
 
-Leave `modelSettings` out and the effort stays `medium`.
+Leave `modelSettings` out and the model picks its own effort. A model without reasoning works too.
 
 ### Temperature
 
@@ -433,7 +434,9 @@ const workspace = await this.sandbox.openSandbox(createManifest(), {
 Lessons in `memories/` stay only while this workspace stays open, you resume it, or you start the next workspace from its snapshot. `closeSandbox` writes those lessons and then the live computer stops.
 
 ```typescript
-const saved = await this.sandbox.saveSandbox(workspace);
+const saved = await this.sandbox.saveSandbox(workspace, {
+  snapshotDir: '/tmp/sandbox-snapshots',
+});
 await this.sandbox.closeSandbox(workspace);
 
 const resumed = await this.sandbox.resumeSandbox(saved, {
@@ -451,7 +454,9 @@ const report = await this.sandbox.readWorkspaceFile(
 );
 ```
 
-A one-off question can skip the saved workspace. The SDK deletes the computer when the run ends.
+Pass `saveSandbox` and `resumeSandbox` the same `computer`, `client`, and `snapshotDir` you passed to `openSandbox`. A Modal workspace saved without `computer: 'modal'` cannot be resumed.
+
+A one-off question can skip the saved workspace. The SDK deletes the computer when the run ends. `runSandboxOnce` takes the same `computer`, `image`, `ports`, `snapshotDir`, `client`, and `password` options as `openSandbox`, and adds `ACCOUNT_PASSWORD` the same way.
 
 ```typescript
 const result = await this.sandbox.runSandboxOnce(
@@ -473,7 +478,7 @@ const notesAgent = this.sandbox.createSandboxAgent(
 await this.sandbox.runSandboxOnce('Summarize the notes.', notesAgent);
 ```
 
-A normal agent can call the sandbox agent as a tool. Pass `workspace` to keep the same files.
+A normal agent can call the sandbox agent as a tool. Pass `workspace` to keep the same files. Without `workspace`, each call opens a fresh workspace from the same options as `openSandbox`. `asTool` returns a promise.
 
 ```typescript
 const sandboxAgent = this.sandbox.createSandboxAgent(
@@ -489,15 +494,16 @@ const intake = this.openai.createTriageAgent(
   'Receives a request and routes it.',
 );
 
-const workspaceTool = this.sandbox.asTool(sandboxAgent, {
+const workspaceTool = await this.sandbox.asTool(sandboxAgent, {
   toolName: 'workspace',
   toolDescription: 'Do the file and command work.',
   workspace,
 });
 
-const freshWorkspaceTool = this.sandbox.asTool(sandboxAgent, {
+const freshWorkspaceTool = await this.sandbox.asTool(sandboxAgent, {
   toolName: 'fresh_workspace',
-  toolDescription: 'Do the work in a new Unix workspace.',
+  toolDescription: 'Do the work in a new Docker workspace.',
+  computer: 'docker',
 });
 ```
 
@@ -786,6 +792,7 @@ Build that file with `docker build --tag agentic-sandbox .` before the call. A m
 
 1. For a public repo, paste the `https://github.com/owner/name` link. Add `/tree/<branch>` when the branch is not the default.
 2. For a private repo, pass `token`. GitHub sends it as `x-access-token`, GitLab as `oauth2`, and Bitbucket as `x-token-auth` unless you set `username`. Use an https URL. An SSH URL cannot carry the token.
+3. The token never goes in the clone URL, so it stays out of saved state, snapshots, `.git/config`, and error messages. The SDK clones on this machine, so `createManifest` gives this process a git header scoped to that one repo URL. A Unix workspace shares this process's environment and can still read it. Use Docker or a hosted computer for untrusted code.
 
 ```typescript
 const workspace = await this.sandbox.openSandbox(
@@ -948,42 +955,35 @@ const session = await this.sandbox.createHostedSession(
   },
 );
 
-const executor = this.sandbox.startHostedExecutor(session);
-await this.sandbox.waitForHostedConnection(session.sessionId);
+const executor = await this.sandbox.connectHostedSession(session);
 const answer = await this.sandbox.sendToHostedSession(
   session.sessionId,
   'Add a test for the homepage.',
 );
 ```
 
-On another machine, take the command and run it there after that machine is up:
+`connectHostedSession` opens the event stream first, then starts the executor on this machine, then waits for `agent.session.environment.connected`. It stops the executor and throws when the environment fails or does not connect within two minutes. Pass a second argument in milliseconds to change that. The executor gets `CODEX_API_KEY` and `PATH`, `HOME`, `USER`, `LANG`, `TMPDIR`, and `SHELL` only, so agent code cannot read `OPENAI_API_KEY` or the provider tokens.
+
+On another machine, open the stream first and start that machine from `onListening`:
 
 ```typescript
 const command = this.sandbox.hostedExecutorCommand(session);
-```
-
-When OpenAI posts `agent.session.created` for a self-hosted session, this starts the executor on this Mac:
-
-```typescript
-this.sandbox.onHostedSessionCreated({
-  type: 'agent.session.created',
-  data: {
-    environment_type: 'self_hosted',
-    environment_id: session.environmentId,
-    connect: { remote_url: session.remoteUrl },
-  },
+await this.sandbox.waitForHostedConnection(session.sessionId, {
+  onListening: () => startRemoteMachine(command),
 });
 ```
 
 Store `session.sessionId` with the chat. One session needs its own executor. Use `remoteUrl` unchanged when the executor reconnects.
 
-On this Mac, `startHostedExecutor` runs the executor. Set `REMOTE_MACHINE_PROVIDER` to `aws`, `digitalocean`, `databricks`, or `oci` when the webhook should create that machine instead. `POST /v1/webhook` checks the OpenAI signature with `OPENAI_WEBHOOK_SECRET`. `agent.session.action_required` with `environment_connection` creates the machine. `agent.session.failed` deletes it.
+On this Mac, `startHostedExecutor` runs the executor. Set `REMOTE_MACHINE_PROVIDER` to `aws`, `digitalocean`, `databricks`, or `oci` when the webhook should create that machine instead. `POST /v1/webhook` checks the OpenAI signature with `OPENAI_WEBHOOK_SECRET`. `agent.session.action_required` with `environment_connection` creates the machine. `agent.session.failed` and `agent.environment.expired` delete it.
 
-1. In the OpenAI dashboard, add a webhook endpoint aimed at this route. Subscribe to `agent.session.action_required` and `agent.session.failed`.
+The webhook is safe to receive twice and safe to run on more than one server. Before it creates a machine, it writes a claim to the session's `remote_machine_id` metadata and reads it back, so only one claim goes ahead. A failed create clears the claim and returns an error, so OpenAI sends the event again. If the machine id cannot be saved, the machine is deleted. A claim older than ten minutes belongs to a crashed create, and the next event takes it over. An expired environment is matched to its session among the 500 most recent sessions.
+
+1. In the OpenAI dashboard, add a webhook endpoint aimed at this route. Subscribe to `agent.session.action_required`, `agent.session.failed`, and `agent.environment.expired`.
 2. Copy the signing secret into `OPENAI_WEBHOOK_SECRET` and restart.
 3. For AWS, set `AWS_MICROVM_IMAGE_ARN`, `AWS_MICROVM_SECRET_ARN`, and the AWS CLI credentials. The image `/run` hook reads `environmentId`, `remoteUrl`, and `secretArn` from the payload.
 4. For DigitalOcean, set `DIGITALOCEAN_TOKEN`. The app posts the `codex-agentapi` manifest to `/v2/agents/sessions` with `openai_session_id`.
-5. For Databricks, set `DATABRICKS_HOST` to the workspace `https` URL and `DATABRICKS_TOKEN`. The app creates a sandbox and starts `codex exec-server` there. The key stays in the command environment.
+5. For Databricks, set `DATABRICKS_HOST` to the workspace `https` URL and `DATABRICKS_TOKEN`. The app creates a sandbox named after the session and starts `codex exec-server` there. The key stays in the command environment. A retry finds the same sandbox and starts the executor again instead of creating a second one.
 6. For OCI, run `oci session authenticate --profile-name Sandbox --region <region>`, then set `OCI_SANDBOX_PROJECT_ID`, `OCI_SANDBOX_TOKEN`, and `OCI_SANDBOX_CREATE_URL` to the create URL in the current OCI sandbox guide. Preview releases can rename that URL. Delete calls that same URL plus the sandbox id.
 
 </details>

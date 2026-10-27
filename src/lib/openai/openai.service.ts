@@ -1,5 +1,6 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import OpenAI from 'openai';
 import { z } from 'zod';
 import {
   Agent,
@@ -32,21 +33,28 @@ type CreateAgentOptions = {
 export class OpenaiService implements OnModuleInit {
   private runner?: Runner;
   private runnerModel?: string;
+  private socketRunner?: Runner;
+  private apiClient?: OpenAI;
 
   constructor(private readonly configService: ConfigService) {}
 
   // Set the default OpenAI key
   onModuleInit() {
-    const apiKey = this.configService
-      .getOrThrow<string>('OPENAI_API_KEY')
-      .trim();
-    setDefaultOpenAIKey(apiKey);
+    setDefaultOpenAIKey(this.apiKey());
   }
 
-  // Optional shared fallback. Agents that set their own model keep that model.
+  // One OpenAI client for the hosted session API. It uses the same key as the agents.
+  client() {
+    this.apiClient ??= new OpenAI({ apiKey: this.apiKey() });
+    return this.apiClient;
+  }
+
+  //1. Optional shared fallback. Agents that set their own model keep that model.
+  //2. It applies to every later run in this app, so call it once at startup.
   createRunner(model: string) {
     this.runnerModel = model;
     this.runner = new Runner({ model });
+    this.socketRunner = undefined;
     return this.runner;
   }
 
@@ -56,7 +64,7 @@ export class OpenaiService implements OnModuleInit {
   }
 
   // Create a new agent. Leave model out to use the runner model.
-  // modelSettings defaults to medium reasoning effort. Pass settings to change it.
+  // modelSettings is optional. Leave it out to use the model's own reasoning effort.
   // temperature is optional. Leave it out unless the model accepts it.
   createAgent(
     name: string,
@@ -104,7 +112,7 @@ export class OpenaiService implements OnModuleInit {
     });
   }
 
-  //1. Medium reasoning effort unless the caller sets another effort or other settings.
+  //1. Only the settings the caller passes are sent, so a model without reasoning still works.
   //2. temperature is included only when the caller passes a number, including 0.
   private modelSettings(
     settings?: ModelSettings,
@@ -113,10 +121,6 @@ export class OpenaiService implements OnModuleInit {
     return {
       ...settings,
       ...(temperature !== undefined && { temperature }),
-      reasoning: {
-        effort: 'medium',
-        ...settings?.reasoning,
-      },
     };
   }
 
@@ -140,10 +144,16 @@ export class OpenaiService implements OnModuleInit {
     return await run(agent, prompt, runOptions);
   }
 
+  // Built once and reused, so later runs share the same socket provider.
   private webSocketRunner() {
-    return new Runner({
+    this.socketRunner ??= new Runner({
       ...(this.runnerModel && { model: this.runnerModel }),
       modelProvider: new OpenAIProvider({ useResponsesWebSocket: true }),
     });
+    return this.socketRunner;
+  }
+
+  private apiKey() {
+    return this.configService.getOrThrow<string>('OPENAI_API_KEY').trim();
   }
 }
