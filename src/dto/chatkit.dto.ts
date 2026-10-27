@@ -78,9 +78,10 @@ export class ChatKitThreadRecoveryDto extends ChatKitRecoveryDto {
     description:
       'This is the id of the interrupted operation the admin checked, from the chat operation route.',
     example: '0192f1e2-0000-7000-8000-000000000003',
+    maxLength: 512,
   })
   @IsString()
-  @Length(1, 128)
+  @Length(1, 512)
   operationId: string;
 
   @ApiProperty({
