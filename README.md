@@ -34,6 +34,148 @@ The application validates configuration before it starts. Invalid ports, boolean
 
 Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS origins without paths.
 
+## OpenAI agents
+
+`OpenaiService` is global. Inject it where you create or run an agent. `OPENAI_API_KEY` is registered once at startup and is shared by every agent.
+
+`instructions` is the agent's job description. `prompt` is the question for one run. `context` is optional data your code can read, such as a user id or a database client. The model reads the instructions and the prompt. Context stays in your code.
+
+### Create an agent
+
+```typescript
+const historyTutor = this.openai.createAgent(
+  'History tutor',
+  'You answer history questions clearly and concisely.',
+  'gpt-6-astra',
+);
+```
+
+### Add a tool
+
+`sampleTool` lives in `src/config/tools/sample.tool.ts`.
+
+```typescript
+import { sampleTool } from '@/config/tools';
+
+const historyTutor = this.openai.createAgent(
+  'History tutor',
+  'You answer history questions clearly and concisely.',
+  'gpt-6-astra',
+  [sampleTool],
+);
+```
+
+### Add an output schema
+
+`sampleSchema` lives in `src/config/schema/sample.schema.ts`. Pass `undefined` for tools when the agent has a schema and no tools.
+
+```typescript
+import { sampleSchema } from '@/config/schema';
+
+const calendarExtractor = this.openai.createAgent(
+  'Calendar extractor',
+  'Extract calendar events from the supplied text.',
+  'gpt-6-astra',
+  undefined,
+  sampleSchema,
+);
+```
+
+### Add a handoff description
+
+`handoffDescription` is optional on a normal agent. Pass `undefined` for tools and schema when you only want the description.
+
+```typescript
+const historyTutor = this.openai.createAgent(
+  'History tutor',
+  'You answer history questions clearly and concisely.',
+  'gpt-6-astra',
+  undefined,
+  undefined,
+  'Specialist for historical questions',
+);
+```
+
+### Run an agent
+
+```typescript
+const result = await this.openai.runAgent(
+  'Who was the first Roman emperor?',
+  historyTutor,
+);
+```
+
+### Run with context
+
+Leave the third argument out when the run has no local data.
+
+```typescript
+const result = await this.openai.runAgent(
+  'Who was the first Roman emperor?',
+  historyTutor,
+  { userId: '123' },
+);
+```
+
+### Triage
+
+Build the specialists first. Each specialist can carry an optional `handoffDescription`. The triage agent requires one, so another agent knows when to hand off to it. Pass the triage agent to `runAgent`. It reads the prompt and hands the question to one specialist.
+
+```typescript
+const historyTutor = this.openai.createAgent(
+  'History tutor',
+  'You answer history questions clearly and concisely.',
+  'gpt-6-astra',
+  undefined,
+  undefined,
+  'Specialist for historical questions',
+);
+
+const mathTutor = this.openai.createAgent(
+  'Math tutor',
+  'You explain math step by step.',
+  'gpt-6-astra',
+  undefined,
+  undefined,
+  'Specialist for math questions',
+);
+
+const triage = this.openai.createTriageAgent(
+  'Homework triage',
+  'Route each homework question to the right specialist.',
+  [historyTutor, mathTutor],
+  'Routes homework questions to the right specialist',
+);
+
+const result = await this.openai.runAgent(
+  'Who was the first Roman emperor?',
+  triage,
+  { userId: '123' },
+);
+```
+
+### Tool, schema, and handoff description together
+
+```typescript
+import { sampleSchema } from '@/config/schema';
+import { sampleTool } from '@/config/tools';
+
+const historyTutor = this.openai.createAgent(
+  'History tutor',
+  'You answer history questions clearly and concisely.',
+  'gpt-6-astra',
+  [sampleTool],
+  sampleSchema,
+  'Specialist for historical questions',
+);
+
+const result = await this.openai.runAgent(
+  'Who was the first Roman emperor?',
+  historyTutor,
+  { userId: '123' },
+);
+```
+
 ## Health checks
 
 - `GET /v1/health/live` proves that the process can answer requests.
