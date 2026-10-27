@@ -63,9 +63,12 @@ export class SandboxService {
 
     return await this.client.create({
       manifest: new Manifest({
-        ...manifest,
+        entries: manifest.entries,
         environment: {
-          ...(password !== undefined && { ACCOUNT_PASSWORD: password }),
+          ...manifest.environment,
+          ...(password !== undefined && {
+            ACCOUNT_PASSWORD: { value: password, ephemeral: true },
+          }),
         },
       }),
     });

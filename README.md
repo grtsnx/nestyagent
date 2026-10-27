@@ -523,8 +523,8 @@ ACCOUNT_PASSWORD=the-login-secret
 
 2. Restart this app. Startup keeps the value only when it is not blank.
 3. Call `openSandbox`. The service reads `ACCOUNT_PASSWORD` from the validated environment.
-4. The workspace starts with that name set in its environment.
-5. The agent reads `$ACCOUNT_PASSWORD` inside the computer when a login form needs it.
+4. The workspace starts with that name set in its environment. The value is ephemeral, so a saved workspace does not keep it.
+5. The agent reads `$ACCOUNT_PASSWORD` inside the computer when a login form needs it. Other environment values on the manifest stay in place.
 
 Leave the variable empty and step 3 skips it. The workspace starts without a password. The value is not written into the prompt, and a person does not type it on each message. Every workspace this app opens receives the same secret.
 
