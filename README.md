@@ -256,6 +256,72 @@ const result = await this.openai.runAgent(
 );
 ```
 
+Start with one agent. Add a specialist only when that branch needs different instructions, tools, or policy. Each split adds a prompt, a trace, and an approval point.
+
+`handoffs` also takes `handoff(agent, options)` from `@openai/agents` when one handoff needs its own tool name or settings:
+
+```typescript
+import { handoff } from '@openai/agents';
+
+const triage = this.openai.createTriageAgent(
+  'Support triage',
+  'Route each request to the right specialist.',
+  [billingAgent, handoff(refundAgent, { toolNameOverride: 'refund_request' })],
+  'Routes support requests to the right specialist',
+);
+```
+
+### Continue with the same specialist
+
+`nextAgent` is optional. Call it when the specialist who just answered should take the next message. Pass the triage agent as the fallback. That fallback is required, and it is used when the run has no last agent. Pass `triage` to `runAgent` again when every new message should be routed from the start. `session` stays optional. Reuse one session when the chat should continue.
+
+```typescript
+const chat = this.openai.createSession();
+
+const first = await this.openai.runAgent('I was charged twice.', triage, {
+  session: chat,
+});
+
+const speaker = this.openai.nextAgent(first, triage);
+
+const second = await this.openai.runAgent('It was on Tuesday.', speaker, {
+  session: chat,
+});
+```
+
+### Call a specialist as a tool
+
+Use this when the manager should write the reply and the specialist should do one job. `toolName` and `toolDescription` are optional. Leave `toolName` out and the tool uses the agent name. Leave the whole options object out when the agent name is enough.
+
+```typescript
+const summarizer = this.openai.createAgent(
+  'Summarizer',
+  'Generate a concise summary of the supplied text.',
+);
+
+const summarizeText = this.openai.asTool(summarizer, {
+  toolName: 'summarize_text',
+  toolDescription: 'Generate a concise summary of the supplied text.',
+});
+
+const researcher = this.openai.createAgent(
+  'Research assistant',
+  'Answer the user. Call the summarizer when the text is long.',
+  { tools: [summarizeText] },
+);
+
+const result = await this.openai.runAgent(
+  'Summarize this article, then tell me if I should care.',
+  researcher,
+);
+```
+
+The same call with no options names the tool `Summarizer`:
+
+```typescript
+const summarizeText = this.openai.asTool(summarizer);
+```
+
 ### Tool, schema, and handoff description together
 
 ```typescript
@@ -505,6 +571,14 @@ const freshWorkspaceTool = await this.sandbox.asTool(sandboxAgent, {
   toolDescription: 'Do the work in a new Docker workspace.',
   computer: 'docker',
 });
+
+const manager = this.openai.createAgent(
+  'Site manager',
+  'Answer the user. Use the workspace tool for files and commands.',
+  { tools: [workspaceTool] },
+);
+
+await this.openai.runAgent('Save a homepage in the workspace.', manager);
 ```
 
 ### Add skills

@@ -270,11 +270,9 @@ export class SandboxService {
       workspace?: SandboxWorkspace;
     },
   ) {
-    return agent.asTool({
-      ...(options?.toolName && { toolName: options.toolName }),
-      ...(options?.toolDescription && {
-        toolDescription: options.toolDescription,
-      }),
+    return this.openaiService.asTool(agent, {
+      toolName: options?.toolName,
+      toolDescription: options?.toolDescription,
       runConfig: {
         sandbox: options?.workspace
           ? { session: options.workspace }

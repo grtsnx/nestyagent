@@ -20,6 +20,11 @@ type RunAgentOptions<TContext> = {
   websocket?: boolean;
 };
 
+type AsToolOptions = Pick<
+  NonNullable<Parameters<Agent['asTool']>[0]>,
+  'toolName' | 'toolDescription' | 'runConfig'
+>;
+
 type CreateAgentOptions = {
   model?: string;
   tools?: Tool[];
@@ -89,10 +94,11 @@ export class OpenaiService implements OnModuleInit {
 
   //1. Create a triage agent that routes work to specialist agents.
   //2. handoffDescription is required so another agent knows when to hand off to it.
+  //3. handoffs takes agents, or handoff(agent, options) when one handoff needs its own settings.
   createTriageAgent(
     name: string,
     instructions: string,
-    handoffs: Agent[],
+    handoffs: Agent['handoffs'],
     handoffDescription: string,
     options?: Pick<
       CreateAgentOptions,
@@ -110,6 +116,13 @@ export class OpenaiService implements OnModuleInit {
       ),
       ...(options?.model && { model: options.model }),
     });
+  }
+
+  //1. Turn an agent into a tool. The manager keeps the reply and calls this agent for one job.
+  //2. toolName and toolDescription are optional. The agent name is used when toolName is left out.
+  //3. runConfig is optional. SandboxService passes the workspace through it.
+  asTool(agent: Agent, options?: AsToolOptions) {
+    return agent.asTool({ ...options });
   }
 
   //1. Only the settings the caller passes are sent, so a model without reasoning still works.
@@ -142,6 +155,12 @@ export class OpenaiService implements OnModuleInit {
 
     if (runner) return await runner.run(agent, prompt, runOptions);
     return await run(agent, prompt, runOptions);
+  }
+
+  //1. Optional. Call this after a handoff when the same specialist should answer the next message.
+  //2. fallback is required here. It is used when the run has no last agent.
+  nextAgent(result: { lastAgent?: Agent }, fallback: Agent) {
+    return result.lastAgent ?? fallback;
   }
 
   // Built once and reused, so later runs share the same socket provider.
