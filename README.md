@@ -216,6 +216,8 @@ Each customer message is a trace named `agent-turn`. A chat id groups those trac
 
 Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` to also send each trace to your self-hosted Langfuse. Langfuse gets more than the OpenAI dashboard: the customer's message, the final answer, the chat id, the user id, the request id, the model, and token use. API keys in that text are masked. Tool inputs and outputs still stay out. Turn Langfuse on only where storing customer messages is allowed.
 
+A trace appears in Langfuse only after a helper runs. This app ships no route that runs a helper, so the dashboard stays empty until your own code calls `runAgent`, `reply`, or `runSandbox`. If Langfuse is down, the app keeps working and those traces are dropped.
+
 `traceWorkflow` puts several runs in one trace. `span` records a step the helper does not already record.
 
 ### Check the answers (evals)
@@ -1422,11 +1424,15 @@ docker run --rm --read-only --tmpfs /tmp --tmpfs /app/.msagents:uid=1000,gid=100
 <details>
 <summary><h2>🚀 CI/CD</h2></summary>
 
-`.github/workflows/ci.yml` runs for pull requests and pushes to `main` and `dev`. It uses Bun 1.4.4, matching the Docker build and release workflow, installs the exact lockfile, checks formatting and types, runs every test, checks packages for known problems, builds the app and the image, and scans the image. Every outside action is pinned to an exact commit. PostgreSQL integration tests run against a temporary CI database. BuildKit caches image layers in GitHub Actions, while the vulnerability database cache remains enabled.
+`.github/workflows/ci.yml` runs for pull requests and pushes to `main` and `dev`. It installs the exact lockfile, checks formatting, lint, and types, runs unit, end-to-end, and PostgreSQL tests, checks packages for known problems, builds the app and the image, and scans the image. One job does all of it, so the runner is set up once.
+
+- **Same everywhere.** Bun's version comes from `packageManager` in `package.json`. Every outside action is pinned to an exact commit.
+- **Tests need no secrets.** End-to-end tests use a fake OpenAI key and ignore your `.env` database and Langfuse settings, so they pass the same on a laptop and in CI.
+- **Cheap.** Bun packages, image layers, and the vulnerability database are cached. A newer push cancels the older run on the same branch. A push that only changes Markdown skips CI; pull requests always run.
 
 When a package deep inside the tree pins a version with a known problem, `overrides` in `package.json` forces the fixed version. Today that is `zod` and `js-yaml`. Remove an override once the package that pins it ships a fix.
 
-`.github/workflows/release.yml` runs when you push a version tag. It publishes images for Linux AMD64 and ARM64 to GitHub Container Registry, with a list of what is inside (SBOM) and a signed record of how it was built. Set up protection rules and reviewers on the `production` environment before your first release.
+`.github/workflows/release.yml` runs when you push a version tag. It runs the whole CI workflow first, then publishes images for Linux AMD64 and ARM64 to GitHub Container Registry, with a list of what is inside (SBOM) and a signed record of how it was built. Set up protection rules and reviewers on the `production` environment before your first release.
 
 ```bash
 git tag v1.0.0

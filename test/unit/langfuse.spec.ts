@@ -5,7 +5,7 @@ import {
   InMemorySpanExporter,
   SimpleSpanProcessor,
 } from '@opentelemetry/sdk-trace-base';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   LangfuseService,
   planObservations,
@@ -59,6 +59,17 @@ describe('LangfuseService', () => {
       await provider.shutdown();
       setLangfuseTracerProvider(null);
     }
+  });
+});
+
+describe('LangfuseService shutdown', () => {
+  it('stops cleanly when Langfuse is unreachable', async () => {
+    const service = new LangfuseService(new ConfigService({}));
+    const flush = vi
+      .spyOn(service, 'forceFlush')
+      .mockRejectedValue(new Error('ECONNREFUSED'));
+    await expect(service.onModuleDestroy()).resolves.toBeUndefined();
+    flush.mockRestore();
   });
 });
 

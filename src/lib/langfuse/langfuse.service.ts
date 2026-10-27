@@ -1,5 +1,6 @@
 import {
   Injectable,
+  Logger,
   type OnModuleDestroy,
   type OnModuleInit,
 } from '@nestjs/common';
@@ -318,6 +319,7 @@ export class LangfuseService
   private readonly notes = new Map<string, TurnNote>();
   private readonly pending = new Map<string, AgentTraceItem[]>();
   private readonly timers = new Map<string, NodeJS.Timeout>();
+  private readonly logger = new Logger(LangfuseService.name);
   private processor?: LangfuseSpanProcessor;
   private provider?: BasicTracerProvider;
 
@@ -348,8 +350,11 @@ export class LangfuseService
     addTraceProcessor(this);
   }
 
+  // A Langfuse outage must not block the app from stopping. Unsent traces are dropped.
   async onModuleDestroy() {
-    await this.shutdown();
+    await this.shutdown().catch(() =>
+      this.logger.warn('Langfuse was unreachable; unsent traces were dropped.'),
+    );
   }
 
   // Merge the user message, answer, chat, and request onto the trace before it is sent.
@@ -400,9 +405,13 @@ export class LangfuseService
     await this.processor?.forceFlush();
   }
 
+  // The provider always shuts down, even when the last flush fails.
   async shutdown(timeout?: number) {
-    await this.forceFlush();
-    await this.provider?.shutdown();
+    try {
+      await this.forceFlush();
+    } finally {
+      await this.provider?.shutdown();
+    }
     void timeout;
   }
 
