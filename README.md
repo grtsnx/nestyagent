@@ -294,7 +294,7 @@ Every sandbox agent starts with three capabilities:
 
 `skills` and `memory` are optional. Pass `skills` when the agent should load a skill folder or repo. Pass `memory: true` when a later run should read lessons from earlier workspace work.
 
-The samples below cover these jobs: an empty computer, a website, notes, a cloned starter, files from this Mac, sandbox accounts, a login secret, GitHub, GitLab, Bitbucket, GitBucket, Google Drive, S3, GCS, R2, Azure, and Box, a preview, the same chat, save and resume, Docker, a hosted client, a one-off run, a handoff, a sandbox tool, skills, memory, and a self-hosted executor on this Mac or another machine.
+The samples below cover these jobs: an empty computer, a website, notes, a cloned starter, files from this Mac, sandbox accounts, a login secret, GitHub, GitLab, Bitbucket, GitBucket, Google Drive, S3, GCS, R2, Azure, and Box, a preview, the same chat, save and resume, Docker, a hosted client, a one-off run, a handoff, a sandbox tool, skills, and memory.
 
 ### Create a sandbox agent
 
@@ -913,6 +913,11 @@ await this.sandbox.runSandbox('Start the site on port 3000.', agent, {
 
 const preview = await this.sandbox.previewUrl(workspace, 3000);
 ```
+
+</details>
+
+<details>
+<summary><h2>🖥️ Self-hosted</h2></summary>
 
 ### Self-hosted session
 
