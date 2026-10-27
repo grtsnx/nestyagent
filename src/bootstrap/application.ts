@@ -1,6 +1,7 @@
 import {
   ConsoleLogger,
   type INestApplication,
+  RequestMethod,
   ValidationPipe,
   VersioningType,
 } from '@nestjs/common';
@@ -23,7 +24,16 @@ export function configureApplication(
         ? true
         : { directives: { upgradeInsecureRequests: null } },
   });
-  app.enableCsrfProtection({ trustedOrigins: environment.CORS_ORIGINS });
+  app.enableCsrfProtection({
+    trustedOrigins: environment.CORS_ORIGINS,
+    exclude: [
+      {
+        path: 'sandbox/hosted-webhook',
+        method: RequestMethod.POST,
+        version: '1',
+      },
+    ],
+  });
   app.enableVersioning({ type: VersioningType.URI });
   app.enableShutdownHooks();
 
@@ -57,6 +67,7 @@ export async function createApplication(): Promise<{
   environment: Environment;
 }> {
   const app = await NestFactory.create(AppModule, {
+    rawBody: true,
     instrument: ObserveInstrument,
     logger: new ConsoleLogger({
       json: true,

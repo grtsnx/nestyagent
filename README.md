@@ -2,13 +2,14 @@
 
 Agentic is a stateless NestJS API foundation for provider-specific agent experiments. The application exposes versioned APIs, health checks, OpenAPI documents, structured responses, and global error handling.
 
-## Requirements
+## 📋 Requirements
 
 - Bun 1.3.14
 - Node.js 24 or later for the production runtime
 - Docker or another OCI-compatible container runtime for deployment
 
-## Local development
+<details>
+<summary><h2>🛠️ Local development</h2></summary>
 
 ```bash
 cp .env.example .env
@@ -18,8 +19,10 @@ bun run start:dev
 
 Swagger UI runs at `http://localhost:3000/api`, and Scalar runs at `http://localhost:3000/docs`. Both use the version-specific OpenAPI documents at `/api/v1-json` and `/api/v2-json`. The application prints every enabled documentation URL when it starts.
 
+</details>
+
 <details>
-<summary><h2>Configuration</h2></summary>
+<summary><h2>⚙️ Configuration</h2></summary>
 
 The application validates configuration before it starts. Invalid ports, booleans, and CORS origins stop startup.
 
@@ -35,12 +38,13 @@ The application validates configuration before it starts. Invalid ports, boolean
 | `ACCOUNT_PASSWORD`        | empty                 | Login secret for every workspace. Blank starts a workspace without one.              |
 | `OPENAI_EXECUTOR_API_KEY` | empty                 | Codex environment key from the platform Agents tab. Blank leaves the executor unset. |
 
-Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS origins without paths.
+> [!CAUTION]
+> Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS origins without paths.
 
 </details>
 
 <details>
-<summary><h2>OpenAI agents</h2></summary>
+<summary><h2>🤖 OpenAI agents</h2></summary>
 
 `OpenaiService` is global. Inject it where you create or run an agent. `OPENAI_API_KEY` is registered once at startup and is shared by every agent.
 
@@ -146,7 +150,10 @@ Leave `modelSettings` out and the effort stays `medium`.
 
 ### Temperature
 
-`temperature` is optional. Leave it out and the request does not send one. `0` keeps the wording steady. A higher number, such as `1`, lets the wording vary. `gpt-6-astra` rejects a custom temperature, so leave it out for that model.
+`temperature` is optional. Leave it out and the request does not send one. `0` keeps the wording steady. A higher number, such as `1`, lets the wording vary.
+
+> [!WARNING]
+> `gpt-6-astra` rejects a custom temperature, so leave it out for that model.
 
 ```typescript
 const writer = this.openai.createAgent(
@@ -275,7 +282,7 @@ const result = await this.openai.runAgent(
 </details>
 
 <details>
-<summary><h2>Sandbox</h2></summary>
+<summary><h2>💻 Sandbox</h2></summary>
 
 `SandboxService` opens a workspace computer. The chat stays in `OpenaiService`. A workspace is where files, commands, and a logged-in browser live.
 
@@ -665,10 +672,21 @@ ACCOUNT_PASSWORD=the-login-secret
 
 2. Restart this app. Startup keeps the value only when it is not blank.
 3. Call `openSandbox`. The service reads `ACCOUNT_PASSWORD` from the validated environment.
-4. The workspace starts with that name set in its environment. The value is ephemeral, so a saved workspace does not keep it.
+4. The workspace starts with that name set in its environment.
 5. The agent reads `$ACCOUNT_PASSWORD` inside the computer when a login form needs it. Other environment values on the manifest stay in place.
 
-Leave the variable empty and step 3 skips it. The workspace starts without a password. The value is not written into the prompt, and a person does not type it on each message. Every workspace this app opens receives the same secret.
+> [!WARNING]
+> The password is ephemeral. A saved workspace does not keep it.
+
+Leave the variable empty and step 3 skips it. The workspace starts without a password. The value is not written into the prompt, and a person does not type it on each message.
+
+Pass `password` when this workspace belongs to a different person. That value replaces the shared secret for this call only.
+
+```typescript
+const workspace = await this.sandbox.openSandbox(createManifest(), {
+  password: this.user.accountPassword,
+});
+```
 
 ### Mount GitHub or Google Drive
 
@@ -767,23 +785,34 @@ Build that file with `docker build --tag agentic-sandbox .` before the call. A m
 ### GitHub
 
 1. For a public repo, paste the `https://github.com/owner/name` link. Add `/tree/<branch>` when the branch is not the default.
-2. For a private repo, this app has no token field. On the machine that runs Docker, run `gh auth login` or add an SSH key that can read the repo.
-3. Pass the `git@github.com:owner/name.git` address when you use SSH.
-4. Open the workspace with the image above. The folder name is the repo name unless you set `path` on `repo`.
+2. For a private repo, pass `token`. GitHub sends it as `x-access-token`, GitLab as `oauth2`, and Bitbucket as `x-token-auth` unless you set `username`. Use an https URL. An SSH URL cannot carry the token.
+
+```typescript
+const workspace = await this.sandbox.openSandbox(
+  createManifest({
+    repo: {
+      url: 'https://github.com/owner/private',
+      token: process.env.GITHUB_TOKEN,
+    },
+  }),
+);
+```
+
+3. Open the workspace with the image above. The folder name is the repo name unless you set `path` on `repo`.
 
 ### GitLab
 
 1. In the GitLab project, open Settings, then Access Tokens. Create a token with `read_repository`. For SSH, add your key under Preferences, then SSH Keys.
 2. Copy the HTTPS or SSH clone URL. A branch link looks like `https://gitlab.com/group/api/-/tree/main`. Nested groups stay in the URL.
-3. Pass it with `provider: 'gitlab'`.
-4. For a private HTTPS clone, store the token in the git credential helper on the Docker host before `openSandbox`. The token does not go in the manifest.
+3. Pass it with `provider: 'gitlab'` and `token`. The app sends the token as `oauth2`.
+4. Use an https URL. An SSH URL cannot carry the token.
 
 ### Bitbucket
 
 1. In Bitbucket, open Personal settings, then App passwords. Create one with Repositories: Read. For SSH, add a key under SSH keys.
 2. Copy the clone URL. A branch link looks like `https://bitbucket.org/owner/web/src/main`.
-3. Pass it with `provider: 'bitbucket'`.
-4. Use the SSH URL when the app password is not in the host git credentials.
+3. Pass it with `provider: 'bitbucket'`, `username`, and `token`. Without `username`, the app uses `x-token-auth`.
+4. Use an https URL. An SSH URL cannot carry the token.
 
 ### GitBucket
 
@@ -805,15 +834,30 @@ Build that file with `docker build --tag agentic-sandbox .` before the call. A m
 1. In the AWS console, open IAM and create a user or role that can `s3:ListBucket` and `s3:GetObject` on one bucket. Add `s3:PutObject` only when `readOnly` is false.
 2. Create an access key for that user. Copy the access key id and the secret.
 3. Put them in the environment of this app, not in source. Pass `bucket`, `region`, `prefix`, `accessKeyId`, and `secretAccessKey` on the mount.
-4. For a temporary STS key, also pass `sessionToken`.
+4. For a temporary STS key, also pass `sessionToken`. A custom endpoint uses `endpointUrl`. Amazon S3 Files is a separate mount: `provider: 's3-files'` and `fileSystemId`.
 5. Open with the Docker image from above.
+
+```typescript
+mounts: {
+  custom: {
+    provider: 's3',
+    bucket: 'account-files',
+    endpointUrl: 'https://s3.example.com',
+  },
+  shared: {
+    provider: 's3-files',
+    fileSystemId: 'fs-0123456789abcdef0',
+    region: 'us-east-1',
+  },
+},
+```
 
 ### Google Cloud Storage
 
 1. In Google Cloud, open IAM and create a service account. Grant it Storage Object Viewer on the bucket. Grant Storage Object Admin only when the agent should write.
 2. Create a JSON key and save it outside the repo, for example `/Users/me/gcs.json`.
 3. Pass `bucket` and `serviceAccountFile` with that path. The file must be visible to the container.
-4. The other way is an HMAC key: pass `accessId` and `secretAccessKey` instead of the JSON file.
+4. The other way is an HMAC key: pass `accessId` and `secretAccessKey` instead of the JSON file. To paste the JSON itself, pass `serviceAccountCredentials` with the file contents. `accessToken` is a third option when you already have a short-lived token.
 5. Open with the Docker image from above.
 
 ### Cloudflare R2
@@ -834,7 +878,7 @@ Build that file with `docker build --tag agentic-sandbox .` before the call. A m
 ### Box
 
 1. In the Box Developer Console, create an app and copy the client id and client secret. For a short test, the console can also issue a developer token.
-2. Pass `accessToken` for that token, or pass `clientId` and `clientSecret`.
+2. Pass `accessToken` for that token, or pass `clientId` and `clientSecret`. For an enterprise app, also pass `boxSubType: 'enterprise'`, `impersonate` or `ownedBy`, and `rootFolderId`. `boxConfigFile` points at a Box config file, and `configCredentials` is that config as text.
 3. A developer token expires quickly. Create a new one when the mount starts failing.
 4. Open with the Docker image from above.
 
@@ -842,11 +886,18 @@ Build that file with `docker build --tag agentic-sandbox .` before the call. A m
 
 Unix is the default. Docker uses `node:latest`, so a new Node release arrives with the image and this file stays as it is. Pass `image` when a workspace needs a fixed tag.
 
-Modal, Vercel, Cloudflare, E2B, Daytona, and Blaxel are separate packages. Install the one you need and pass its client. The agent, the manifest, and the capabilities stay the same.
+Modal, Vercel, Cloudflare, E2B, Daytona, and Blaxel are installed with this app. Pass `computer` and the same agent. Cloudflare also needs `workerUrl` or `CLOUDFLARE_SANDBOX_WORKER_URL`. Each provider still reads its own credential: Modal uses `modal setup` or `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`, E2B uses `E2B_API_KEY`, Daytona uses `DAYTONA_API_KEY`, Vercel uses `VERCEL_TOKEN`, and Blaxel uses its own workspace login.
 
 ```typescript
 const workspace = await this.sandbox.openSandbox(createManifest(), {
-  client: modalClient,
+  computer: 'modal',
+});
+```
+
+```typescript
+const workspace = await this.sandbox.openSandbox(createManifest(), {
+  computer: 'cloudflare',
+  workerUrl: 'https://sandbox.example.workers.dev',
 });
 ```
 
@@ -921,12 +972,19 @@ this.sandbox.onHostedSessionCreated({
 
 Store `session.sessionId` with the chat. One session needs its own executor. Use `remoteUrl` unchanged when the executor reconnects.
 
-On this Mac, `startHostedExecutor` runs the executor. On Lambda, Databricks, DigitalOcean, OCI, or another host, that machine runs `hostedExecutorCommand(session)` after it is up. When OpenAI posts `agent.session.created` for a self-hosted session, pass the event to `onHostedSessionCreated` to start the executor on this Mac. A webhook that creates or deletes a remote machine belongs to that provider.
+On this Mac, `startHostedExecutor` runs the executor. Set `REMOTE_MACHINE_PROVIDER` to `aws`, `digitalocean`, `databricks`, or `oci` when the webhook should create that machine instead. `POST /v1/sandbox/hosted-webhook` checks the OpenAI signature with `OPENAI_WEBHOOK_SECRET`. `agent.session.action_required` with `environment_connection` creates the machine. `agent.session.failed` deletes it.
+
+1. In the OpenAI dashboard, add a webhook endpoint aimed at this route. Subscribe to `agent.session.action_required` and `agent.session.failed`.
+2. Copy the signing secret into `OPENAI_WEBHOOK_SECRET` and restart.
+3. For AWS, set `AWS_MICROVM_IMAGE_ARN`, `AWS_MICROVM_SECRET_ARN`, and the AWS CLI credentials. The image `/run` hook reads `environmentId`, `remoteUrl`, and `secretArn` from the payload.
+4. For DigitalOcean, set `DIGITALOCEAN_TOKEN`. The app posts the `codex-agentapi` manifest to `/v2/agents/sessions` with `openai_session_id`.
+5. For Databricks, set `DATABRICKS_HOST` to the workspace `https` URL and `DATABRICKS_TOKEN`. The app creates a sandbox and starts `codex exec-server` there. The key stays in the command environment.
+6. For OCI, run `oci session authenticate --profile-name Sandbox --region <region>`, then set `OCI_SANDBOX_PROJECT_ID`, `OCI_SANDBOX_TOKEN`, and `OCI_SANDBOX_CREATE_URL` to the create URL in the current OCI sandbox guide. Preview releases can rename that URL. Delete calls that same URL plus the sandbox id.
 
 </details>
 
 <details>
-<summary><h2>Health checks</h2></summary>
+<summary><h2>💚 Health checks</h2></summary>
 
 - `GET /v1/health/live` proves that the process can answer requests.
 - `GET /v1/health/ready` checks the process's memory limits.
@@ -936,7 +994,7 @@ Both routes also support API version 2. The checks do not depend on external web
 </details>
 
 <details>
-<summary><h2>Verification</h2></summary>
+<summary><h2>✅ Verification</h2></summary>
 
 All tests live under `test/`.
 
@@ -953,7 +1011,7 @@ bun run build
 </details>
 
 <details>
-<summary><h2>Container deployment</h2></summary>
+<summary><h2>🐳 Container deployment</h2></summary>
 
 Build and run the same OCI image on Docker, Kubernetes, Nomad, ECS, Cloud Run, Fly.io, Railway, Render, or any compatible platform:
 
@@ -967,7 +1025,7 @@ The image uses pinned Bun and Node digests, contains production dependencies onl
 </details>
 
 <details>
-<summary><h2>CI/CD</h2></summary>
+<summary><h2>🚀 CI/CD</h2></summary>
 
 `.github/workflows/ci.yml` installs the lockfile exactly, checks formatting and types, runs all tests, audits dependencies, builds the application and container, and scans the runtime image. Every external action is pinned to a full commit SHA.
 
@@ -984,17 +1042,23 @@ The workflow delivers a portable image. Each hosting platform can deploy that im
 
 </details>
 
-## Reliability and state
+<details>
+<summary><h2>🛡️ Reliability and state</h2></summary>
 
-The HTTP API owns no durable state. A sandbox workspace lasts only while it stays open, until you save and resume it, or until a new workspace starts from its snapshot. Add workflow and idempotency modules only with a shared production store and tested transaction boundaries. Until then, replicas can start, stop, and roll back without losing application-owned state because the application owns none.
+> [!IMPORTANT]
+> The HTTP API owns no durable state. A sandbox workspace lasts only while it stays open, until you save and resume it, or until a new workspace starts from its snapshot.
+
+Add workflow and idempotency modules only with a shared production store and tested transaction boundaries. Until then, replicas can start, stop, and roll back without losing application-owned state because the application owns none.
 
 The application enables graceful NestJS shutdown hooks. Its global exception filter also handles exceptions thrown by middleware, assigns a safe request ID, logs unexpected server errors, and keeps internal error details out of client responses.
 
-## NestJS guidance applied
+</details>
+
+## 📘 NestJS guidance applied
 
 This project follows the current NestJS guidance for [exception filters](https://docs.nestjs.com/exception-filters), [security headers](https://docs.nestjs.com/techniques/security/cors), [CSRF protection](https://docs.nestjs.com/security/csrf), [validation](https://docs.nestjs.com/application/validation), [rate limiting](https://docs.nestjs.com/security/rate-limiting), and [shutdown hooks](https://docs.nestjs.com/fundamentals/lifecycle-events).
 
-## Acknowledgments
+## ⭐ Acknowledgments
 
 This Nestjs-OpenAI Agents SDK boilerplate was created by [Abolade Greatness](https://github.com/grtsnx).
 

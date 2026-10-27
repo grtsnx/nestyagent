@@ -33,6 +33,15 @@ describe('validateEnvironment', () => {
     ).toBeUndefined();
   });
 
+  it('keeps a trimmed webhook secret and treats a blank value as unset', () => {
+    expect(
+      validateEnvironment({ OPENAI_WEBHOOK_SECRET: '  whsec_test  ' })
+        .OPENAI_WEBHOOK_SECRET,
+    ).toBe('whsec_test');
+    expect(
+      validateEnvironment({ OPENAI_WEBHOOK_SECRET: '' }).OPENAI_WEBHOOK_SECRET,
+    ).toBeUndefined();
+  });
   it('keeps a trimmed OpenAI API key and treats a blank value as unset', () => {
     expect(
       validateEnvironment({ OPENAI_API_KEY: '  sk-test  ' }).OPENAI_API_KEY,

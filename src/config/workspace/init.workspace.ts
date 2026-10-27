@@ -336,10 +336,15 @@ function withGitCredentials(
 function gitHost(repo: string): GitHost {
   if (!repo.includes('://')) return 'github';
   const host = new URL(repo).hostname;
-  if (host === 'gitlab.com' || host.endsWith('.gitlab.com') || host.includes('gitlab')) {
+  if (
+    host === 'gitlab.com' ||
+    host.endsWith('.gitlab.com') ||
+    host.includes('gitlab')
+  ) {
     return 'gitlab';
   }
-  if (host === 'bitbucket.org' || host.endsWith('.bitbucket.org')) return 'bitbucket';
+  if (host === 'bitbucket.org' || host.endsWith('.bitbucket.org'))
+    return 'bitbucket';
   return 'github';
 }
 

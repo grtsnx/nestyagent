@@ -16,6 +16,13 @@ const booleanValue = (name: string) =>
     z.boolean({ error: `${name} must be a boolean` }),
   );
 
+function optionalSecret() {
+  return z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().trim().min(1).optional(),
+  );
+}
+
 function corsOrigins(value: unknown): string[] {
   if (value === undefined || value === '') return [];
   const values = Array.isArray(value) ? value : String(value).split(',');
@@ -70,6 +77,22 @@ const environmentSchema = z
       (value) => (value === '' ? undefined : value),
       z.string().trim().min(1).optional(),
     ),
+    OPENAI_WEBHOOK_SECRET: optionalSecret(),
+    REMOTE_MACHINE_PROVIDER: z
+      .enum(['local', 'aws', 'digitalocean', 'databricks', 'oci'])
+      .optional(),
+    AWS_MICROVM_IMAGE_ARN: optionalSecret(),
+    AWS_MICROVM_EXECUTION_ROLE: optionalSecret(),
+    AWS_MICROVM_SECRET_ARN: optionalSecret(),
+    AWS_REGION: optionalSecret(),
+    DIGITALOCEAN_TOKEN: optionalSecret(),
+    DATABRICKS_HOST: optionalSecret(),
+    DATABRICKS_TOKEN: optionalSecret(),
+    OCI_SANDBOX_PROJECT_ID: optionalSecret(),
+    OCI_SANDBOX_TOKEN: optionalSecret(),
+    OCI_SANDBOX_CREATE_URL: optionalSecret(),
+    CLOUDFLARE_SANDBOX_WORKER_URL: optionalSecret(),
+    CLOUDFLARE_SANDBOX_API_KEY: optionalSecret(),
   })
   .superRefine((environment, context) => {
     if (!environment.OBSERVE_ENABLED) return;
@@ -102,6 +125,21 @@ export interface Environment {
   OPENAI_API_KEY?: string;
   ACCOUNT_PASSWORD?: string;
   OPENAI_EXECUTOR_API_KEY?: string;
+  OPENAI_WEBHOOK_SECRET?: string;
+  REMOTE_MACHINE_PROVIDER?:
+    'local' | 'aws' | 'digitalocean' | 'databricks' | 'oci';
+  AWS_MICROVM_IMAGE_ARN?: string;
+  AWS_MICROVM_EXECUTION_ROLE?: string;
+  AWS_MICROVM_SECRET_ARN?: string;
+  AWS_REGION?: string;
+  DIGITALOCEAN_TOKEN?: string;
+  DATABRICKS_HOST?: string;
+  DATABRICKS_TOKEN?: string;
+  OCI_SANDBOX_PROJECT_ID?: string;
+  OCI_SANDBOX_TOKEN?: string;
+  OCI_SANDBOX_CREATE_URL?: string;
+  CLOUDFLARE_SANDBOX_WORKER_URL?: string;
+  CLOUDFLARE_SANDBOX_API_KEY?: string;
 }
 
 export function validateEnvironment(
