@@ -1,30 +1,58 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Agent, run, setDefaultOpenAIKey } from '@openai/agents';
+import { z } from 'zod';
+import { Agent, run, setDefaultOpenAIKey, Tool } from '@openai/agents';
 
 @Injectable()
 export class OpenaiService implements OnModuleInit {
   constructor(private readonly configService: ConfigService) {}
 
+  // Set the default OpenAI key
   onModuleInit() {
     const apiKey = this.configService.getOrThrow<string>('OPENAI_API_KEY');
     setDefaultOpenAIKey(apiKey);
   }
 
-  createAgent(name: string, instructions: string, model: string) {
+  // Create a new agent
+  createAgent(
+    name: string,
+    instructions: string,
+    model: string,
+    tools?: Tool[],
+    schema?: z.ZodObject,
+    handoffDescription?: string,
+  ) {
     return new Agent({
       name,
       instructions,
       model,
+      ...(schema && { outputType: schema }),
+      ...(tools && { tools }),
+      ...(handoffDescription && { handoffDescription }),
     });
   }
 
-  async runAgent(
-    prompt: string,
+  // Create a triage agent that routes work to specialist agents.
+  // handoffDescription is required so another agent knows when to hand off to it.
+  createTriageAgent(
     name: string,
     instructions: string,
-    model: string,
+    handoffs: Agent[],
+    handoffDescription: string,
+    model?: string,
   ) {
-    return await run(this.createAgent(name, instructions, model), prompt);
+    return Agent.create({
+      name,
+      instructions,
+      handoffs,
+      handoffDescription,
+      ...(model && { model }),
+    });
+  }
+
+  // Run a prompt on an agent. For triage, pass the agent from createTriageAgent.
+  // That agent reads the prompt and hands it to one specialist in its handoffs.
+  async runAgent(prompt: string, agent: Agent) {
+    return await run(agent, prompt);
   }
 }

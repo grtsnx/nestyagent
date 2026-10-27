@@ -1,0 +1,23 @@
+---
+description: Use OpenAI Agents SDK types as exported, without extra type modifiers or any generics
+globs: "**/*.ts"
+alwaysApply: false
+---
+
+# OpenAI SDK types
+
+Import and annotate with the types the Agents SDK exports. Do not add a `type` import modifier, and do not fill generic slots with `any`.
+
+```typescript
+import { Agent, run, setDefaultOpenAIKey, Tool } from '@openai/agents';
+
+createTriageAgent(name: string, instructions: string, handoffs: Agent[]) {
+  return Agent.create({ name, instructions, handoffs });
+}
+
+async runAgent(prompt: string, agent: Agent) {
+  return await run(agent, prompt);
+}
+```
+
+`Agent` and `Tool` are already the SDK types. `Agent<any, any>` and `import { type Tool }` are not.
