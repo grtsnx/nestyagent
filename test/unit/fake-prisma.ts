@@ -49,7 +49,10 @@ class Table {
 
   async create({ data }: { data: Row }) {
     for (const key of this.unique) {
-      if (this.rows.some((row) => row[key] === data[key])) {
+      if (
+        data[key] != null &&
+        this.rows.some((row) => row[key] === data[key])
+      ) {
         throw Object.assign(new Error('Unique constraint failed'), {
           code: 'P2002',
         });
@@ -148,7 +151,7 @@ type FakeDb = {
   systemPrompt: Table;
   composioSession: Table;
   agentRun: Table;
-  $queryRaw(sql: TemplateStringsArray, chatId: string): Promise<Row[]>;
+  $queryRaw(sql: TemplateStringsArray, ...values: unknown[]): Promise<Row[]>;
   $transaction<T>(
     work: ((tx: FakeDb) => Promise<T>) | Promise<unknown>[],
   ): Promise<T>;
@@ -158,6 +161,7 @@ type FakeDb = {
 //2. $transaction puts every row back when the callback throws, like a rollback.
 //3. Deleting a chat deletes its items, like the foreign key does.
 export function fakePrisma() {
+  let promptVersion = 0;
   const db: FakeDb = {
     chat: new Table(['id']),
     chatItem: new Table([]),
@@ -195,7 +199,7 @@ export function fakePrisma() {
       createdAt: new Date(),
     })),
     systemPrompt: new Table(['name'], () => ({
-      version: 1,
+      version: ++promptVersion,
       createdAt: new Date(),
       updatedAt: new Date(),
     })),
@@ -204,7 +208,21 @@ export function fakePrisma() {
     })),
 
     // Only the chat pop query is used: remove and return the newest item of one chat.
-    async $queryRaw(_sql: TemplateStringsArray, chatId: string) {
+    async $queryRaw(sql: TemplateStringsArray, ...values: unknown[]) {
+      if (sql.join('').includes('UPDATE system_prompts')) {
+        const [content, name, version] = values;
+        const row = db.systemPrompt.rows.find(
+          (row) => row.name === name && row.version === version,
+        );
+        if (!row) return [];
+        Object.assign(row, {
+          content,
+          version: ++promptVersion,
+          updatedAt: new Date(),
+        });
+        return [{ ...row }];
+      }
+      const [chatId] = values;
       const rows = db.chatItem.rows.filter((row) => row.chatId === chatId);
       const newest = rows.at(-1);
       if (!newest) return [];

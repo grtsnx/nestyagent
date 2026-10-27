@@ -1,6 +1,6 @@
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'node:crypto';
-import { MonitoringService } from '@/modules/admin/monitoring.service.js';
+import { AdminService } from '@/modules/admin/admin.service.js';
 import { PrismaService } from '@/lib/prisma/prisma.service.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -10,10 +10,10 @@ if (!databaseUrl)
   );
 
 // Starts from empty monitoring tables, so the counts are exact.
-describe('Monitoring in Postgres', () => {
+describe('AdminService in Postgres', () => {
   const config = new ConfigService({ DATABASE_URL: databaseUrl });
   const prisma = new PrismaService(config);
-  const monitoring = new MonitoringService(prisma, config);
+  const admin = new AdminService(prisma, config);
   const chatId = `chat-${randomUUID()}`;
 
   beforeAll(async () => {
@@ -86,7 +86,7 @@ describe('Monitoring in Postgres', () => {
   });
 
   it('counts what needs a person and the last 24 hours', async () => {
-    const overview = await monitoring.overview();
+    const overview = await admin.overview();
     expect(overview.needsAttention).toEqual({
       approvalsWaiting: 1,
       runsNeedingRecovery: 0,
@@ -105,19 +105,78 @@ describe('Monitoring in Postgres', () => {
   });
 
   it('adds up usage per day and per model', async () => {
-    const usage = await monitoring.usage(7);
+    const usage = await admin.usage(7);
     expect(usage.daily).toHaveLength(1);
     expect(usage.models).toMatchObject([
       { model: 'gpt-6-astra', runs: 2, failed: 1, outputTokens: 100 },
     ]);
   });
 
+  it('includes abandoned running approvals but excludes live execution leases', async () => {
+    const db = prisma.db;
+    const ids = Array.from({ length: 5 }, () => randomUUID());
+    const keys = ids.map((id) => `run:${id}`);
+    try {
+      await db.pausedRun.createMany({
+        data: ids.map((id, index) => ({
+          id,
+          state: 'private state',
+          status:
+            index === 0
+              ? 'recovery_required'
+              : index === 1
+                ? 'taken'
+                : 'running',
+        })),
+      });
+      await db.executionLock.createMany({
+        data: [
+          {
+            key: keys[3],
+            owner: randomUUID(),
+            expiresAt: new Date(Date.now() - 60_000),
+          },
+          {
+            key: keys[4],
+            owner: randomUUID(),
+            expiresAt: new Date(Date.now() + 60_000),
+          },
+        ],
+      });
+      const approvals = await admin.approvals({ status: 'recovery_required' });
+      expect(approvals.map((row) => row.id).sort()).toEqual(
+        ids.slice(0, 4).sort(),
+      );
+      expect(JSON.stringify(approvals)).not.toContain('private state');
+      expect((await admin.overview()).needsAttention.runsNeedingRecovery).toBe(
+        4,
+      );
+    } finally {
+      await db.executionLock.deleteMany({ where: { key: { in: keys } } });
+      await db.pausedRun.deleteMany({ where: { id: { in: ids } } });
+    }
+  });
+
+  it('limits recent chats before counting their messages and runs', async () => {
+    const id = `recent-${randomUUID()}`;
+    try {
+      await prisma.db.chat.create({
+        data: { id, updatedAt: new Date(Date.now() + 60_000) },
+      });
+      const chats = await admin.chats({ limit: 1 });
+      expect(chats).toMatchObject([{ id, messages: 0, runs: 0 }]);
+      expect(chats).toHaveLength(1);
+    } finally {
+      await prisma.db.chat.delete({ where: { id } });
+    }
+  });
+
   it('lists runs, chats, and paused runs without message text or secrets', async () => {
     const [runs, chats, approvals, machines] = await Promise.all([
-      monitoring.runs({ status: 'failed' }),
-      monitoring.chats({}),
-      monitoring.approvals({}),
-      monitoring.machines({}),
+      admin.runs({ status: 'failed' }),
+      admin.chats({}),
+      admin.approvals({}),
+      admin.machines({}),
     ]);
     expect(runs).toMatchObject([{ status: 'failed', chatId }]);
     expect(chats.find((chat) => chat.id === chatId)).toMatchObject({

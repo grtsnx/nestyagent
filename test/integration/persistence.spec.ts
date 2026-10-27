@@ -275,16 +275,22 @@ describe('Postgres persistence', () => {
     const b = new SystemPromptsService(second, config);
     const name = `test-${randomUUID().slice(0, 8)}`;
     try {
-      await a.create(name, 'Version one.');
+      const initial = await a.create(name, 'Version one.');
       const saves = await Promise.allSettled([
-        a.update(name, 'Editor A.', 1),
-        b.update(name, 'Editor B.', 1),
+        a.update(name, 'Editor A.', initial.version!),
+        b.update(name, 'Editor B.', initial.version!),
       ]);
       expect(saves.filter((save) => save.status === 'fulfilled')).toHaveLength(
         1,
       );
-      await expect(b.get(name)).resolves.toMatchObject({ version: 2 });
-      await expect(a.remove(name, 2)).resolves.toBeUndefined();
+      const winner = saves.find((save) => save.status === 'fulfilled');
+      if (!winner || winner.status !== 'fulfilled')
+        throw new Error('No winner');
+      expect(winner.value.version).toBeGreaterThan(initial.version!);
+      await expect(b.get(name)).resolves.toEqual(winner.value);
+      await expect(
+        a.remove(name, winner.value.version!),
+      ).resolves.toBeUndefined();
     } finally {
       await first.db.systemPrompt.deleteMany({ where: { name } });
     }
@@ -296,8 +302,10 @@ describe('Postgres persistence', () => {
       new ConfigService({ DATABASE_URL: databaseUrl }),
     );
     await first.db.systemPrompt.deleteMany({ where: { name: 'mssuzie' } });
-    await systemPrompts.create('mssuzie', 'Custom.');
-    await expect(systemPrompts.remove('mssuzie', 1)).resolves.toMatchObject({
+    const created = await systemPrompts.create('mssuzie', 'Custom.');
+    await expect(
+      systemPrompts.remove('mssuzie', created.version!),
+    ).resolves.toMatchObject({
       source: 'default',
       content: defaultSystemPrompts.mssuzie,
     });

@@ -9,7 +9,7 @@ import { NestFactory } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import { AppModule, ObserveInstrument } from '@/app';
 import type { Environment } from '@/config/index.js';
-import { RequestIdMiddleware } from '@/middleware';
+import { ADMIN_KEY_HEADER, RequestIdMiddleware } from '@/middleware';
 import { configureSwagger } from './swagger.js';
 
 export function configureApplication(
@@ -46,6 +46,7 @@ export function configureApplication(
         'Authorization',
         'Idempotency-Key',
         'X-Request-ID',
+        ADMIN_KEY_HEADER,
       ],
       credentials: true,
     });

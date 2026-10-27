@@ -8,7 +8,7 @@ import {
   UsageQueryDto,
   WebhooksQueryDto,
 } from '@/dto/index.js';
-import { MonitoringService } from './monitoring.service.js';
+import { AdminService } from './admin.service.js';
 import { AdminKeyGuard, ApiFailure, ApiSuccess } from '@/middleware';
 
 const PATH = '/v1/admin/overview';
@@ -41,7 +41,7 @@ const usage = {
 )
 @Controller({ path: 'admin', version: '1' })
 export class AdminController {
-  constructor(private readonly monitoring: MonitoringService) {}
+  constructor(private readonly admin: AdminService) {}
 
   @ApiOperation({
     summary: 'Monitoring overview',
@@ -61,7 +61,7 @@ export class AdminController {
   })
   @Get('overview')
   overview() {
-    return this.monitoring.overview();
+    return this.admin.overview();
   }
 
   @ApiOperation({
@@ -76,7 +76,7 @@ export class AdminController {
   })
   @Get('usage')
   usage(@Query() query: UsageQueryDto) {
-    return this.monitoring.usage(query.days);
+    return this.admin.usage(query.days);
   }
 
   @ApiOperation({
@@ -105,7 +105,7 @@ export class AdminController {
   ])
   @Get('runs')
   runs(@Query() query: RunsQueryDto) {
-    return this.monitoring.runs(query);
+    return this.admin.runs(query);
   }
 
   @ApiOperation({
@@ -129,7 +129,7 @@ export class AdminController {
   ])
   @Get('approvals')
   approvals(@Query() query: ApprovalsQueryDto) {
-    return this.monitoring.approvals(query);
+    return this.admin.approvals(query);
   }
 
   @ApiOperation({
@@ -148,7 +148,7 @@ export class AdminController {
   ])
   @Get('chats')
   chats(@Query() query: ListQueryDto) {
-    return this.monitoring.chats(query);
+    return this.admin.chats(query);
   }
 
   @ApiOperation({
@@ -171,7 +171,7 @@ export class AdminController {
   ])
   @Get('webhooks')
   webhooks(@Query() query: WebhooksQueryDto) {
-    return this.monitoring.webhooks(query);
+    return this.admin.webhooks(query);
   }
 
   @ApiOperation({
@@ -195,6 +195,6 @@ export class AdminController {
   ])
   @Get('machines')
   machines(@Query() query: MachinesQueryDto) {
-    return this.monitoring.machines(query);
+    return this.admin.machines(query);
   }
 }

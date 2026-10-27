@@ -97,7 +97,7 @@ The app uses Postgres through Prisma. The database keeps durable workflow record
 | ------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------ |
 | `chats`                   | One row per chat, with when it started and when it last moved.                        | The chat id you pick, like `chat-c-42`     |
 | `chat_items`              | Every chat message, so a helper remembers the chat.                                   | A counter, so messages stay in exact order |
-| `paused_runs`             | Approval checkpoints, execution status, owner, and recovery notes.                    | A Prisma-generated UUIDv7                  |
+| `paused_runs`             | Approval checkpoints, execution status, owner, and recovery notes.                    | A stable UUID assigned before saving       |
 | `remote_machines`         | Which self-hosted machine belongs to which session.                                   | OpenAI's session id                        |
 | `hosted_webhooks`         | Verified events, retries, worker leases, and terminal records.                        | OpenAI event id                            |
 | `chat_history_operations` | Completed SDK history operations and their content digest.                            | Chat id + operation id                     |
@@ -105,11 +105,11 @@ The app uses Postgres through Prisma. The database keeps durable workflow record
 | `expired_environments`    | Environments OpenAI said are gone, so they are never started again.                   | OpenAI's environment id                    |
 | `system_prompts`          | Custom system prompts saved through the API. Without a row, the default file is used. | The helper name, like `mssuzie`            |
 | `composio_sessions`       | Each user's Composio session, so a session id never comes from a request.             | The user id                                |
-| `agent_runs`              | One row per helper run: tokens, time, result, and trace id. No message text.          | A UUID the database makes                  |
+| `agent_runs`              | One row per invocation: token deltas, time, result, and trace id. No message text.    | A UUID the database makes                  |
 
 How the tables are built:
 
-- **Ids.** Approval ids are native UUID columns generated as UUIDv7. Worker claim tokens use random UUIDs. Ids from outside, like your chat ids and OpenAI's session ids, are kept as they are. Chat messages use a counter instead of a UUID, because the order of a chat must be exact.
+- **Ids.** Approval ids are native UUID columns. New checkpoints receive a stable random UUID before saving so a retry can identify the same record. Worker claim tokens use random UUIDs. Ids from outside, like your chat ids and OpenAI's session ids, are kept as they are. Chat messages use a counter instead of a UUID, because the order of a chat must be exact.
 - **Keys.** Each chat message points at its chat. Deleting a chat deletes its messages. One environment can only belong to one session.
 - **Times.** Every table has `created_at`. Tables whose rows change also have `updated_at`. All times are stored with their time zone.
 - **Indexes.** Only where a query needs one: a chat's messages by chat and order, and the machine for an environment. Webhook queue indexes cover due work and terminal-event lookups; history-operation ids deduplicate writes. Locks are found by owner, so a worker frees all of its locks in one step.
@@ -604,7 +604,7 @@ const helper = this.openai.createAgent(
 ```
 
 - **The user id comes from your login.** It must be stable, and `default` is rejected. Never take it from what a caller sends, or one person could reach another person's Gmail.
-- **The session stays on the server.** The first call opens a Composio session for that user and saves its id in Postgres (`composio_sessions`). Later calls reuse it. There is no session id to store or pass. If Composio drops the session, a new one is made. Without `DATABASE_URL`, each call opens a new session; connections belong to the user, so nothing is lost.
+- **The session stays on the server.** The first call opens a Composio session and saves its id in Postgres. Later calls reuse it, and a new one is made if Composio drops it. Making a session never touches the owner's apps, so a failed attempt is simply tried again on the next call; a session that could not be saved is deleted. Calls in one server share one creation. If another server is creating the same owner's session at that moment, the call gets 409 and can retry a moment later. Without `DATABASE_URL`, each call opens a new session; connections belong to the owner, so nothing is lost.
 - **First time.** When Gmail or Slack is not connected yet, the helper gets a Connect Link. Show it to the owner. The next message can use the app.
 
 ### Every action waits for a yes
@@ -627,6 +627,8 @@ if (turn.waiting) {
 
 A person can decide later, too. The paused run is saved, the same way as [Decide later](#decide-later).
 
+Tool requests receive the run's cancellation signal, the application's shutdown signal, and a two-minute timeout, and are never retried automatically. A failed lookup goes back to the model, which can try again or explain. A failed or uncertain action stops the run with `ComposioActionError`, carrying the session, tool, call, and available log ids, because nobody knows yet whether the email was sent. A saved approval enters recovery when resumed execution fails. Inspect the remote action before calling `recoverRun`; cancellation cannot undo an action the remote service already accepted.
+
 </details>
 
 <details>
@@ -644,7 +646,7 @@ Set `ADMIN_API_KEY` to turn the routes on. Every request sends it in the `x-admi
 | `PUT /v1/system-prompts/:name`    | Replaces the custom version                                  |
 | `DELETE /v1/system-prompts/:name` | Deletes the custom version, so the default is used again     |
 
-**Two people editing at once.** Every reply carries a `version`. Send that number back with `PUT` (in the body) or `DELETE` (as `?version=2`). If someone saved since you read it, you get 409 and their change is kept. Reload, then try again.
+**Two people editing at once.** Every reply carries a `version`. Send that number back with `PUT` (in the body) or `DELETE` (as `?version=2`). If someone saved since you read it, you get 409 and their change is kept. Reload, then try again. Versions come from a database sequence shared by all prompts and survive deletion. Treat them as opaque revision numbers: they need not start at 1 or increase by exactly 1. Updating returns the content and revision written by that request.
 
 **Use it in a helper.** Import `SystemPromptsModule` (from `src/modules/system-prompts`) into your module, inject `SystemPromptsService`, and pass `forAgent` instead of fixed text. The helper reads the latest text before each model call, so a change applies to the next message.
 
@@ -655,7 +657,7 @@ const frontDesk = this.openai.createAgent(
 );
 ```
 
-Each server keeps the text in memory for 5 seconds, so another server sees an edit within that time. If the database is down, the helper keeps the last text it saw, then the built-in file. Saving needs `DATABASE_URL`.
+Each server keeps the text in memory for 5 seconds, so another server sees an edit within that time while the database is available. Local writes invalidate the cache, and an older in-flight read cannot restore the invalidated text. If the database is down, the helper keeps the last text it saw, then the built-in file. Saving needs `DATABASE_URL`.
 
 To add a helper, add `src/config/system-prompts/<name>.md` and list it in `src/config/system-prompts/index.ts`. Only names with a built-in file can be used with `forAgent`, so a helper is never left without a system prompt.
 
@@ -678,11 +680,11 @@ The admin routes show what needs a person, how the helpers are doing, and what t
 
 Every list takes `?limit=`, from 1 to 200.
 
-**Where the numbers come from.** Each helper run writes one row to `agent_runs` when it ends: the helper, the model, the tokens, cached tokens, how long it took, whether it finished, paused, or failed, and its trace id. Open that trace id in Langfuse or the OpenAI dashboard to see the whole run. If the row cannot be written, the chat still works and the server logs a warning.
+**Where the numbers come from.** Each helper invocation writes one row to `agent_runs` when it ends: the helper, the model, the tokens, cached tokens, how long it took, whether it finished, paused, or failed, and its trace id. Open that trace id in Langfuse or the OpenAI dashboard to see the whole run. If the row cannot be written, the chat still works and the server logs a warning. Approval resumes record only usage added by that invocation, and failed runs retain usage reported by the SDK. The actual chat id is stored separately from trace grouping. A run that spans several models is labelled `mixed`; unresolved custom models are `unknown`. Use request-level traces for per-model costs.
 
-`cacheHitRate` is cached input tokens divided by all input tokens. A long chat should climb toward 1.
+`cacheHitRate` is cached input tokens divided by all input tokens. Recovery counts and `?status=recovery_required` include abandoned `running` checkpoints with no live run lease, as well as explicitly flagged checkpoints. Chat summaries aggregate only the requested page of chats.
 
-**What is never shown.** No message text, no saved run state, no machine claim tokens, and no webhook lease tokens. A Guardian's words about a Learner stay out of the admin routes.
+**What is never shown.** No message text, no saved run state, no machine claim tokens, and no webhook lease tokens. Run errors are fixed categories, such as `input_guardrail` or `run_failed`, rather than raw exception messages. A Guardian's words about a Learner stay out of the admin routes.
 
 </details>
 
@@ -938,6 +940,8 @@ this.openai.approve({ state });
 const finished = await this.openai.resumeAgent(orderHelper, state);
 ```
 
+Concurrent `saveRun` calls for the same live state object share one write and checkpoint id. Retrying after a lost database acknowledgement uses that same id. Independent objects or application requests still need caller-owned idempotency; this does not deduplicate arbitrary requests across processes.
+
 Loading a checkpoint does not consume it. Resuming acquires its database execution lock and claims its version; a second or stale resume is rejected. The original database session is restored automatically. Supply the same agent definition, owner, and configuration version. Bind chat ids to authenticated users in your application; these helpers do not provide an authentication endpoint.
 
 `reply()` and `finish()` preserve the session, cancellation signal, and execution options during an in-process approval. Signals, formatter functions, and live sandbox objects cannot be restored from database JSON; reattach runtime-only configuration when resuming after a restart.
@@ -957,13 +961,13 @@ const finished = await this.openai.resumeAgent(orderHelper, state);
 
 ### Nobody answers
 
-While a question waits, that chat takes no new messages. The OpenAI guide says a pause must be answered, not skipped. If the customer never answers, cancel it. Every waiting tool call is rejected, the helper tells the customer it did not happen, and the chat moves on.
+While a question waits, that chat takes no new messages. If the customer never answers, `cancelRun` settles the waiting checkpoint and its chat history in one database transaction. It removes unexecuted approval placeholders and adds a cancellation message without calling a model or tool. The checkpoint becomes `completed` with recovery note `cancelled`, and the method returns `{ id, status: 'cancelled' }`. Repeating cancellation returns the same receipt; a stale resume is rejected. Interrupted actions must be reconciled before cancellation.
 
 ```typescript
-await this.openai.cancelRun(orderHelper, runId, { ownerId, agentVersion });
-// Optional: your own words for the helper.
-await this.openai.cancelRun(orderHelper, runId, {
-  message: 'The customer did not confirm in time.',
+const receipt = await this.openai.cancelRun(orderHelper, runId, {
+  ownerId,
+  agentVersion,
+  message: 'The customer did not confirm in time.', // optional chat message
 });
 ```
 
@@ -1304,7 +1308,7 @@ ACCOUNT_PASSWORD=the-shop-admin-password
 4. The helper reads `$ACCOUNT_PASSWORD` when a login form asks for it.
 
 > [!WARNING]
-> A saved computer does not keep the password. It comes from `.env` again when you open or resume.
+> A saved computer does not keep the password. It comes from `.env` or the supplied `password` option again when you open or resume. Resume applies it to the live workspace through the SDK before returning; if that fails, the workspace is closed. Adding a password preserves existing mount credential acknowledgements.
 
 Empty `ACCOUNT_PASSWORD` means no password. For one computer with a different password, pass `password`:
 
@@ -1549,9 +1553,9 @@ The gateway contract is:
 - Wait for the OCI sandbox to reach `RUNNING`, prepare its workspace, install Codex, and launch `codex exec-server` for that environment. Return `{ id, status: 'ready', sessionId, environmentId }` only after successful setup. A known id with incomplete or mismatched setup enters reconciliation.
 - `DELETE <endpoint>/<encoded-id>` must stop and delete that sandbox. Repeating deletion must succeed or return `404`. Redirects are rejected so credentials never follow a redirect to another service.
 
-DigitalOcean provisioning sends a JSON envelope containing the YAML manifest and its variables. Databricks setup runs separate shell statements before starting the detached executor. Provider contract tests run without cloud credentials; deploy-time smoke tests must still verify the executor connects and completes a real turn.
+DigitalOcean provisioning sends a JSON envelope containing the YAML manifest and its variables. Databricks setup runs separate shell statements before starting the detached executor. Each command must report successful completion and exit code zero; HTTP 200 alone does not mark the machine ready. A failure retains its machine id for reconciliation. Provider contract tests run without cloud credentials; deploy-time smoke tests must still verify the executor connects and completes a real turn.
 
-The webhook needs `DATABASE_URL`. It verifies the signature and inserts a deduplicated event in `hosted_webhooks` before acknowledging it. Provider work runs in a background worker, which starts when both `DATABASE_URL` and `OPENAI_WEBHOOK_SECRET` are configured. It starts as soon as this server stores an event, and checks every 5 seconds for events other servers stored. Each pass claims up to 20 events.
+The webhook needs `DATABASE_URL`. It verifies the signature and inserts a deduplicated event in `hosted_webhooks` before acknowledging it. Provider work runs in a background worker, which starts when both `DATABASE_URL` and `OPENAI_WEBHOOK_SECRET` are configured. It starts as soon as this server stores an event, and checks every 5 seconds for events other servers stored. Each pass processes up to 20 events with at most four workers. A worker claims its next event only when it is available to process it, so slow provisioning does not block all unrelated environments.
 
 - Duplicate deliveries share one event id. Database leases and per-environment locks coordinate replicas.
 - Retryable worker failures stay queued with bounded exponential backoff. An expired five-minute worker lease can be reclaimed after a crash; an active worker renews it.
@@ -1647,7 +1651,7 @@ docker run --rm --read-only --tmpfs /tmp --tmpfs /app/.msagents:uid=1000,gid=100
 
 - **Same everywhere.** Bun's version comes from `packageManager` in `package.json`. Every outside action is pinned to an exact commit.
 - **Tests need no secrets.** End-to-end tests use a fake OpenAI key and ignore your `.env` database and Langfuse settings, so they pass the same on a laptop and in CI.
-- **Cheap.** Bun packages, image layers, and the vulnerability database are cached. A newer push cancels the older run on the same branch. A push that only changes Markdown skips CI; pull requests always run.
+- **Cheap.** Bun packages, image layers, and the vulnerability database are cached. A newer push cancels the older run on the same branch. A push that only changes `README.md`, `docs/`, or editor guidance skips CI; production prompt Markdown changes run CI, and pull requests always run.
 
 When a package deep inside the tree pins a version with a known problem, `overrides` in `package.json` forces the fixed version. Today that is `zod` and `js-yaml`. Remove an override once the package that pins it ships a fix.
 
@@ -1677,9 +1681,9 @@ Database transactions are short and never span a model or provider call. Externa
 
 Execution leases use expiring rows, so model and provider calls do not hold database connections. The worker renews its leases every 15 seconds; a crashed worker’s leases expire after 60 seconds. An independent deadline aborts work when renewal cannot complete in time. History, checkpoint, and coordinated machine writes verify the lease owner and expiry while locking that row inside the same short database transaction. A stale worker cannot commit those writes after a takeover, even before its cancellation callback runs. Database pool capacity still limits concurrent queries. Custom tools must honor cancellation and independently enforce idempotency; the database fence cannot roll back an external side effect.
 
-**Deployment:** drain old workers before applying the recovery migration and starting this version. Older binaries do not participate in the new execution locks or inbox. The migration preserves data and marks legacy consumed approvals and incomplete machine claims for reconciliation. Back up production data and inspect these records after deployment; do not replay them automatically.
+**Deployment:** drain old workers before applying schema changes and starting this version. Apply the system-prompt revision and Composio creation-intent migrations with `bun run db:deploy`, and regenerate the Prisma client with `bun run db:generate` (also run by install). Old clients that write a literal prompt version bypass the new sequence. Existing Composio mappings become `ready`; interrupted new creations require the reconciliation described above. Older binaries do not participate in the new execution locks or inbox. The migration preserves data and marks legacy consumed approvals and incomplete machine claims for reconciliation. Back up production data and inspect these records after deployment; do not replay them automatically.
 
-Run-owned traces finish on both success and failure, including streaming failures. Langfuse keeps separate input/output notes for each run within a shared workflow, records the resolved model on each OpenAI request after handoffs, and counts cached input in a non-overlapping token bucket. Unknown custom-model identities are not assigned an invented price. The Agents SDK's built-in tracing remains enabled. Model and tool payloads stay off each trace unless `TRACE_PAYLOADS` or a run's `tracePayloads` flag turns them on for grading. Use the returned result's `runContext.usage` for token accounting, and correlate application request ids with run/chat ids in your own telemetry. Define task-specific evaluation datasets and measure latency and cost on representative workloads before making performance claims. Retention and authorization policies belong to the application; authenticate before loading a chat or deciding an approval.
+Run-owned traces finish on both success and failure, including streaming failures. Langfuse keeps separate input/output notes for each run within a shared workflow, records the resolved model on each OpenAI request after handoffs, and counts cached input in a non-overlapping token bucket. Chat Completions requests retain one billable generation with the resolved model and usage, including streaming and retry paths. Failed attempts remain visible without counting successful usage again. Unknown custom-model identities are not assigned an invented price. The Agents SDK's built-in tracing remains enabled. Model and tool payloads stay off each trace unless `TRACE_PAYLOADS` or a run's `tracePayloads` flag turns them on for grading. Use the returned result's `runContext.usage` for token accounting, and correlate application request ids with run/chat ids in your own telemetry. Define task-specific evaluation datasets and measure latency and cost on representative workloads before making performance claims. Retention and authorization policies belong to the application; authenticate before loading a chat or deciding an approval.
 
 Sandbox files require their own retained workspace, provider storage, or snapshot. Keep executor credentials separate from application credentials, and use isolated compute for untrusted code. Shutdown cancels run signals, closes cached WebSocket providers, and stops locally owned executors; interrupted external operations remain subject to reconciliation.
 

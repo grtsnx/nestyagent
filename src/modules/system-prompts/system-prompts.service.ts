@@ -34,6 +34,7 @@ const CACHE_MS = 5_000;
 @Injectable()
 export class SystemPromptsService {
   private readonly cache = new Map<string, { content: string; at: number }>();
+  private readonly generations = new Map<string, number>();
   private readonly logger = new Logger(SystemPromptsService.name);
 
   constructor(
@@ -49,12 +50,8 @@ export class SystemPromptsService {
       ...Object.keys(defaultSystemPrompts),
       ...rows.map((row) => row.name),
     ]);
-    return [...names].sort().map((name) =>
-      view(
-        name,
-        rows.find((row) => row.name === name),
-      ),
-    );
+    const byName = new Map(rows.map((row) => [row.name, row]));
+    return [...names].sort().map((name) => view(name, byName.get(name)));
   }
 
   async get(name: string): Promise<SystemPromptView> {
@@ -74,7 +71,7 @@ export class SystemPromptsService {
       const row = await this.prisma.db.systemPrompt.create({
         data: { name, content },
       });
-      this.cache.delete(name);
+      this.invalidate(name);
       return view(name, row);
     } catch (error) {
       if (isUniqueViolation(error))
@@ -92,13 +89,15 @@ export class SystemPromptsService {
   ): Promise<SystemPromptView> {
     checkName(name);
     this.requireStore();
-    const { count } = await this.prisma.db.systemPrompt.updateMany({
-      where: { name, version },
-      data: { content, version: { increment: 1 } },
-    });
-    if (count !== 1) await this.missingOrStale(name);
-    this.cache.delete(name);
-    return await this.get(name);
+    const [row] = await this.prisma.db.$queryRaw<Row[]>`
+      UPDATE system_prompts
+      SET content = ${content}, version = nextval('system_prompts_version_seq'),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE name = ${name} AND version = ${version}
+      RETURNING name, content, version, updated_at AS "updatedAt"`;
+    if (!row) await this.missingOrStale(name);
+    this.invalidate(name);
+    return view(name, row);
   }
 
   // Removes the custom version. Returns what the helper uses now: the default, or nothing.
@@ -112,7 +111,7 @@ export class SystemPromptsService {
       where: { name, version },
     });
     if (count !== 1) await this.missingOrStale(name);
-    this.cache.delete(name);
+    this.invalidate(name);
     return defaultSystemPrompts[name] === undefined
       ? undefined
       : view(name, undefined);
@@ -130,7 +129,9 @@ export class SystemPromptsService {
   async content(name: string): Promise<string> {
     const cached = this.cache.get(name);
     if (cached && Date.now() - cached.at < CACHE_MS) return cached.content;
+    const generation = this.generations.get(name) ?? 0;
     let content = defaultSystemPrompts[name];
+    let readFailed = false;
     if (this.stored()) {
       try {
         const row = await this.prisma.db.systemPrompt.findUnique({
@@ -139,16 +140,25 @@ export class SystemPromptsService {
         });
         if (row) content = row.content;
       } catch {
+        readFailed = true;
         this.logger.warn(
           `The system prompt for ${name} could not be read; using the last known text.`,
         );
-        if (cached) return cached.content;
       }
     }
+    // A write can finish while this read is waiting on the database.
+    if ((this.generations.get(name) ?? 0) !== generation)
+      return this.content(name);
+    if (readFailed && cached) return cached.content;
     if (content === undefined)
       throw new Error(`No system prompt named ${name}.`);
     this.cache.set(name, { content, at: Date.now() });
     return content;
+  }
+
+  private invalidate(name: string) {
+    this.generations.set(name, (this.generations.get(name) ?? 0) + 1);
+    this.cache.delete(name);
   }
 
   private async missingOrStale(name: string): Promise<never> {

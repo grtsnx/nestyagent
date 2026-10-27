@@ -6,7 +6,8 @@ on:
     branches: [main, dev]
     # Docs-only pushes skip CI. Pull requests always run, so required checks still report.
     paths-ignore:
-      - '**/*.md'
+      - 'README.md'
+      - 'docs/**'
       - '.cursor/**'
   # The release workflow runs this same workflow before it publishes.
   workflow_call:

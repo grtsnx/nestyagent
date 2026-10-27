@@ -8,10 +8,12 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHash, randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import OpenAI from 'openai';
 import { z } from 'zod';
 import {
   Agent,
+  AgentsError,
   AgentInputItem,
   AgentOutputType,
   connectMcpServers,
@@ -32,6 +34,7 @@ import {
   OutputGuardrailBlockedMessageFormatter,
   OutputGuardrailTripwireTriggered,
   Runner,
+  RunContext,
   RunResult,
   RunState,
   RunToolApprovalItem,
@@ -398,6 +401,14 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   private socketRunner?: Runner;
   private apiClient?: OpenAI;
   private readonly runMetadata = new WeakMap<object, RunMetadata>();
+  private readonly saves = new WeakMap<
+    object,
+    { id: string; pending?: Promise<string> }
+  >();
+  private readonly execution = new AsyncLocalStorage<{
+    signal: AbortSignal;
+    models: Set<string>;
+  }>();
   private readonly shutdown = new AbortController();
   private socketModelProvider?: OpenAIProvider;
   private httpModelProvider?: OpenAIProvider;
@@ -568,7 +579,13 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
     return this.inputGuardrail(
       name,
       async ({ input, context }) => {
-        const result = await this.runner().run(agent, input, { context });
+        const signal =
+          this.execution.getStore()?.signal ?? this.shutdown.signal;
+        signal.throwIfAborted();
+        const result = await this.runner().run(agent, input, {
+          context,
+          signal,
+        });
         return {
           outputInfo: result.finalOutput,
           tripwireTriggered: tripwire(result.finalOutput),
@@ -819,6 +836,23 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   async saveRun(result: PausedRun, options?: RunAgentOptions) {
     const metadata = this.runMetadata.get(result.state);
     if (metadata?.saved) return metadata.saved.id;
+    const attempt = this.saves.get(result.state) ?? { id: randomUUID() };
+    this.saves.set(result.state, attempt);
+    if (attempt.pending) return await attempt.pending;
+    attempt.pending = this.persistRun(result, attempt.id, options);
+    try {
+      return await attempt.pending;
+    } finally {
+      attempt.pending = undefined;
+    }
+  }
+
+  private async persistRun(
+    result: PausedRun,
+    id: string,
+    options?: RunAgentOptions,
+  ) {
+    const metadata = this.runMetadata.get(result.state);
     const policy = { ...metadata?.options, ...options };
     const session = policy.session;
     if (session && !(session instanceof DatabaseSession)) {
@@ -826,10 +860,14 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
         'Saved runs require DatabaseSession so the session can be restored after a restart.',
       );
     }
+    const state = result.state.toString();
     const row = await this.prisma.transaction((tx) =>
-      tx.pausedRun.create({
-        data: {
-          state: result.state.toString(),
+      tx.pausedRun.upsert({
+        where: { id },
+        update: {},
+        create: {
+          id,
+          state,
           chatId: session?.chatId,
           agentName: metadata?.agentName,
           agentVersion: policy.agentVersion,
@@ -857,6 +895,10 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
         },
       }),
     );
+    if (row.version !== 0 || row.state !== state)
+      throw new ConflictException(
+        'The saved checkpoint changed. Reload the saved run.',
+      );
     this.runMetadata.set(result.state, {
       options: policy,
       agentName: metadata?.agentName,
@@ -892,21 +934,85 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
     return state;
   }
 
-  //1. Close a saved approval nobody will answer. Every waiting tool call is rejected and the run finishes.
-  //2. The model hears "no", so the chat can take its next message. A pause is resolved, never skipped.
+  // Cancel without executing another model or tool. History and checkpoint settle atomically.
   async cancelRun(
     agent: AnyAgent,
     id: string,
     options?: RunAccess & { message?: string },
   ) {
-    const state = await this.loadRun(agent, id, options);
-    this.reject(
-      { state },
-      {
-        message: options?.message ?? 'Not approved. The request was cancelled.',
-      },
-    );
-    return await this.resumeAgent(agent, state);
+    const row = await this.readRun(agent, id, options ?? {});
+    const keys = [`run:${id}`, ...(row.chatId ? [`chat:${row.chatId}`] : [])];
+    return await this.prisma.withLock(keys, async () => {
+      const current = await this.readRun(agent, id, options ?? {});
+      if (
+        current.status === 'completed' &&
+        current.recoveryNote === 'cancelled'
+      )
+        return { id, status: 'cancelled' as const };
+      if (current.status !== 'waiting')
+        throw new ConflictException(
+          'Only a waiting approval can be cancelled. Reconcile interrupted actions first.',
+        );
+      const state = await RunState.fromString(agent, current.state);
+      const result = new RunResult(state);
+      const retained = new Set(result.history.map(historyItemKey));
+      const discarded = new Map<string, number>();
+      for (const item of result.newItems) {
+        if (item.type === 'tool_approval_item') continue;
+        const key = historyItemKey(item.rawItem);
+        if (!retained.has(key))
+          discarded.set(key, (discarded.get(key) ?? 0) + 1);
+      }
+      // Hosted approvals may be retained by the SDK's ordinary continuation history.
+      for (const item of state.getInterruptions()) {
+        const key = historyItemKey(item.rawItem);
+        if (!discarded.has(key)) discarded.set(key, 1);
+      }
+      await this.prisma.transaction(async (tx) => {
+        const changed = await tx.pausedRun.updateMany({
+          where: { id, version: current.version, status: 'waiting' },
+          data: {
+            status: 'completed',
+            recoveryNote: 'cancelled',
+            version: { increment: 1 },
+          },
+        });
+        if (changed.count !== 1)
+          throw new ConflictException(
+            'The checkpoint changed before cancellation.',
+          );
+        if (current.chatId) {
+          const rows = await tx.chatItem.findMany({
+            where: { chatId: current.chatId },
+            orderBy: { id: 'desc' },
+            select: { id: true, item: true },
+          });
+          const ids = rows
+            .filter(({ item }) => {
+              const key = historyItemKey(item);
+              const count = discarded.get(key) ?? 0;
+              if (!count) return false;
+              discarded.set(key, count - 1);
+              return true;
+            })
+            .map(({ id }) => id);
+          if (ids.length)
+            await tx.chatItem.deleteMany({
+              where: { chatId: current.chatId, id: { in: ids } },
+            });
+          await tx.chatItem.create({
+            data: {
+              chatId: current.chatId,
+              item: {
+                role: 'assistant',
+                content: options?.message ?? 'The request was cancelled.',
+              },
+            },
+          });
+        }
+      });
+      return { id, status: 'cancelled' as const };
+    });
   }
 
   // An interrupted external action may have succeeded. Only the application can reconcile it.
@@ -965,25 +1071,43 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
     traceId?: string;
     requestId?: string;
     result?: { interruptions?: unknown[]; state?: { usage?: Usage } };
+    baseline: UsageTotals;
+    models: Set<string>;
+    usage?: Usage;
     error?: unknown;
   }) {
     if (!this.configService.get<string>('DATABASE_URL')) return;
-    const { started, result, error, ...ids } = run;
-    const usage = result?.state?.usage;
+    const {
+      started,
+      result,
+      error,
+      baseline,
+      models,
+      usage: consumed,
+      ...ids
+    } = run;
+    const usage = usageTotals(
+      consumed ??
+        result?.state?.usage ??
+        (error instanceof AgentsError ? error.state?.usage : undefined),
+    );
+    const model =
+      models.size > 1 ? 'mixed' : (models.values().next().value ?? ids.model);
     try {
       await this.prisma.db.agentRun.create({
         data: {
           ...ids,
+          model,
           status: error
             ? 'failed'
             : result?.interruptions?.length
               ? 'waiting'
               : 'completed',
           ...(error !== undefined && { error: describeError(error) }),
-          requests: usage?.requests ?? 0,
-          inputTokens: usage?.inputTokens ?? 0,
-          outputTokens: usage?.outputTokens ?? 0,
-          cachedTokens: cachedTokens(usage),
+          requests: Math.max(0, usage.requests - baseline.requests),
+          inputTokens: Math.max(0, usage.inputTokens - baseline.inputTokens),
+          outputTokens: Math.max(0, usage.outputTokens - baseline.outputTokens),
+          cachedTokens: Math.max(0, usage.cachedTokens - baseline.cachedTokens),
           durationMs: Date.now() - started,
         },
       });
@@ -1071,8 +1195,8 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
             'This chat has a pending approval or interrupted run. Resume or reconcile it first.',
           );
       }
-      const sessionId =
-        policy.groupId ?? (session ? await session.getSessionId() : undefined);
+      const chatId = session ? await session.getSessionId() : undefined;
+      const sessionId = policy.groupId ?? chatId;
       const requestId = requestStore.getStore()?.requestId;
       // The model this run really uses, so Langfuse can price it. The SDK default comes last.
       const model =
@@ -1088,6 +1212,17 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
       };
       const joined = getCurrentTrace();
       const userText = userTurn(input);
+      // Keep the SDK's live usage container even when an ordinary Error has no
+      // RunState attached. Reuse restored and nested contexts without adding
+      // their usage a second time; only this invocation's delta is recorded.
+      const context =
+        input instanceof RunState
+          ? new RunResult(input).runContext
+          : policy.context instanceof RunContext
+            ? policy.context
+            : new RunContext(policy.context);
+      const baseline = usageTotals(context.usage);
+      const models = new Set<string>();
       return await getOrCreateTrace(
         async () => {
           const trace = getCurrentTrace();
@@ -1126,7 +1261,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
             }
             try {
               const runOptions = {
-                context: policy.context,
+                context,
                 session,
                 ...(session instanceof DatabaseSession &&
                   !(input instanceof RunState) && {
@@ -1232,20 +1367,28 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
           const recorded = {
             agent: agent.name,
             started,
-            ...(sessionId && { chatId: sessionId }),
+            ...(chatId && { chatId }),
             ...(model && { model }),
             ...(policy.userId && { userId: policy.userId }),
             ...(traceId && { traceId }),
             ...(requestId && { requestId }),
+            baseline,
+            models,
           };
+          const runWithContext = () =>
+            this.execution.run({ signal, models }, run);
           try {
             const result = this.langfuse
-              ? await this.langfuse.withRun(note, run)
-              : await run();
+              ? await this.langfuse.withRun(note, runWithContext)
+              : await runWithContext();
             await this.recordRun({ ...recorded, result });
             return result;
           } catch (error) {
-            await this.recordRun({ ...recorded, error });
+            await this.recordRun({
+              ...recorded,
+              error,
+              usage: context.usage,
+            });
             throw error;
           } finally {
             // SDK 0.21 does not end getOrCreateTrace on rejection. Always settle our trace,
@@ -1304,6 +1447,8 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
   private configuredRunner(config: Partial<RunConfig>) {
     const runner = new Runner(config);
     runner.on('agent_start', (_context, agent) => {
+      if (typeof agent.model === 'object')
+        this.execution.getStore()?.models.add('unknown');
       const span = getCurrentSpan();
       const agentSpanId =
         span?.spanData.type === 'turn' ? span.parentId : span?.spanId;
@@ -1338,6 +1483,7 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
         getModel: async (name?: string) => {
           const model = await provider.getModel(name);
           const prepare = (request: ModelRequest): ModelRequest => {
+            this.execution.getStore()?.models.add(name || getDefaultModel());
             const spanId = getCurrentSpan()?.spanId;
             if (spanId)
               this.langfuse?.noteSpan(spanId, {
@@ -1433,9 +1579,41 @@ function cachedTokens(usage?: Usage) {
   );
 }
 
-// The error type and a short message, without stack traces.
+type UsageTotals = {
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+};
+
+// Copy scalar totals before the SDK mutates the same state during a resume.
+function usageTotals(usage?: Usage): UsageTotals {
+  return {
+    requests: usage?.requests ?? 0,
+    inputTokens: usage?.inputTokens ?? 0,
+    outputTokens: usage?.outputTokens ?? 0,
+    cachedTokens: cachedTokens(usage),
+  };
+}
+
+function historyItemKey(item: unknown): string {
+  if (item && typeof item === 'object') {
+    const entry = item as { type?: string; callId?: string; id?: string };
+    if (entry.callId) return `${entry.type}:call:${entry.callId}`;
+    if (entry.id) return `${entry.type}:id:${entry.id}`;
+  }
+  return historyDigest(item);
+}
+
+// Exceptions can include prompts, tool arguments, or guardrail output. Persist only fixed categories.
 function describeError(error: unknown) {
-  const text =
-    error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-  return text.slice(0, 300);
+  if (error instanceof InputGuardrailTripwireTriggered)
+    return 'input_guardrail';
+  if (error instanceof OutputGuardrailTripwireTriggered)
+    return 'output_guardrail';
+  if (error instanceof ToolInputGuardrailTripwireTriggered)
+    return 'tool_input_guardrail';
+  if (error instanceof ToolOutputGuardrailTripwireTriggered)
+    return 'tool_output_guardrail';
+  return 'run_failed';
 }

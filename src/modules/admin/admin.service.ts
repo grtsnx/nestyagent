@@ -1,16 +1,31 @@
 import { Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Prisma } from '@/generated/prisma/client.js';
+import { Prisma, type PausedRun } from '@/generated/prisma/client.js';
 import { PrismaService } from '@/lib/prisma/prisma.service.js';
 
 const DAY_MS = 24 * 60 * 60_000;
+const RECOVERY_REQUIRED = Prisma.sql`
+  p.status IN ('recovery_required', 'taken') OR (
+    p.status = 'running' AND NOT EXISTS (
+      SELECT 1 FROM execution_locks l
+      WHERE l.key = 'run:' || p.id::text AND l.expires_at > clock_timestamp()
+    )
+  )`;
+const USAGE_TOTALS = Prisma.sql`
+  count(*) AS runs,
+  count(*) FILTER (WHERE status = 'failed') AS failed,
+  coalesce(sum(input_tokens), 0) AS input_tokens,
+  coalesce(sum(output_tokens), 0) AS output_tokens,
+  coalesce(sum(cached_tokens), 0) AS cached_tokens,
+  avg(duration_ms) AS average_ms,
+  percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95_ms`;
 
 export type ListOptions = { limit?: number };
 
 //1. Read-only numbers and lists for the admin routes. Nothing here changes data.
 //2. No message text is read. Saved run state and machine claim tokens are never returned.
 @Injectable()
-export class MonitoringService {
+export class AdminService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
@@ -35,9 +50,7 @@ export class MonitoringService {
       db.chat.count({ where: { createdAt: { gte: since } } }),
       db.chatItem.count({ where: { createdAt: { gte: since } } }),
       db.pausedRun.count({ where: { status: 'waiting' } }),
-      db.pausedRun.count({
-        where: { status: { in: ['recovery_required', 'taken'] } },
-      }),
+      this.recoveryCount(),
       db.hostedWebhook.count({
         where: { status: 'pending', attempts: { gt: 0 } },
       }),
@@ -65,24 +78,12 @@ export class MonitoringService {
     const [daily, models] = await Promise.all([
       db.$queryRaw<UsageRow[]>`
         SELECT to_char(date_trunc('day', created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
-               count(*) AS runs,
-               count(*) FILTER (WHERE status = 'failed') AS failed,
-               coalesce(sum(input_tokens), 0) AS input_tokens,
-               coalesce(sum(output_tokens), 0) AS output_tokens,
-               coalesce(sum(cached_tokens), 0) AS cached_tokens,
-               avg(duration_ms) AS average_ms,
-               percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95_ms
+               ${USAGE_TOTALS}
         FROM agent_runs WHERE created_at >= ${from}
         GROUP BY 1 ORDER BY 1`,
       db.$queryRaw<UsageRow[]>`
         SELECT coalesce(model, 'unknown') AS model,
-               count(*) AS runs,
-               count(*) FILTER (WHERE status = 'failed') AS failed,
-               coalesce(sum(input_tokens), 0) AS input_tokens,
-               coalesce(sum(output_tokens), 0) AS output_tokens,
-               coalesce(sum(cached_tokens), 0) AS cached_tokens,
-               avg(duration_ms) AS average_ms,
-               percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95_ms
+               ${USAGE_TOTALS}
         FROM agent_runs WHERE created_at >= ${from}
         GROUP BY 1 ORDER BY runs DESC`,
     ]);
@@ -119,37 +120,29 @@ export class MonitoringService {
   async approvals(
     options: ListOptions & { status?: 'waiting' | 'recovery_required' },
   ) {
-    const rows = await this.db().pausedRun.findMany({
-      where: {
-        status:
-          options.status === 'recovery_required'
-            ? { in: ['recovery_required', 'taken'] }
-            : (options.status ?? 'waiting'),
-      },
-      orderBy: { createdAt: 'asc' },
-      take: limit(options),
-      select: {
-        id: true,
-        status: true,
-        chatId: true,
-        agentName: true,
-        agentVersion: true,
-        ownerId: true,
-        recoveryNote: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    });
+    const filter =
+      options.status === 'recovery_required'
+        ? RECOVERY_REQUIRED
+        : Prisma.sql`p.status = 'waiting'`;
+    const rows = await this.db().$queryRaw<ApprovalRow[]>`
+      SELECT p.id, p.status, p.chat_id AS "chatId", p.agent_name AS "agentName",
+             p.agent_version AS "agentVersion", p.owner_id AS "ownerId",
+             p.recovery_note AS "recoveryNote", p.created_at AS "createdAt",
+             p.updated_at AS "updatedAt"
+      FROM paused_runs p WHERE ${filter}
+      ORDER BY p.created_at ASC, p.id ASC LIMIT ${limit(options)}`;
     return rows.map((row) => ({ ...row, waitingMs: age(row.createdAt) }));
   }
 
   // Most recent first, with message count and last activity. No message text.
   async chats(options: ListOptions) {
     const rows = await this.db().$queryRaw<ChatRow[]>`
-      SELECT c.id, c.created_at, c.updated_at, count(i.id) AS messages,
+      SELECT c.id, c.created_at, c.updated_at,
+             (SELECT count(*) FROM chat_items i WHERE i.chat_id = c.id) AS messages,
              (SELECT count(*) FROM agent_runs r WHERE r.chat_id = c.id) AS runs
-      FROM chats c LEFT JOIN chat_items i ON i.chat_id = c.id
-      GROUP BY c.id ORDER BY c.updated_at DESC LIMIT ${limit(options)}`;
+      FROM (SELECT id, created_at, updated_at FROM chats
+            ORDER BY updated_at DESC, id ASC LIMIT ${limit(options)}) c
+      ORDER BY c.updated_at DESC, c.id ASC`;
     return rows.map((row) => ({
       id: row.id,
       messages: Number(row.messages),
@@ -210,15 +203,15 @@ export class MonitoringService {
 
   private async runTotals(since: Date) {
     const [row] = await this.db().$queryRaw<UsageRow[]>`
-      SELECT count(*) AS runs,
-             count(*) FILTER (WHERE status = 'failed') AS failed,
-             coalesce(sum(input_tokens), 0) AS input_tokens,
-             coalesce(sum(output_tokens), 0) AS output_tokens,
-             coalesce(sum(cached_tokens), 0) AS cached_tokens,
-             avg(duration_ms) AS average_ms,
-             percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95_ms
+      SELECT ${USAGE_TOTALS}
       FROM agent_runs WHERE created_at >= ${since}`;
     return usageNumbers(row);
+  }
+
+  private async recoveryCount() {
+    const [row] = await this.db().$queryRaw<Array<{ count: bigint }>>`
+      SELECT count(*) AS count FROM paused_runs p WHERE ${RECOVERY_REQUIRED}`;
+    return Number(row.count);
   }
 
   private db() {
@@ -247,6 +240,19 @@ type ChatRow = {
   messages: bigint;
   runs: bigint;
 };
+
+type ApprovalRow = Pick<
+  PausedRun,
+  | 'id'
+  | 'status'
+  | 'chatId'
+  | 'agentName'
+  | 'agentVersion'
+  | 'ownerId'
+  | 'recoveryNote'
+  | 'createdAt'
+  | 'updatedAt'
+>;
 
 // Postgres counts come back as big integers. cacheHitRate is cached input over all input.
 function usageNumbers(row: UsageRow) {

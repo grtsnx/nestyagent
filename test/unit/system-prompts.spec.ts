@@ -20,6 +20,94 @@ function service(env: Record<string, unknown> = { DATABASE_URL }) {
 }
 
 describe('SystemPromptsService', () => {
+  it('never reuses a deleted prompt revision for stale updates or deletes', async () => {
+    const { systemPrompts } = service();
+    const first = await systemPrompts.create('mssuzie', 'Original.');
+    await systemPrompts.remove('mssuzie', first.version!);
+    const replacement = await systemPrompts.create('mssuzie', 'Replacement.');
+    expect(replacement.version).toBeGreaterThan(first.version!);
+    await expect(
+      systemPrompts.update('mssuzie', 'Stale edit.', first.version!),
+    ).rejects.toThrow(/changed/);
+    await expect(
+      systemPrompts.remove('mssuzie', first.version!),
+    ).rejects.toThrow(/changed/);
+    expect((await systemPrompts.get('mssuzie')).content).toBe('Replacement.');
+  });
+
+  it('returns its own updated row when another writer edits immediately afterward', async () => {
+    const { db, systemPrompts } = service();
+    const first = await systemPrompts.create('mssuzie', 'Original.');
+    let edited = false;
+    const editAgain = async () => {
+      if (edited) return;
+      edited = true;
+      const current = await systemPrompts.get('mssuzie');
+      await systemPrompts.update('mssuzie', 'Writer B.', current.version!);
+    };
+    const update = db.systemPrompt.updateMany.bind(db.systemPrompt);
+    vi.spyOn(db.systemPrompt, 'updateMany').mockImplementation(async (args) => {
+      const result = await update(args);
+      await editAgain();
+      return result;
+    });
+    const query = db.$queryRaw.bind(db);
+    vi.spyOn(db, '$queryRaw').mockImplementation(async (...args) => {
+      const result = await query(...args);
+      if (args[0].join(' ').includes('UPDATE system_prompts'))
+        await editAgain();
+      return result;
+    });
+    const result = await systemPrompts.update(
+      'mssuzie',
+      'Writer A.',
+      first.version!,
+    );
+    expect(edited).toBe(true);
+    expect(result.content).toBe('Writer A.');
+    expect((await systemPrompts.get('mssuzie')).content).toBe('Writer B.');
+  });
+
+  it.each(['update', 'remove'] as const)(
+    'discards an in-flight stale read after %s',
+    async (operation) => {
+      const { db, systemPrompts } = service();
+      const first = await systemPrompts.create('mssuzie', 'Old.');
+      const old = { ...db.systemPrompt.rows[0] };
+      let finish!: (row: typeof old) => void;
+      vi.spyOn(db.systemPrompt, 'findUnique').mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const pending = systemPrompts.content('mssuzie');
+      if (operation === 'update')
+        await systemPrompts.update('mssuzie', 'New.', first.version!);
+      else await systemPrompts.remove('mssuzie', first.version!);
+      finish(old);
+      const expected =
+        operation === 'update' ? 'New.' : defaultSystemPrompts.mssuzie;
+      expect(await pending).toBe(expected);
+      expect(await systemPrompts.content('mssuzie')).toBe(expected);
+    },
+  );
+
+  it('does not treat inherited object properties as built-in prompts', async () => {
+    const { systemPrompts } = service();
+    await expect(systemPrompts.get('constructor')).rejects.toThrow(
+      /No system prompt/,
+    );
+    expect(() => systemPrompts.forAgent('constructor')).toThrow(/default file/);
+    const custom = await systemPrompts.create(
+      'constructor',
+      'A custom prompt.',
+    );
+    await expect(
+      systemPrompts.remove('constructor', custom.version!),
+    ).resolves.toBeUndefined();
+  });
+
   it('ships the MsSuzie prompt as the default', async () => {
     const { systemPrompts } = service();
     expect(defaultSystemPrompts.mssuzie).toContain(

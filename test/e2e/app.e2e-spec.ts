@@ -73,6 +73,18 @@ describe('AppController (e2e)', () => {
     });
   });
 
+  it('allows the admin key in trusted browser preflights', async () => {
+    const response = await request(app.getHttpServer())
+      .options('/v1/system-prompts/mssuzie')
+      .set('Origin', 'https://app.example.com')
+      .set('Access-Control-Request-Method', 'PUT')
+      .set('Access-Control-Request-Headers', 'content-type,x-admin-key')
+      .expect(204);
+    expect(
+      response.headers['access-control-allow-headers'].toLowerCase().split(','),
+    ).toContain('x-admin-key');
+  });
+
   it('replaces an invalid caller-supplied request ID', async () => {
     const response = await request(app.getHttpServer())
       .get('/v1')

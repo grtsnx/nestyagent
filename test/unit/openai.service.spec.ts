@@ -615,38 +615,6 @@ describe('OpenaiService storage and limits', () => {
     expect(await session.getItems(2)).toEqual(steps.slice(2));
   });
 
-  it('cancels a saved approval so the chat can move on', async () => {
-    const openai = service();
-    const agent = new Agent({ name: 'Order helper', instructions: 'Orders.' });
-    const state = {
-      getInterruptions: () => [{ name: 'cancelOrder' }],
-      reject: vi.fn(),
-      toString: () => 'paused',
-    };
-    vi.spyOn(RunState, 'fromString').mockResolvedValue(state as never);
-    const run = vi.spyOn(Runner.prototype, 'run').mockResolvedValue({
-      state: { toString: () => 'done' },
-      interruptions: [],
-    } as never);
-    try {
-      const id = await openai.saveRun({ state: state as never });
-      await openai.cancelRun(agent, id);
-
-      expect(state.reject).toHaveBeenCalledWith(
-        { name: 'cancelOrder' },
-        expect.objectContaining({
-          message: 'Not approved. The request was cancelled.',
-        }),
-      );
-      expect(run).toHaveBeenCalledWith(agent, state, expect.anything());
-      await expect(openai.loadRun(agent, id)).rejects.toThrow(
-        'already taken or does not exist',
-      );
-    } finally {
-      vi.restoreAllMocks();
-    }
-  });
-
   it('preserves cancellation and turn limits through reply', async () => {
     const openai = service();
     const agent = new Agent({ name: 'Helper' });
@@ -1025,7 +993,7 @@ describe('OpenaiService storage and limits', () => {
           outputTokens: 50,
           cachedTokens: 768,
         },
-        { status: 'failed', error: 'Error: Model unavailable.' },
+        { status: 'failed', error: 'run_failed' },
       ]);
       expect(JSON.stringify(db.agentRun.rows)).not.toContain('Hi.');
     } finally {

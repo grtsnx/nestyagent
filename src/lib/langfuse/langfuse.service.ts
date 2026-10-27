@@ -82,7 +82,7 @@ export type PlannedObservation = {
 };
 
 //1. One completed Agents SDK trace segment becomes one Langfuse trace.
-//2. A model turn is a generation, so cost and tokens attach to it.
+//2. Native model generations carry cost and tokens; a turn supplies the fallback.
 //3. A tool, guardrail, or handoff keeps its own type and sits beside that generation.
 export function planObservations(
   items: AgentTraceItem[],
@@ -98,6 +98,57 @@ export function planObservations(
     return [item];
   });
   const byId = new Map(spans.map((item) => [item.spanId, item]));
+  const generationsByTurn = new Map<string, (typeof spans)[number][]>();
+  for (const item of spans) {
+    if (item.spanData.type !== 'generation') continue;
+    const seen = new Set([item.spanId]);
+    let parent = item.parentId && byId.get(item.parentId);
+    while (parent && !seen.has(parent.spanId)) {
+      if (parent.spanData.type === 'turn') {
+        const children = generationsByTurn.get(parent.spanId) ?? [];
+        children.push(item);
+        generationsByTurn.set(parent.spanId, children);
+        break;
+      }
+      seen.add(parent.spanId);
+      parent = parent.parentId && byId.get(parent.parentId);
+    }
+  }
+  const usageFallbacks = new Map<string, Parameters<typeof usageOf>[0]>();
+  for (const [turnId, generations] of generationsByTurn) {
+    const turn = byId.get(turnId)?.spanData;
+    if (turn?.type !== 'turn' || !turn.usage) continue;
+    const missing = generations.filter(
+      (item) =>
+        item.spanData.type === 'generation' &&
+        !item.spanData.usage &&
+        !item.error,
+    );
+    // The SDK puts successful Chat Completions usage on the enclosing turn.
+    // After a retry, subtract reported failed usage before assigning the rest
+    // to its single successful call. Never copy a turn total onto every child.
+    const target =
+      generations.length === 1
+        ? generations[0]
+        : missing.length === 1
+          ? missing[0]
+          : undefined;
+    if (!target) continue;
+    const remaining = { ...turn.usage };
+    for (const item of generations) {
+      if (item.spanData.type !== 'generation' || !item.spanData.usage) continue;
+      const usage = item.spanData.usage;
+      remaining.input_tokens -= usage.input_tokens ?? 0;
+      remaining.output_tokens -= usage.output_tokens ?? 0;
+      remaining.cached_input_tokens -=
+        usageOf(usage).usageDetails?.input_cached_tokens ?? 0;
+    }
+    usageFallbacks.set(target.spanId, {
+      input_tokens: Math.max(0, remaining.input_tokens),
+      output_tokens: Math.max(0, remaining.output_tokens),
+      cached_input_tokens: Math.max(0, remaining.cached_input_tokens),
+    });
+  }
   const ordered = spans
     .slice()
     .sort((left, right) => depth(left) - depth(right));
@@ -122,7 +173,15 @@ export function planObservations(
     const runId =
       ancestors.find((ancestor) => ancestor.spanData.type === 'task')?.spanId ??
       item.traceId;
-    const mapped = mapSpan(item, trace, note, seenGenerations, runId);
+    const mapped = mapSpan(
+      item,
+      trace,
+      note,
+      seenGenerations,
+      runId,
+      generationsByTurn.has(item.spanId),
+      usageFallbacks.get(item.spanId),
+    );
     if (!mapped) continue;
     const parentId = item.parentId;
     planned.push({
@@ -158,6 +217,8 @@ function mapSpan(
   note: TurnNote | undefined,
   seenGenerations: Map<string, number>,
   runId: string,
+  hasNativeGenerations: boolean,
+  usageFallback: Parameters<typeof usageOf>[0],
 ):
   | Omit<
       PlannedObservation,
@@ -195,10 +256,10 @@ function mapSpan(
       const index = seenGenerations.get(runId) ?? 0;
       seenGenerations.set(runId, index + 1);
       return {
-        name: 'generate-response',
-        asType: 'generation',
-        ...usageOf(data.usage),
-        ...(note?.model && { model: note.model }),
+        name: hasNativeGenerations ? 'model-turn' : 'generate-response',
+        asType: hasNativeGenerations ? 'span' : 'generation',
+        ...(!hasNativeGenerations && usageOf(data.usage)),
+        ...(!hasNativeGenerations && note?.model && { model: note.model }),
         ...(index === 0 && note?.input !== undefined && { input: note.input }),
         metadata: {
           ...metadata,
@@ -213,7 +274,7 @@ function mapSpan(
         name: 'generate-response',
         asType: 'generation',
         ...(data.model && { model: data.model }),
-        ...usageOf(data.usage),
+        ...usageOf(data.usage ?? usageFallback),
         ...(data.input !== undefined && { input: data.input }),
         ...(data.output !== undefined && { output: data.output }),
         metadata,
@@ -295,6 +356,7 @@ function usageOf(usage?: {
   input_tokens?: number;
   output_tokens?: number;
   cached_input_tokens?: number;
+  input_tokens_details?: { cached_tokens?: number };
 }) {
   if (!usage) return {};
   const details: {
@@ -302,15 +364,13 @@ function usageOf(usage?: {
     output?: number;
     input_cached_tokens?: number;
   } = {};
+  const cached =
+    usage.cached_input_tokens ?? usage.input_tokens_details?.cached_tokens ?? 0;
   // OpenAI includes cache hits in input; Langfuse expects exclusive buckets.
   if (usage.input_tokens !== undefined)
-    details.input = Math.max(
-      0,
-      usage.input_tokens - (usage.cached_input_tokens ?? 0),
-    );
+    details.input = Math.max(0, usage.input_tokens - cached);
   if (usage.output_tokens !== undefined) details.output = usage.output_tokens;
-  if (usage.cached_input_tokens)
-    details.input_cached_tokens = usage.cached_input_tokens;
+  if (cached) details.input_cached_tokens = cached;
   return Object.keys(details).length ? { usageDetails: details } : {};
 }
 

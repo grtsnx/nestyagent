@@ -14,12 +14,14 @@ import OpenAI, { APIError } from 'openai';
 import {
   Capabilities,
   Capability,
+  Environment as SandboxEnvironment,
   Manifest,
   MemoryArgs,
   SandboxAgent,
   SandboxClient,
   SandboxSession,
   SkillsArgs,
+  cloneManifest,
   memory,
   skills,
 } from '@openai/agents/sandbox';
@@ -100,6 +102,7 @@ const WORKER_POLL_MS = 5_000;
 // Finished webhooks are kept this long to drop OpenAI's repeat deliveries, then deleted.
 const WEBHOOK_RETENTION_MS = 7 * 24 * 60 * 60_000;
 const WEBHOOK_LEASE_MS = 5 * 60_000;
+const WEBHOOK_CONCURRENCY = 4;
 // The only variables the executor inherits from this app, besides CODEX_API_KEY.
 const EXECUTOR_ENV_KEYS = ['PATH', 'HOME', 'USER', 'LANG', 'TMPDIR', 'SHELL'];
 const runFile = promisify(execFile);
@@ -301,7 +304,30 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
       throw new Error('This computer cannot resume a saved workspace.');
     }
     const state = await client.deserializeSessionState(saved);
-    return (await client.resume(state)) as SandboxWorkspace;
+    const workspace = (await client.resume(state)) as SandboxWorkspace;
+    try {
+      const update = this.workspaceManifest(
+        new Manifest({ root: workspace.state.manifest.root }),
+        options?.password,
+      );
+      if (update.environment.ACCOUNT_PASSWORD) {
+        if (!workspace.applyManifest)
+          throw new Error(
+            'This computer cannot restore workspace credentials.',
+          );
+        await workspace.applyManifest(update);
+      }
+      return workspace;
+    } catch (error) {
+      try {
+        await workspace.close?.();
+      } catch {
+        this.logger.warn(
+          'Could not close the workspace after restoring credentials failed.',
+        );
+      }
+      throw error;
+    }
   }
 
   //1. Run a prompt on a sandbox agent inside a workspace.
@@ -645,7 +671,7 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
       orderBy: { createdAt: 'asc' },
       take: 20,
     });
-    for (const event of events) {
+    const processEvent = async (event: (typeof events)[number]) => {
       if (this.shutdown.signal.aborted) return;
       const leaseToken = randomUUID();
       const claimed = await this.db().hostedWebhook.updateMany({
@@ -657,7 +683,7 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
           attempts: { increment: 1 },
         },
       });
-      if (!claimed.count) continue;
+      if (!claimed.count) return;
       const lease = new AbortController();
       const heartbeat = setInterval(() => {
         void this.db()
@@ -714,7 +740,20 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
       } finally {
         clearInterval(heartbeat);
       }
-    }
+    };
+    // Claim only when a worker is free; waiting rows keep their original leases.
+    let next = 0;
+    const workers = Array.from(
+      { length: Math.min(WEBHOOK_CONCURRENCY, events.length) },
+      async () => {
+        while (next < events.length && !this.shutdown.signal.aborted)
+          await processEvent(events[next++]);
+      },
+    );
+    // A database failure must not release workerTask while sibling work is running.
+    const results = await Promise.allSettled(workers);
+    const failed = results.find((result) => result.status === 'rejected');
+    if (failed?.status === 'rejected') throw failed.reason;
   }
 
   private async connectRemoteMachine(sessionId: string, signal: AbortSignal) {
@@ -1277,7 +1316,18 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
           }),
         },
       );
-      await readJson(started);
+      const result = await readJson(started);
+      if (
+        !result ||
+        typeof result !== 'object' ||
+        !('status' in result) ||
+        result.status !== 'EXECUTE_COMMAND_STATUS_COMPLETED' ||
+        !('exit_code' in result) ||
+        result.exit_code !== 0
+      )
+        throw new Error(
+          'The Databricks executor command did not complete successfully.',
+        );
     } catch {
       throw new KnownMachineFailure(`databricks:${name}`);
     }
@@ -1411,19 +1461,12 @@ export class SandboxService implements OnModuleInit, OnModuleDestroy {
         ? password.trim() || undefined
         : this.configService.get<string>('ACCOUNT_PASSWORD');
     if (secret === undefined) return manifest;
-    return new Manifest({
-      version: manifest.version,
-      root: manifest.root,
-      entries: manifest.entries,
-      environment: {
-        ...manifest.environment,
-        ACCOUNT_PASSWORD: { value: secret, ephemeral: true },
-      },
-      users: manifest.users,
-      groups: manifest.groups,
-      extraPathGrants: manifest.extraPathGrants,
-      remoteMountCommandAllowlist: manifest.remoteMountCommandAllowlist,
+    const updated = cloneManifest(manifest);
+    updated.environment.ACCOUNT_PASSWORD = new SandboxEnvironment({
+      value: secret,
+      ephemeral: true,
     });
+    return updated;
   }
 
   private async providerClient(

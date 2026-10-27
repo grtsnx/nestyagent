@@ -90,7 +90,7 @@ export class SystemPromptsController {
       'This route saves a custom version that replaces the default from the next message on.',
   })
   @ApiSuccess(
-    'The custom version was saved as version 1.',
+    'The custom version was saved with a new revision number.',
     { ...custom, version: 1 },
     HttpStatus.CREATED,
   )

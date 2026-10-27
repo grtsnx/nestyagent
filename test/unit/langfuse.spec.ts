@@ -1,9 +1,11 @@
 import { ConfigService } from '@nestjs/config';
 import { setLangfuseTracerProvider } from '@langfuse/tracing';
+import OpenAI from 'openai';
 import {
   Agent,
   handoff,
   OpenAIProvider,
+  OpenAIChatCompletionsModel,
   RunState,
   setTraceProcessors,
   setTracingDisabled,
@@ -36,6 +38,231 @@ const trace = {
 };
 
 describe('LangfuseService', () => {
+  it.each([
+    { stream: false, retry: false },
+    { stream: true, retry: false },
+    { stream: false, retry: true },
+    { stream: true, retry: true },
+  ])(
+    'exports one priced generation for stock Chat Completions (stream: $stream, retry: $retry)',
+    async ({ stream, retry }) => {
+      const exporter = new InMemorySpanExporter();
+      const provider = new BasicTracerProvider({
+        spanProcessors: [new SimpleSpanProcessor(exporter)],
+      });
+      setLangfuseTracerProvider(provider);
+      const service = new LangfuseService(
+        new ConfigService({ NODE_ENV: 'development', LANGFUSE_ENABLED: true }),
+      );
+      const openai = new OpenaiService(
+        new ConfigService({ OPENAI_API_KEY: 'sk-test' }),
+        fakePrisma().prisma,
+        service,
+      );
+      const usage = {
+        prompt_tokens: 12,
+        completion_tokens: 4,
+        total_tokens: 16,
+        prompt_tokens_details: { cached_tokens: 3 },
+      };
+      const response = {
+        id: 'chatcmpl-fixture',
+        object: 'chat.completion',
+        created: 1,
+        model: 'gpt-fixture',
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: 'Fixture answer' },
+            finish_reason: 'stop',
+          },
+        ],
+        usage,
+      };
+      const chunks =
+        [
+          {
+            choices: [
+              {
+                index: 0,
+                delta: { role: 'assistant', content: 'Fixture answer' },
+                finish_reason: null,
+              },
+            ],
+          },
+          { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+          { choices: [], usage },
+        ]
+          .map(
+            (chunk) =>
+              `data: ${JSON.stringify({ id: response.id, object: 'chat.completion.chunk', created: 1, model: response.model, ...chunk })}\n\n`,
+          )
+          .join('') + 'data: [DONE]\n\n';
+      let requests = 0;
+      const client = new OpenAI({
+        apiKey: 'sk-test',
+        maxRetries: 0,
+        fetch: async () => {
+          requests++;
+          if (retry && requests === 1)
+            return new Response(
+              JSON.stringify({
+                error: {
+                  message: 'Retry fixture',
+                  type: 'rate_limit_exceeded',
+                },
+              }),
+              { status: 429, headers: { 'content-type': 'application/json' } },
+            );
+          return new Response(stream ? chunks : JSON.stringify(response), {
+            headers: {
+              'content-type': stream ? 'text/event-stream' : 'application/json',
+            },
+          });
+        },
+      });
+      const agent = new Agent({
+        name: 'Fixture',
+        model: new OpenAIChatCompletionsModel(client, 'gpt-fixture'),
+        modelSettings: {
+          retry: {
+            maxRetries: 1,
+            policy: () => true,
+            backoff: { initialDelayMs: 0, maxDelayMs: 0, jitter: false },
+          },
+        },
+      });
+      setTraceProcessors([service]);
+      setTracingDisabled(false);
+      try {
+        if (stream) {
+          const result = await openai.runAgent('Fixture question', agent, {
+            stream: true,
+          });
+          await result.completed;
+        } else await openai.runAgent('Fixture question', agent);
+        await service.forceFlush();
+        const spans = exporter.getFinishedSpans();
+        const generations = spans.filter(
+          (span) =>
+            span.attributes['langfuse.observation.type'] === 'generation',
+        );
+        expect(requests).toBe(retry ? 2 : 1);
+        expect(generations).toHaveLength(retry ? 2 : 1);
+        const priced = generations.filter(
+          (span) => span.attributes['langfuse.observation.usage_details'],
+        );
+        expect(priced).toHaveLength(1);
+        expect(priced[0].attributes['langfuse.observation.model.name']).toBe(
+          'gpt-fixture',
+        );
+        expect(
+          JSON.parse(
+            priced[0].attributes[
+              'langfuse.observation.usage_details'
+            ] as string,
+          ),
+        ).toEqual({ input: 9, output: 4, input_cached_tokens: 3 });
+        expect(
+          spans.filter(
+            (span) => span.attributes['langfuse.observation.usage_details'],
+          ),
+        ).toHaveLength(1);
+        const parent = spans.find(
+          (span) =>
+            span.spanContext().spanId === priced[0].parentSpanContext?.spanId,
+        );
+        expect(parent?.attributes['langfuse.observation.type']).toBe('span');
+      } finally {
+        await openai.onModuleDestroy();
+        setTracingDisabled(true);
+        setTraceProcessors([]);
+        await provider.shutdown();
+        setLangfuseTracerProvider(null);
+      }
+    },
+  );
+
+  it('retains distinct native generations without charging their aggregate turn twice', () => {
+    const planned = planObservations(
+      [
+        trace,
+        span('turn', null, {
+          type: 'turn',
+          turn: 1,
+          agent_name: 'Fixture',
+          usage: {
+            input_tokens: 30,
+            output_tokens: 6,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+          },
+        }),
+        span('first', 'turn', {
+          type: 'generation',
+          model: 'model-a',
+          usage: { input_tokens: 10, output_tokens: 2 },
+        }),
+        span('second', 'turn', {
+          type: 'generation',
+          model: 'model-b',
+          usage: { input_tokens: 20, output_tokens: 4 },
+        }),
+      ],
+      note(),
+    );
+    expect(
+      planned
+        .filter((item) => item.asType === 'generation')
+        .map((item) => [item.model, item.usageDetails]),
+    ).toEqual([
+      ['model-a', { input: 10, output: 2 }],
+      ['model-b', { input: 20, output: 4 }],
+    ]);
+    expect(planned[0]).not.toHaveProperty('usageDetails');
+  });
+
+  it.each([undefined, { input_tokens: 5, output_tokens: 2 }])(
+    'retains successful usage after a native retry (failed usage: %j)',
+    (failedUsage) => {
+      const planned = planObservations(
+        [
+          trace,
+          span('turn', null, {
+            type: 'turn',
+            turn: 1,
+            agent_name: 'Fixture',
+            usage: {
+              input_tokens: 12 + (failedUsage?.input_tokens ?? 0),
+              output_tokens: 4 + (failedUsage?.output_tokens ?? 0),
+              cached_input_tokens: 3,
+              cache_write_input_tokens: 0,
+            },
+          }),
+          {
+            ...span('failed', 'turn', {
+              type: 'generation',
+              model: 'model-a',
+              usage: failedUsage,
+            }),
+            error: { message: 'Retryable error' },
+          },
+          span('successful', 'turn', { type: 'generation', model: 'model-a' }),
+        ],
+        note(),
+      );
+      const successful = planned.find((item) => item.spanId === 'successful');
+      expect(successful?.usageDetails).toEqual({
+        input: 9,
+        output: 4,
+        input_cached_tokens: 3,
+      });
+      expect(planned.find((item) => item.spanId === 'turn')).not.toHaveProperty(
+        'usageDetails',
+      );
+    },
+  );
+
   it.each([false, true])(
     'automatically publishes a failed restored approval trace (stream: %s)',
     async (stream) => {

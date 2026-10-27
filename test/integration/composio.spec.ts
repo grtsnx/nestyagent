@@ -49,14 +49,49 @@ describe('Composio sessions in Postgres', () => {
       () => new ComposioService(new ConfigService(env), prisma),
     );
     try {
-      await Promise.all(servers.map((server) => server.tools(userId)));
+      const attempts = await Promise.allSettled(
+        servers.map((server) => server.tools(userId)),
+      );
+      expect(attempts.some((result) => result.status === 'fulfilled')).toBe(
+        true,
+      );
+      for (const [index, result] of attempts.entries()) {
+        if (result.status === 'rejected') {
+          expect(result.reason.getStatus()).toBe(409);
+          await servers[index].tools(userId);
+        }
+      }
       const rows = await prisma.db.composioSession.findMany({
         where: { userId },
       });
       expect(rows).toHaveLength(1);
-      expect(remove).toHaveBeenCalledTimes(made - 1);
+      expect(made).toBe(1);
+      expect(remove).not.toHaveBeenCalled();
     } finally {
       await prisma.db.composioSession.deleteMany({ where: { userId } });
+    }
+  });
+
+  it('lets another server try again after a failed creation', async () => {
+    const userId = `user-${randomUUID()}`;
+    const sessionId = `sess-${randomUUID()}`;
+    create.mockReset();
+    use.mockReset();
+    create
+      .mockRejectedValueOnce(new Error('Lost connection'))
+      .mockResolvedValueOnce({ sessionId, tools: async () => [] });
+    const first = new ComposioService(new ConfigService(env), prisma);
+    const second = new ComposioService(new ConfigService(env), prisma);
+    try {
+      await expect(first.tools(userId)).rejects.toThrow(/Lost connection/);
+      await second.tools(userId);
+      expect(
+        await prisma.db.composioSession.findUnique({ where: { userId } }),
+      ).toMatchObject({ sessionId });
+    } finally {
+      await prisma.db.composioSession.deleteMany({ where: { userId } });
+      first.onModuleDestroy();
+      second.onModuleDestroy();
     }
   });
 });

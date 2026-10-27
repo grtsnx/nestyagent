@@ -1,7 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ConfigService } from '@nestjs/config';
 import { Logger } from '@nestjs/common';
-import { Manifest, type SandboxClient } from '@openai/agents/sandbox';
+import {
+  Manifest,
+  inContainerMountStrategy,
+  s3Mount,
+  type SandboxClient,
+} from '@openai/agents/sandbox';
+import {
+  validateMountCredentialBoundaries,
+  validateMountEnvironmentCredentialBoundaries,
+} from '@openai/agents-core/sandbox/internal';
 import {
   DockerSandboxClient,
   UnixLocalSandboxClient,
@@ -207,6 +216,185 @@ describe('self-hosted machines', () => {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
+  });
+
+  it('processes independent environments concurrently with a bounded worker pool', async () => {
+    const { db, prisma } = fakePrisma();
+    for (let index = 0; index < 12; index++)
+      await db.hostedWebhook.create({
+        data: {
+          id: `event-${index}`,
+          type: 'agent.session.action_required',
+          resourceId: `session-${index}`,
+        },
+      });
+    const api = hostedApi();
+    api.beta.agents.sessions.retrieve = async (...[id]: [string?]) => ({
+      id: id!,
+      status: 'idle',
+      environment: {
+        type: 'self_hosted',
+        id: `env-${id}`,
+        remote_url: 'wss://example.com',
+      },
+      required_actions: [{ type: 'environment_connection' }],
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let active = 0;
+    let maximum = 0;
+    const fetchMock = vi.fn(async (url: unknown) => {
+      active++;
+      maximum = Math.max(maximum, active);
+      await gate;
+      active--;
+      return new Response(
+        JSON.stringify({
+          id: new URL(String(url)).searchParams.get('openai_session_id'),
+        }),
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const service = sandboxService(remoteSettings, api, prisma);
+    const processing = service.processHostedWebhooks();
+    try {
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4), {
+        timeout: 500,
+      });
+      expect(
+        db.hostedWebhook.rows.filter((row) => row.status === 'processing'),
+      ).toHaveLength(4);
+    } finally {
+      release();
+      await processing;
+    }
+    expect(maximum).toBe(4);
+    expect(fetchMock).toHaveBeenCalledTimes(12);
+    expect(
+      db.hostedWebhook.rows.every((row) => row.status === 'completed'),
+    ).toBe(true);
+  });
+
+  it('keeps duplicate environment requests fenced while other environments progress', async () => {
+    const { db, prisma } = fakePrisma();
+    for (const [id, resourceId] of [
+      ['first', 'same'],
+      ['duplicate', 'same'],
+      ['independent', 'other'],
+    ])
+      await db.hostedWebhook.create({
+        data: { id, type: 'agent.session.action_required', resourceId },
+      });
+    const api = hostedApi();
+    api.beta.agents.sessions.retrieve = async (...[id]: [string?]) => ({
+      id: id!,
+      status: 'idle',
+      environment: {
+        type: 'self_hosted',
+        id: `env-${id}`,
+        remote_url: 'wss://example.com',
+      },
+      required_actions: [{ type: 'environment_connection' }],
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const starts: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: unknown) => {
+        const id = new URL(String(url)).searchParams.get('openai_session_id')!;
+        starts.push(id);
+        if (id === 'same') await gate;
+        return new Response(JSON.stringify({ id: `provider-${id}` }));
+      }),
+    );
+    const processing = sandboxService(
+      remoteSettings,
+      api,
+      prisma,
+    ).processHostedWebhooks();
+    try {
+      await vi.waitFor(() => expect(starts).toContain('other'), {
+        timeout: 500,
+      });
+      expect(starts.filter((id) => id === 'same')).toHaveLength(1);
+    } finally {
+      release();
+      await processing;
+    }
+    expect(starts.filter((id) => id === 'same')).toHaveLength(1);
+    expect(
+      db.remoteMachine.rows.filter((row) => row.environmentId === 'env-same'),
+    ).toHaveLength(1);
+  });
+
+  it('waits for active webhook workers before exposing a database failure', async () => {
+    const { db, prisma } = fakePrisma();
+    for (let index = 0; index < 6; index++)
+      await db.hostedWebhook.create({
+        data: {
+          id: `event-${index}`,
+          type: 'agent.session.action_required',
+          resourceId: `session-${index}`,
+        },
+      });
+    const api = hostedApi();
+    api.beta.agents.sessions.retrieve = async (...[id]: [string?]) => ({
+      id: id!,
+      status: 'idle',
+      environment: {
+        type: 'self_hosted',
+        id: `env-${id}`,
+        remote_url: 'wss://example.com',
+      },
+      required_actions: [{ type: 'environment_connection' }],
+    });
+    const failure = new Error('database unavailable');
+    const update = db.hostedWebhook.updateMany.bind(db.hostedWebhook);
+    vi.spyOn(db.hostedWebhook, 'updateMany').mockImplementation(
+      async (args) => {
+        if (args.where.id === 'event-0') throw failure;
+        return update(args);
+      },
+    );
+    const find = vi.spyOn(db.hostedWebhook, 'findMany');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fetchMock = vi.fn(async (url: unknown) => {
+      await gate;
+      return new Response(
+        JSON.stringify({
+          id: new URL(String(url)).searchParams.get('openai_session_id'),
+        }),
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const service = sandboxService(remoteSettings, api, prisma);
+    let settled = false;
+    const first = service.processHostedWebhooks().catch((error) => {
+      settled = true;
+      return error;
+    });
+    let second: Promise<unknown> | undefined;
+    try {
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3), {
+        timeout: 500,
+      });
+      expect(settled).toBe(false);
+      second = service.processHostedWebhooks().catch((error) => error);
+      expect(find).toHaveBeenCalledOnce();
+    } finally {
+      release();
+      expect(await first).toBe(failure);
+      if (second) expect(await second).toBe(failure);
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(5);
   });
 
   it('sends DigitalOcean its JSON manifest and variable envelope', async () => {
@@ -938,6 +1126,82 @@ describe('self-hosted machines', () => {
     });
   });
 
+  it.each([
+    { status: 'EXECUTE_COMMAND_STATUS_COMPLETED', exit_code: 1 },
+    { status: 'EXECUTE_COMMAND_STATUS_FAILED' },
+    { status: 'EXECUTE_COMMAND_STATUS_TIMED_OUT' },
+    {},
+  ])(
+    'retains Databricks identity after an unsuccessful HTTP 200 command result: %j',
+    async (command) => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(
+          async (_url: unknown, init?: RequestInit) =>
+            new Response(
+              JSON.stringify(
+                init?.body?.toString().includes('execution_timeout')
+                  ? command
+                  : { name: 'sandboxes/failed-command' },
+              ),
+            ),
+        ),
+      );
+      const { db, prisma } = fakePrisma();
+      const service = sandboxService(
+        {
+          ...remoteSettings,
+          REMOTE_MACHINE_PROVIDER: 'databricks',
+          DATABRICKS_HOST: 'https://workspace.example.com',
+          DATABRICKS_TOKEN: 'token',
+        },
+        hostedApi(),
+        prisma,
+      );
+      await service.handleHostedWebhook(connectEvent, {});
+      await service.processHostedWebhooks();
+      expect(db.remoteMachine.rows[0]).toMatchObject({
+        status: 'reconciliation',
+        machineId: 'databricks:sandboxes/failed-command',
+      });
+      expect(db.hostedWebhook.rows[0].status).toBe('reconciliation');
+    },
+  );
+
+  it('marks a successful Databricks command ready', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async (_url: unknown, init?: RequestInit) =>
+          new Response(
+            JSON.stringify(
+              init?.body?.toString().includes('execution_timeout')
+                ? { status: 'EXECUTE_COMMAND_STATUS_COMPLETED', exit_code: 0 }
+                : { name: 'sandboxes/started-command' },
+            ),
+          ),
+      ),
+    );
+    const { db, prisma } = fakePrisma();
+    const service = sandboxService(
+      {
+        ...remoteSettings,
+        REMOTE_MACHINE_PROVIDER: 'databricks',
+        DATABRICKS_HOST: 'https://workspace.example.com',
+        DATABRICKS_TOKEN: 'token',
+      },
+      hostedApi(),
+      prisma,
+    );
+    await service.handleHostedWebhook(connectEvent, {});
+    await service.processHostedWebhooks();
+    expect(db.remoteMachine.rows[0]).toMatchObject({
+      status: 'ready',
+      machineId: 'databricks:sandboxes/started-command',
+    });
+    expect(db.hostedWebhook.rows[0].status).toBe('completed');
+  });
+
   it('does not start a second executor when Databricks reports an existing sandbox', async () => {
     const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) =>
       init?.body?.toString().includes('execution_timeout')
@@ -1223,6 +1487,141 @@ describe('sandbox workspaces', () => {
       value: 'shared',
       ephemeral: true,
     });
+  });
+
+  it.each(['mount_scoped', 'broad'] as const)(
+    'preserves %s mount acknowledgement when injecting the password',
+    async (authority) => {
+      const source = new Manifest({
+        entries: {
+          data: s3Mount({
+            bucket: 'fixture',
+            mountStrategy: inContainerMountStrategy(),
+            ...(authority === 'mount_scoped'
+              ? {
+                  accessKeyId: 'fixture-key',
+                  secretAccessKey: 'fixture-secret',
+                }
+              : {}),
+          }),
+        },
+      });
+      const manifest =
+        authority === 'mount_scoped'
+          ? source.withInContainerMountCredentialExposureAcknowledged('data')
+          : source.withInContainerMountBroadCredentialExposureAcknowledged(
+              'data',
+            );
+      validateMountCredentialBoundaries(manifest);
+      const validate = (candidate: Manifest) =>
+        authority === 'broad'
+          ? validateMountEnvironmentCredentialBoundaries(candidate, {
+              AWS_ACCESS_KEY_ID: 'ambient-key',
+              AWS_SECRET_ACCESS_KEY: 'ambient-secret',
+            })
+          : validateMountCredentialBoundaries(candidate);
+      validate(manifest);
+      const fake = fakeClient();
+      fake.create.mockImplementation(async ({ manifest }) => {
+        validate(manifest);
+        return { state: { manifest } };
+      });
+      await expect(
+        sandboxService({ ACCOUNT_PASSWORD: 'shared' }).openSandbox(manifest, {
+          client: fake.client,
+        }),
+      ).resolves.toBeDefined();
+      expect(manifest.environment).not.toHaveProperty('ACCOUNT_PASSWORD');
+    },
+  );
+
+  it.each([undefined, 'replacement-password'])(
+    'restores ephemeral credentials through the SDK after saving and resuming (override: %s)',
+    async (password) => {
+      const directory = await mkdtemp(join(tmpdir(), 'resume-credentials-'));
+      const client = new UnixLocalSandboxClient({
+        workspaceBaseDir: directory,
+        snapshot: { type: 'local', baseDir: join(directory, 'snapshots') },
+      });
+      const service = sandboxService({
+        ACCOUNT_PASSWORD: 'configured-password',
+      });
+      let workspace:
+        Awaited<ReturnType<SandboxService['openSandbox']>> | undefined;
+      let resumed:
+        Awaited<ReturnType<SandboxService['resumeSandbox']>> | undefined;
+      try {
+        workspace = await service.openSandbox(
+          new Manifest({ environment: { KEEP: 'retained' } }),
+          { client },
+        );
+        const saved = await service.saveSandbox(workspace, { client });
+        expect(JSON.stringify(saved)).not.toContain('configured-password');
+        await workspace.close?.();
+        resumed = await service.resumeSandbox(saved, { client, password });
+        const result = await resumed.exec!({
+          cmd: 'printf "%s/%s" "$ACCOUNT_PASSWORD" "$KEEP"',
+          login: false,
+        });
+        expect(result.stdout).toBe(
+          `${password ?? 'configured-password'}/retained`,
+        );
+        expect(
+          JSON.stringify(await service.saveSandbox(resumed, { client })),
+        ).not.toContain(password ?? 'configured-password');
+      } finally {
+        await resumed?.close?.();
+        await workspace?.close?.();
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([false, true])(
+    'closes a resumed workspace when credential restoration fails (close fails: %s)',
+    async (closeFails) => {
+      vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      const failure = new Error('credential restoration failed');
+      const close = vi.fn(async () => {
+        if (closeFails) throw new Error('close failed');
+      });
+      const workspace = {
+        state: { manifest: new Manifest() },
+        applyManifest: vi.fn(async () => {
+          throw failure;
+        }),
+        close,
+      };
+      const client = {
+        deserializeSessionState: async () => workspace.state,
+        resume: async () => workspace,
+      } as unknown as SandboxClient;
+      await expect(
+        sandboxService({ ACCOUNT_PASSWORD: 'secret' }).resumeSandbox(
+          {},
+          { client },
+        ),
+      ).rejects.toBe(failure);
+      expect(close).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('rejects credential restoration when a resumed backend cannot apply a manifest', async () => {
+    const workspace = {
+      state: { manifest: new Manifest() },
+      close: vi.fn(async () => {}),
+    };
+    const client = {
+      deserializeSessionState: async () => workspace.state,
+      resume: async () => workspace,
+    } as unknown as SandboxClient;
+    await expect(
+      sandboxService({ ACCOUNT_PASSWORD: 'secret' }).resumeSandbox(
+        {},
+        { client },
+      ),
+    ).rejects.toThrow('cannot restore workspace credentials');
+    expect(workspace.close).toHaveBeenCalledOnce();
   });
 
   it('saves with the client that opened the workspace', async () => {
