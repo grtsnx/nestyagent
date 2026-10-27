@@ -1,7 +1,23 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { z } from 'zod';
-import { Agent, run, Runner, setDefaultOpenAIKey, Tool } from '@openai/agents';
+import {
+  Agent,
+  ModelSettings,
+  run,
+  Runner,
+  setDefaultOpenAIKey,
+  Tool,
+} from '@openai/agents';
+
+type CreateAgentOptions = {
+  model?: string;
+  tools?: Tool[];
+  schema?: z.ZodObject;
+  handoffDescription?: string;
+  modelSettings?: ModelSettings;
+  temperature?: number;
+};
 
 @Injectable()
 export class OpenaiService implements OnModuleInit {
@@ -24,21 +40,26 @@ export class OpenaiService implements OnModuleInit {
   }
 
   // Create a new agent. Leave model out to use the runner model.
+  // modelSettings defaults to medium reasoning effort. Pass settings to change it.
+  // temperature is optional. Leave it out unless the model accepts it.
   createAgent(
     name: string,
     instructions: string,
-    model?: string,
-    tools?: Tool[],
-    schema?: z.ZodObject,
-    handoffDescription?: string,
+    options?: CreateAgentOptions,
   ) {
     return new Agent({
       name,
       instructions,
-      ...(model && { model }),
-      ...(schema && { outputType: schema }),
-      ...(tools && { tools }),
-      ...(handoffDescription && { handoffDescription }),
+      modelSettings: this.modelSettings(
+        options?.modelSettings,
+        options?.temperature,
+      ),
+      ...(options?.model && { model: options.model }),
+      ...(options?.schema && { outputType: options.schema }),
+      ...(options?.tools && { tools: options.tools }),
+      ...(options?.handoffDescription && {
+        handoffDescription: options.handoffDescription,
+      }),
     });
   }
 
@@ -49,27 +70,50 @@ export class OpenaiService implements OnModuleInit {
     instructions: string,
     handoffs: Agent[],
     handoffDescription: string,
-    model?: string,
+    options?: Pick<
+      CreateAgentOptions,
+      'model' | 'modelSettings' | 'temperature'
+    >,
   ) {
     return Agent.create({
       name,
       instructions,
       handoffs,
       handoffDescription,
-      ...(model && { model }),
+      modelSettings: this.modelSettings(
+        options?.modelSettings,
+        options?.temperature,
+      ),
+      ...(options?.model && { model: options.model }),
     });
+  }
+
+  //1. Medium reasoning effort unless the caller sets another effort or other settings.
+  //2. temperature is included only when the caller passes a number, including 0.
+  private modelSettings(
+    settings?: ModelSettings,
+    temperature?: number,
+  ): ModelSettings {
+    return {
+      ...settings,
+      ...(temperature !== undefined && { temperature }),
+      reasoning: {
+        effort: 'medium',
+        ...settings?.reasoning,
+      },
+    };
   }
 
   //1. Run a prompt on an agent. For triage, pass the agent from createTriageAgent.
   //2. That agent reads the prompt and hands it to one specialist in its handoffs.
   //3. context is optional data for your code. The model does not see it.
   async runAgent<TContext>(prompt: string, agent: Agent, context?: TContext) {
-    const options = context === undefined ? undefined : { context };
-
-    if (this.runner) {
-      return await this.runner.run(agent, prompt, options);
+    if (context === undefined) {
+      if (this.runner) return await this.runner.run(agent, prompt);
+      return await run(agent, prompt);
     }
 
-    return await run(agent, prompt, options);
+    if (this.runner) return await this.runner.run(agent, prompt, { context });
+    return await run(agent, prompt, { context });
   }
 }

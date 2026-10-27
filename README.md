@@ -46,7 +46,7 @@ Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS 
 const historyTutor = this.openai.createAgent(
   'History tutor',
   'You answer history questions clearly and concisely.',
-  'gpt-6-astra',
+  { model: 'gpt-6-astra' },
 );
 ```
 
@@ -60,14 +60,13 @@ import { sampleTool } from '@/config/tools';
 const historyTutor = this.openai.createAgent(
   'History tutor',
   'You answer history questions clearly and concisely.',
-  'gpt-6-astra',
-  [sampleTool],
+  { model: 'gpt-6-astra', tools: [sampleTool] },
 );
 ```
 
 ### Add an output schema
 
-`sampleSchema` lives in `src/config/schema/sample.schema.ts`. Pass `undefined` for tools when the agent has a schema and no tools.
+`sampleSchema` lives in `src/config/schema/sample.schema.ts`.
 
 ```typescript
 import { sampleSchema } from '@/config/schema';
@@ -75,24 +74,22 @@ import { sampleSchema } from '@/config/schema';
 const calendarExtractor = this.openai.createAgent(
   'Calendar extractor',
   'Extract calendar events from the supplied text.',
-  'gpt-6-astra',
-  undefined,
-  sampleSchema,
+  { model: 'gpt-6-astra', schema: sampleSchema },
 );
 ```
 
 ### Add a handoff description
 
-`handoffDescription` is optional on a normal agent. Pass `undefined` for tools and schema when you only want the description.
+`handoffDescription` is optional on a normal agent.
 
 ```typescript
 const historyTutor = this.openai.createAgent(
   'History tutor',
   'You answer history questions clearly and concisely.',
-  'gpt-6-astra',
-  undefined,
-  undefined,
-  'Specialist for historical questions',
+  {
+    model: 'gpt-6-astra',
+    handoffDescription: 'Specialist for historical questions',
+  },
 );
 ```
 
@@ -106,7 +103,7 @@ this.openai.createRunner('gpt-6-astra');
 const fastAgent = this.openai.createAgent(
   'Fast support agent',
   'Handle routine support questions.',
-  'gpt-5.6-terra',
+  { model: 'gpt-5.6-terra' },
 );
 
 const generalAgent = this.openai.createAgent(
@@ -123,6 +120,35 @@ const result = await this.openai.runAgent(
 ```
 
 The first run uses `gpt-5.6-terra`. The second run uses `gpt-6-astra`. `result.finalOutput` is the billing answer.
+
+### Reasoning effort
+
+Every agent starts at medium reasoning effort. Pass `modelSettings` to change it. Reasoning effort changes how long the model thinks.
+
+```typescript
+const fastAgent = this.openai.createAgent(
+  'Fast support agent',
+  'Handle routine support questions.',
+  {
+    model: 'gpt-5.6-terra',
+    modelSettings: { reasoning: { effort: 'low' } },
+  },
+);
+```
+
+Leave `modelSettings` out and the effort stays `medium`.
+
+### Temperature
+
+`temperature` is optional. Leave it out and the request does not send one. `0` keeps the wording steady. A higher number, such as `1`, lets the wording vary. `gpt-6-astra` rejects a custom temperature, so leave it out for that model.
+
+```typescript
+const writer = this.openai.createAgent(
+  'Writer',
+  'Rewrite the note in a warmer tone.',
+  { model: 'gpt-5.6-terra', temperature: 0.7 },
+);
+```
 
 ### Run an agent
 
@@ -153,19 +179,19 @@ Build the specialists first. Each specialist can carry an optional `handoffDescr
 const historyTutor = this.openai.createAgent(
   'History tutor',
   'You answer history questions clearly and concisely.',
-  'gpt-6-astra',
-  undefined,
-  undefined,
-  'Specialist for historical questions',
+  {
+    model: 'gpt-6-astra',
+    handoffDescription: 'Specialist for historical questions',
+  },
 );
 
 const mathTutor = this.openai.createAgent(
   'Math tutor',
   'You explain math step by step.',
-  'gpt-6-astra',
-  undefined,
-  undefined,
-  'Specialist for math questions',
+  {
+    model: 'gpt-6-astra',
+    handoffDescription: 'Specialist for math questions',
+  },
 );
 
 const triage = this.openai.createTriageAgent(
@@ -191,10 +217,12 @@ import { sampleTool } from '@/config/tools';
 const historyTutor = this.openai.createAgent(
   'History tutor',
   'You answer history questions clearly and concisely.',
-  'gpt-6-astra',
-  [sampleTool],
-  sampleSchema,
-  'Specialist for historical questions',
+  {
+    model: 'gpt-6-astra',
+    tools: [sampleTool],
+    schema: sampleSchema,
+    handoffDescription: 'Specialist for historical questions',
+  },
 );
 
 const result = await this.openai.runAgent(
