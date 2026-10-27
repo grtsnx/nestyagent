@@ -58,6 +58,10 @@ const environmentSchema = z
     OBSERVE_APP_SECRET: z.string().trim().optional(),
     OBSERVE_SERVICE_ID: z.string().trim().optional(),
     SWAGGER_ENABLED: booleanValue('SWAGGER_ENABLED').optional(),
+    OPENAI_API_KEY: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z.string().trim().min(1).optional(),
+    ),
   })
   .superRefine((environment, context) => {
     if (!environment.OBSERVE_ENABLED) return;
@@ -87,6 +91,7 @@ export interface Environment {
   OBSERVE_APP_SECRET?: string;
   OBSERVE_SERVICE_ID?: string;
   SWAGGER_ENABLED: boolean;
+  OPENAI_API_KEY?: string;
 }
 
 export function validateEnvironment(

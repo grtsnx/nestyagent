@@ -13,6 +13,15 @@ describe('validateEnvironment', () => {
     });
   });
 
+  it('keeps a trimmed OpenAI API key and treats a blank value as unset', () => {
+    expect(
+      validateEnvironment({ OPENAI_API_KEY: '  sk-test  ' }).OPENAI_API_KEY,
+    ).toBe('sk-test');
+    expect(
+      validateEnvironment({ OPENAI_API_KEY: '' }).OPENAI_API_KEY,
+    ).toBeUndefined();
+  });
+
   it('normalizes and deduplicates CORS origins', () => {
     const environment = validateEnvironment({
       CORS_ORIGINS:

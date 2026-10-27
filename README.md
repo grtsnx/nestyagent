@@ -30,6 +30,7 @@ The application validates configuration before it starts. Invalid ports, boolean
 | `CORS_ORIGINS`    | empty                 | Lists exact, comma-separated browser origins. Empty disables CORS.          |
 | `SWAGGER_ENABLED` | on outside production | Enables Swagger, Scalar, and OpenAPI JSON. Set it explicitly in production. |
 | `OBSERVE_ENABLED` | `false`               | Enables NestJS Observe when valid credentials are present.                  |
+| `OPENAI_API_KEY`  | empty                 | Authenticates every OpenAI agent. Blank leaves the shared key unset.        |
 
 Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS origins without paths.
 
