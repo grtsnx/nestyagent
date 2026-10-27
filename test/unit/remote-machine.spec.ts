@@ -4,7 +4,7 @@ import {
   awsTerminateArgs,
   databricksExecutorScript,
   digitalOceanManifest,
-} from '@/lib/sandbox/remote-machine.js';
+} from '@/lib/sandbox/sandbox.service.js';
 
 describe('remote machine commands', () => {
   it('builds the AWS MicroVM run and terminate commands', () => {

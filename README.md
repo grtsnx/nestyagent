@@ -972,7 +972,7 @@ this.sandbox.onHostedSessionCreated({
 
 Store `session.sessionId` with the chat. One session needs its own executor. Use `remoteUrl` unchanged when the executor reconnects.
 
-On this Mac, `startHostedExecutor` runs the executor. Set `REMOTE_MACHINE_PROVIDER` to `aws`, `digitalocean`, `databricks`, or `oci` when the webhook should create that machine instead. `POST /v1/sandbox/hosted-webhook` checks the OpenAI signature with `OPENAI_WEBHOOK_SECRET`. `agent.session.action_required` with `environment_connection` creates the machine. `agent.session.failed` deletes it.
+On this Mac, `startHostedExecutor` runs the executor. Set `REMOTE_MACHINE_PROVIDER` to `aws`, `digitalocean`, `databricks`, or `oci` when the webhook should create that machine instead. `POST /v1/webhook` checks the OpenAI signature with `OPENAI_WEBHOOK_SECRET`. `agent.session.action_required` with `environment_connection` creates the machine. `agent.session.failed` deletes it.
 
 1. In the OpenAI dashboard, add a webhook endpoint aimed at this route. Subscribe to `agent.session.action_required` and `agent.session.failed`.
 2. Copy the signing secret into `OPENAI_WEBHOOK_SECRET` and restart.

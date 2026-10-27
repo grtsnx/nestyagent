@@ -28,7 +28,7 @@ export function configureApplication(
     trustedOrigins: environment.CORS_ORIGINS,
     exclude: [
       {
-        path: 'sandbox/hosted-webhook',
+        path: 'webhook',
         method: RequestMethod.POST,
         version: '1',
       },

@@ -1,9 +1,9 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { spawn } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { promisify } from 'node:util';
 import { run, Session } from '@openai/agents';
 import OpenAI, { APIError } from 'openai';
-import { RemoteMachineProvider, RemoteMachines } from './remote-machine.js';
 import {
   Capabilities,
   Capability,
@@ -79,12 +79,23 @@ export type HostedSession = {
 
 // Follows the current Node release. Pass image when a workspace needs a fixed tag.
 const DOCKER_IMAGE = 'node:latest';
+const runFile = promisify(execFile);
+
+type RemoteMachineProvider =
+  'local' | 'aws' | 'digitalocean' | 'databricks' | 'oci';
+
+type MachineRequest = {
+  sessionId: string;
+  environmentId: string;
+  remoteUrl: string;
+  executorKey: string;
+};
 
 @Injectable()
 export class SandboxService {
   private hostedClient?: OpenAI;
-  private remoteMachines?: RemoteMachines;
   private readonly machineLocks = new Map<string, Promise<void>>();
+  private readonly localExecutors = new Map<string, ChildProcess>();
 
   constructor(private readonly configService: ConfigService) {}
 
@@ -466,7 +477,7 @@ export class SandboxService {
     );
     if (!needsConnection || session.metadata.remote_machine_id) return;
 
-    const machineId = await this.machines().create({
+    const machineId = await this.createRemoteMachine({
       sessionId: session.id,
       environmentId: session.environment.id,
       remoteUrl: session.environment.remote_url,
@@ -485,33 +496,241 @@ export class SandboxService {
       if (session.status !== 'failed') return;
       const machineId = session.metadata.remote_machine_id;
       if (!machineId) return;
-      await this.machines().release(machineId);
+      await this.deleteRemoteMachine(machineId);
     } catch (error) {
       if (error instanceof APIError && error.status === 404) return;
       throw error;
     }
   }
 
-  private machines() {
-    this.remoteMachines ??= new RemoteMachines(
-      {
-        provider: this.remoteProvider(),
-        awsImageArn: this.configService.get<string>('AWS_MICROVM_IMAGE_ARN'),
-        awsExecutionRole: this.configService.get<string>(
+  //1. local starts codex on this Mac. The other providers create a machine that starts codex itself.
+  //2. The id prefix says which provider created the machine, so delete still works if the setting changes.
+  private async createRemoteMachine(request: MachineRequest) {
+    switch (this.remoteProvider()) {
+      case 'local':
+        return this.createLocalMachine(request);
+      case 'aws':
+        return this.createAwsMachine(request);
+      case 'digitalocean':
+        return this.createDigitalOceanMachine(request);
+      case 'databricks':
+        return this.createDatabricksMachine(request);
+      case 'oci':
+        return this.createOciMachine(request);
+    }
+  }
+
+  private async deleteRemoteMachine(machineId: string) {
+    const separator = machineId.indexOf(':');
+    const provider = machineId.slice(0, separator);
+    const id = machineId.slice(separator + 1);
+    if (provider === 'local') return this.deleteLocalMachine(id);
+    if (provider === 'aws') return this.deleteAwsMachine(id);
+    if (provider === 'digitalocean') return this.deleteDigitalOceanMachine(id);
+    if (provider === 'databricks') return this.deleteDatabricksMachine(id);
+    if (provider === 'oci') return this.deleteOciMachine(id);
+    throw new Error(`Unknown remote machine ${provider}.`);
+  }
+
+  private createLocalMachine(request: MachineRequest) {
+    const child = this.startHostedExecutor(request);
+    const pid = child.pid;
+    if (!pid) throw new Error('The local executor did not start.');
+    this.localExecutors.set(String(pid), child);
+    return `local:${pid}`;
+  }
+
+  private deleteLocalMachine(pid: string) {
+    const child = this.localExecutors.get(pid);
+    if (child) child.kill();
+    else process.kill(Number(pid));
+    this.localExecutors.delete(pid);
+  }
+
+  private async createAwsMachine(request: MachineRequest) {
+    const image = requiredSetting(
+      this.configService.get<string>('AWS_MICROVM_IMAGE_ARN'),
+      'AWS_MICROVM_IMAGE_ARN',
+    );
+    const secretArn = requiredSetting(
+      this.configService.get<string>('AWS_MICROVM_SECRET_ARN'),
+      'AWS_MICROVM_SECRET_ARN',
+    );
+    const result = await runFile(
+      'aws',
+      awsRunArgs({
+        image,
+        region: this.configService.get<string>('AWS_REGION'),
+        executionRole: this.configService.get<string>(
           'AWS_MICROVM_EXECUTION_ROLE',
         ),
-        awsSecretArn: this.configService.get<string>('AWS_MICROVM_SECRET_ARN'),
-        awsRegion: this.configService.get<string>('AWS_REGION'),
-        digitalOceanToken: this.configService.get<string>('DIGITALOCEAN_TOKEN'),
-        databricksHost: this.configService.get<string>('DATABRICKS_HOST'),
-        databricksToken: this.configService.get<string>('DATABRICKS_TOKEN'),
-        ociProjectId: this.configService.get<string>('OCI_SANDBOX_PROJECT_ID'),
-        ociToken: this.configService.get<string>('OCI_SANDBOX_TOKEN'),
-        ociCreateUrl: this.configService.get<string>('OCI_SANDBOX_CREATE_URL'),
-      },
-      (request) => this.startHostedExecutor(request),
+        payload: JSON.stringify({
+          environmentId: request.environmentId,
+          remoteUrl: request.remoteUrl,
+          secretArn,
+        }),
+      }),
+      { timeout: 120_000, maxBuffer: 1_000_000 },
     );
-    return this.remoteMachines;
+    const body = JSON.parse(result.stdout) as { microvmId?: string };
+    if (!body.microvmId) throw new Error('AWS did not return a MicroVM id.');
+    return `aws:${body.microvmId}`;
+  }
+
+  private async deleteAwsMachine(id: string) {
+    await runFile(
+      'aws',
+      awsTerminateArgs(id, this.configService.get<string>('AWS_REGION')),
+      { timeout: 120_000, maxBuffer: 1_000_000 },
+    );
+  }
+
+  private async createDigitalOceanMachine(request: MachineRequest) {
+    const token = requiredSetting(
+      this.configService.get<string>('DIGITALOCEAN_TOKEN'),
+      'DIGITALOCEAN_TOKEN',
+    );
+    requiredSetting(request.executorKey, 'OPENAI_EXECUTOR_API_KEY');
+    const url = new URL('https://api.digitalocean.com/v2/agents/sessions');
+    url.searchParams.set('openai_session_id', request.sessionId);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/x-yaml',
+      },
+      body: digitalOceanManifest(request),
+    });
+    const id = readId(await readJson(response));
+    if (!id) throw new Error('DigitalOcean did not return a session id.');
+    return `digitalocean:${id}`;
+  }
+
+  private async deleteDigitalOceanMachine(id: string) {
+    const token = requiredSetting(
+      this.configService.get<string>('DIGITALOCEAN_TOKEN'),
+      'DIGITALOCEAN_TOKEN',
+    );
+    const response = await fetch(
+      `https://api.digitalocean.com/v2/agents/sessions/${encodeURIComponent(id)}`,
+      { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!response.ok && response.status !== 404) {
+      throw new Error(
+        `DigitalOcean delete failed with status ${response.status}.`,
+      );
+    }
+  }
+
+  private async createDatabricksMachine(request: MachineRequest) {
+    const host = databricksHost(
+      this.configService.get<string>('DATABRICKS_HOST'),
+    );
+    const token = requiredSetting(
+      this.configService.get<string>('DATABRICKS_TOKEN'),
+      'DATABRICKS_TOKEN',
+    );
+    requiredSetting(request.executorKey, 'OPENAI_EXECUTOR_API_KEY');
+    const sandboxId = databricksSandboxId(request.sessionId);
+    const created = await fetch(
+      `${host}/api/2.0/sandboxes?sandbox_id=${encodeURIComponent(sandboxId)}`,
+      {
+        method: 'POST',
+        headers: databricksHeaders(token),
+        body: JSON.stringify({
+          spec: { compute: { inactivity_timeout: '900s' } },
+        }),
+      },
+    );
+    const body = await readJson(created);
+    const name =
+      typeof body === 'object' &&
+      body &&
+      'name' in body &&
+      typeof body.name === 'string'
+        ? body.name
+        : `sandboxes/${sandboxId}`;
+    await fetch(`${host}/api/2.0/sandbox-exec/${name}/exec-sync`, {
+      method: 'POST',
+      headers: databricksHeaders(token),
+      body: JSON.stringify({
+        cmd: '/bin/bash',
+        args: ['-lc', databricksExecutorScript(request)],
+        envs: { CODEX_API_KEY: request.executorKey, RUST_LOG: 'info' },
+        execution_timeout: '120s',
+      }),
+    });
+    return `databricks:${name}`;
+  }
+
+  private async deleteDatabricksMachine(name: string) {
+    const host = databricksHost(
+      this.configService.get<string>('DATABRICKS_HOST'),
+    );
+    const token = requiredSetting(
+      this.configService.get<string>('DATABRICKS_TOKEN'),
+      'DATABRICKS_TOKEN',
+    );
+    const response = await fetch(`${host}/api/2.0/${name}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    });
+    if (!response.ok && response.status !== 404) {
+      throw new Error(
+        `Databricks delete failed with status ${response.status}.`,
+      );
+    }
+  }
+
+  private async createOciMachine(request: MachineRequest) {
+    const endpoint = requiredSetting(
+      this.configService.get<string>('OCI_SANDBOX_CREATE_URL'),
+      'OCI_SANDBOX_CREATE_URL',
+    );
+    const projectId = requiredSetting(
+      this.configService.get<string>('OCI_SANDBOX_PROJECT_ID'),
+      'OCI_SANDBOX_PROJECT_ID',
+    );
+    const token = requiredSetting(
+      this.configService.get<string>('OCI_SANDBOX_TOKEN'),
+      'OCI_SANDBOX_TOKEN',
+    );
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        projectId,
+        displayName: `openai-${request.sessionId}`,
+        freeformTags: {
+          environmentId: request.environmentId,
+          remoteUrl: request.remoteUrl,
+        },
+      }),
+    });
+    const id = readId(await readJson(response));
+    if (!id) throw new Error('OCI did not return a sandbox id.');
+    return `oci:${id}`;
+  }
+
+  private async deleteOciMachine(id: string) {
+    const endpoint = requiredSetting(
+      this.configService.get<string>('OCI_SANDBOX_CREATE_URL'),
+      'OCI_SANDBOX_CREATE_URL',
+    );
+    const token = requiredSetting(
+      this.configService.get<string>('OCI_SANDBOX_TOKEN'),
+      'OCI_SANDBOX_TOKEN',
+    );
+    const response = await fetch(
+      `${endpoint.replace(/\/$/, '')}/${encodeURIComponent(id)}`,
+      { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!response.ok && response.status !== 404) {
+      throw new Error(`OCI delete failed with status ${response.status}.`);
+    }
   }
 
   private remoteProvider(): RemoteMachineProvider {
@@ -602,4 +821,116 @@ function isHostedComputer(
   computer: SandboxComputer,
 ): computer is Exclude<SandboxComputer, 'unix' | 'docker'> {
   return computer !== 'unix' && computer !== 'docker';
+}
+
+export function awsRunArgs(input: {
+  image: string;
+  payload: string;
+  region?: string;
+  executionRole?: string;
+}) {
+  return [
+    'lambda-microvms',
+    'run-microvm',
+    '--image-identifier',
+    input.image,
+    '--run-hook-payload',
+    input.payload,
+    '--output',
+    'json',
+    ...(input.executionRole
+      ? ['--execution-role-arn', input.executionRole]
+      : []),
+    ...(input.region ? ['--region', input.region] : []),
+  ];
+}
+
+export function awsTerminateArgs(id: string, region?: string) {
+  return [
+    'lambda-microvms',
+    'terminate-microvm',
+    '--microvm-identifier',
+    id,
+    ...(region ? ['--region', region] : []),
+  ];
+}
+
+export function digitalOceanManifest(request: MachineRequest) {
+  return [
+    'agent: codex-agentapi',
+    'egress:',
+    '  - api.openai.com',
+    '  - codex-cloud-environments.chatgpt.com',
+    'env:',
+    `  CODEX_ENVIRONMENT_ID: ${request.environmentId}`,
+    'secrets:',
+    `  CODEX_API_KEY: ${request.executorKey}`,
+    '',
+  ].join('\n');
+}
+
+export function databricksExecutorScript(request: MachineRequest) {
+  const remote = shellQuote(request.remoteUrl);
+  const environment = shellQuote(request.environmentId);
+  return [
+    'cx=$(mktemp -d -p /home/sandbox-agent)',
+    'rm -f /home/sandbox-agent/codex-exec-server.log',
+    'CODEX_HOME=$cx setsid nohup codex exec-server',
+    `--remote ${remote}`,
+    `--environment-id ${environment}`,
+    '>/home/sandbox-agent/codex-exec-server.log 2>&1 & echo pid=$!',
+  ].join(' ');
+}
+
+function databricksSandboxId(sessionId: string) {
+  const cleaned = sessionId.replace(/[^a-zA-Z0-9-]/g, '').slice(0, 40);
+  return `openai-${cleaned || 'session'}`;
+}
+
+function databricksHost(host: string | undefined) {
+  const value = requiredSetting(host, 'DATABRICKS_HOST');
+  const url = new URL(value);
+  if (url.protocol !== 'https:') {
+    throw new Error('DATABRICKS_HOST must be https.');
+  }
+  return url.origin;
+}
+
+function databricksHeaders(token: string) {
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+  };
+}
+
+function requiredSetting(value: string | undefined, name: string) {
+  if (!value) throw new Error(`${name} is required for this remote machine.`);
+  return value;
+}
+
+async function readJson(response: Response) {
+  if (!response.ok) {
+    throw new Error(
+      `Remote machine request failed with status ${response.status}.`,
+    );
+  }
+  return (await response.json()) as unknown;
+}
+
+function readId(body: unknown) {
+  if (!body || typeof body !== 'object') return;
+  const record = body as Record<string, unknown>;
+  if (typeof record.id === 'string') return record.id;
+  if (typeof record.session_id === 'string') return record.session_id;
+  const session = record.session;
+  if (session && typeof session === 'object' && 'id' in session) {
+    const id = session.id;
+    if (typeof id === 'string') return id;
+  }
+  return;
+}
+
+function shellQuote(value: string) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }

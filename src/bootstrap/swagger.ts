@@ -21,6 +21,10 @@ export function configureSwagger(
         'Server',
         'Core server status, health, and connectivity endpoints.',
       )
+      .addTag(
+        'Webhook',
+        'Signed webhooks. The sandbox webhook creates and deletes a remote machine.',
+      )
       .build();
     const document = SwaggerModule.createDocument(app, options);
     const prefix = `/v${version}`;
