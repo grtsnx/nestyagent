@@ -82,6 +82,7 @@ export async function createApplication(): Promise<{
     CORS_ORIGINS: config.getOrThrow<string[]>('CORS_ORIGINS'),
     OBSERVE_ENABLED: config.getOrThrow<boolean>('OBSERVE_ENABLED'),
     LANGFUSE_ENABLED: config.getOrThrow<boolean>('LANGFUSE_ENABLED'),
+    COMPOSIO_ENABLED: config.getOrThrow<boolean>('COMPOSIO_ENABLED'),
     OBSERVE_APP_KEY: config.get<string>('OBSERVE_APP_KEY'),
     OBSERVE_APP_SECRET: config.get<string>('OBSERVE_APP_SECRET'),
     OBSERVE_SERVICE_ID: config.get<string>('OBSERVE_SERVICE_ID'),

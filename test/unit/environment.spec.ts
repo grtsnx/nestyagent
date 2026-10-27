@@ -11,6 +11,7 @@ describe('validateEnvironment', () => {
       OBSERVE_ENABLED: false,
       SWAGGER_ENABLED: true,
       TRACE_PAYLOADS: false,
+      COMPOSIO_ENABLED: false,
     });
   });
 
@@ -118,6 +119,18 @@ describe('validateEnvironment', () => {
         LANGFUSE_SECRET_KEY: 'sk-lf-test',
         LANGFUSE_BASE_URL: 'http://localhost:3100',
       }).LANGFUSE_ENABLED,
+    ).toBe(true);
+  });
+
+  it('turns Composio on only when a project key is set', () => {
+    expect(validateEnvironment({ COMPOSIO_API_KEY: '' }).COMPOSIO_ENABLED).toBe(
+      false,
+    );
+    expect(
+      validateEnvironment({ COMPOSIO_API_KEY: '  ak_test  ' }).COMPOSIO_API_KEY,
+    ).toBe('ak_test');
+    expect(
+      validateEnvironment({ COMPOSIO_API_KEY: 'ak_test' }).COMPOSIO_ENABLED,
     ).toBe(true);
   });
 

@@ -97,6 +97,7 @@ const environmentSchema = z
     LANGFUSE_PUBLIC_KEY: optionalString(),
     LANGFUSE_SECRET_KEY: optionalString(),
     LANGFUSE_BASE_URL: optionalString(),
+    COMPOSIO_API_KEY: optionalString(),
     TRACE_PAYLOADS: z.preprocess(
       (value) => (value === '' ? undefined : value),
       booleanValue('TRACE_PAYLOADS').optional(),
@@ -158,6 +159,7 @@ export type Environment = Omit<
   OBSERVE_ENABLED: boolean;
   SWAGGER_ENABLED: boolean;
   LANGFUSE_ENABLED: boolean;
+  COMPOSIO_ENABLED: boolean;
   TRACE_PAYLOADS: boolean;
 };
 
@@ -176,5 +178,6 @@ export function validateEnvironment(
       parsed.LANGFUSE_SECRET_KEY &&
       parsed.LANGFUSE_BASE_URL,
     ),
+    COMPOSIO_ENABLED: Boolean(parsed.COMPOSIO_API_KEY),
   };
 }

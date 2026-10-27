@@ -71,6 +71,7 @@ The app checks these values before it starts. A bad port, a bad true/false value
 | `OBSERVE_ENABLED`                                                 | `false`               | Turns on NestJS Observe.                                                                                      |
 | `OBSERVE_APP_KEY`, `OBSERVE_APP_SECRET`, `OBSERVE_SERVICE_ID`     | empty                 | NestJS Observe login. Needed when `OBSERVE_ENABLED` is on.                                                    |
 | `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` | empty                 | Self-hosted Langfuse. Set all three to record traces there. Leave them empty to stay on the OpenAI dashboard. |
+| `COMPOSIO_API_KEY`                                                | empty                 | Composio project key. Empty leaves Gmail, Slack, and other connected apps off. The app starts without it.     |
 | `OPENAI_API_KEY`                                                  | required              | Your OpenAI key. Every helper uses it. The app does not start without it.                                     |
 | `DATABASE_URL`                                                    | empty                 | Your Postgres address. The app starts without it. Chats, saved approvals, and the webhook need it.            |
 | `OPENAI_HOSTED_MODEL`                                             | `gpt-6-astra`         | The model for a self-hosted session when you do not pick one.                                                 |
@@ -183,6 +184,24 @@ const menuHelper = this.openai.createAgent(
 ```
 
 Keep your own tools in `src/config/tools`. `sample.tool.ts` there is a starting template.
+
+### Connected apps
+
+`ComposioService` gives a helper the account owner's Gmail, Slack, and the other apps Composio hosts. Leave `COMPOSIO_API_KEY` empty and it stays off. Inject `ComposioService` the same way you inject `OpenaiService`.
+
+```typescript
+const connected = await this.composio.tools(ownerId, {
+  sessionId: savedSessionId,
+});
+
+const helper = this.openai.createAgent(
+  'Front desk',
+  'Help the owner. When an app needs permission, share the Connect Link and wait.',
+  { tools: connected.tools },
+);
+```
+
+`ownerId` is a stable id for that account, the same kind of id you pass as `ownerId` on an approval. Store `connected.sessionId` with that account. Pass it back as `sessionId` on the next message so the same connections continue. Leave `sessionId` out the first time.
 
 ### See the run
 
