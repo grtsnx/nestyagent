@@ -1,7 +1,8 @@
 import { z } from 'zod';
 
+// A Sunny Bakery order. Pass it as schema and the agent fills it in.
 export const sampleSchema = z.object({
-  name: z.string(),
-  date: z.string(),
-  participants: z.array(z.string()),
+  item: z.string(),
+  quantity: z.number(),
+  pickupDay: z.string(),
 });

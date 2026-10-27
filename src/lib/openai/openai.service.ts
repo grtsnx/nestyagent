@@ -300,12 +300,12 @@ export class OpenaiService implements OnModuleInit {
   //6. stream is optional. stream: true returns a streamed result. Wait for completed, then approve or reject.
   //7. outputGuardrailBlockedMessage is optional. It replaces a blocked tool result.
   //8. When a tool pauses, the result carries interruptions. approve or reject, then resumeAgent.
-  runAgent<TAgent extends AnyAgent, TContext = undefined>(
+  runAgent<TAgent extends AnyAgent, TContext = unknown>(
     prompt: string,
     agent: TAgent,
     options: RunAgentOptions<TContext> & Streamed,
   ): Promise<StreamedRunResult<TContext, TAgent>>;
-  runAgent<TAgent extends AnyAgent, TContext = undefined>(
+  runAgent<TAgent extends AnyAgent, TContext = unknown>(
     prompt: string,
     agent: TAgent,
     options?: RunAgentOptions<TContext> & NotStreamed,

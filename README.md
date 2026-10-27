@@ -164,7 +164,7 @@ const result = await this.openai.runAgent(
 result.finalOutput; // { item: 'croissant', quantity: 2, pickupDay: 'Saturday' }
 ```
 
-Without a schema, `finalOutput` is text. Keep your own schemas in `src/config/schema`. `sample.schema.ts` there is a starting template.
+Without a schema, `finalOutput` is text. `src/config/schema/sample.schema.ts` holds this same order form as `sampleSchema`, so you can import it with `import { sampleSchema } from '@/config/schema'`. Keep your own schemas there too.
 
 ### Pass your own data
 

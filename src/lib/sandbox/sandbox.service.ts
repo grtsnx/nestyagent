@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
-import { run, Session } from '@openai/agents';
+import { run, Session, type TextOutput } from '@openai/agents';
 import OpenAI, { APIError } from 'openai';
 import {
   Capabilities,
@@ -63,6 +63,9 @@ type CreateSandboxAgentOptions = AgentGuardrails & {
 };
 
 export type SandboxWorkspace = SandboxSession;
+
+// Any sandbox agent, whatever its context or output type.
+type AnySandboxAgent = SandboxAgent<any, any>;
 
 type HostedSessionOptions = {
   model?: string;
@@ -145,7 +148,8 @@ export class SandboxService {
     instructions: string,
     options?: CreateSandboxAgentOptions,
   ) {
-    return new SandboxAgent({
+    // Explicit types keep the guardrail list from changing the agent's text output.
+    return new SandboxAgent<unknown, TextOutput>({
       name,
       instructions,
       capabilities: this.capabilities(options),
@@ -240,7 +244,7 @@ export class SandboxService {
   //3. chat is optional. Reuse one session to continue the messages.
   async runSandbox(
     prompt: string,
-    agent: SandboxAgent,
+    agent: AnySandboxAgent,
     options: {
       workspace: SandboxWorkspace;
       chat?: Session;
@@ -256,7 +260,7 @@ export class SandboxService {
   //2. Takes the same computer options as openSandbox. manifest replaces the agent's default manifest.
   async runSandboxOnce(
     prompt: string,
-    agent: SandboxAgent,
+    agent: AnySandboxAgent,
     options?: FreshSandboxOptions & { chat?: Session },
   ) {
     return await run(agent, prompt, {
@@ -269,7 +273,7 @@ export class SandboxService {
   //2. Leave workspace out for a fresh workspace on each call, built from the same options as openSandbox.
   //3. needsApproval is optional. Pass true to always pause, or a function that pauses some calls.
   async asTool(
-    agent: SandboxAgent,
+    agent: AnySandboxAgent,
     options?: FreshSandboxOptions & {
       toolName?: string;
       toolDescription?: string;
@@ -772,7 +776,7 @@ export class SandboxService {
 
   // A client and manifest for a workspace the SDK creates and deletes on its own.
   private async freshSandbox(
-    agent: SandboxAgent,
+    agent: AnySandboxAgent,
     options?: FreshSandboxOptions,
   ) {
     return {

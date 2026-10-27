@@ -101,6 +101,43 @@ describe('OpenaiService orchestration', () => {
     );
   });
 
+  it('types a resumed run like the run it continues', () => {
+    const openai = service();
+    const helper = openai.createAgent('Order helper', 'Track orders.');
+    // The typecheck verifies these. The runs are only typed, never started.
+    const first = () => openai.runAgent('Cancel order 123.', helper);
+    const resumed = () =>
+      openai.resumeAgent(
+        helper,
+        {} as Parameters<typeof openai.saveRun>[0]['state'],
+      );
+
+    expectTypeOf<Awaited<ReturnType<typeof resumed>>>().toEqualTypeOf<
+      Awaited<ReturnType<typeof first>>
+    >();
+  });
+
+  it('runs a created sandbox agent without a type error', () => {
+    const openai = service();
+    const sandbox = new SandboxService(
+      { getOrThrow: () => 'sk-test' } as unknown as ConfigService,
+      openai,
+    );
+    const guard = openai.outputGuardrail(
+      'Keep the recipe secret',
+      async () => ({
+        tripwireTriggered: false,
+        outputInfo: null,
+      }),
+    );
+    const siteHelper = sandbox.createSandboxAgent('Site helper', 'Build.', {
+      outputGuardrails: [guard],
+    });
+
+    expectTypeOf(sandbox.runSandboxOnce).toBeCallableWith('Hi.', siteHelper);
+    expectTypeOf(sandbox.asTool).toBeCallableWith(siteHelper);
+  });
+
   it('leaves guardrails off until the caller passes them', () => {
     const openai = service();
     const check = openai.inputGuardrail('Math homework', async () => ({
