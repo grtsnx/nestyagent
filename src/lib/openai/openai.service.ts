@@ -61,6 +61,13 @@ import { PrismaService } from '../prisma/prisma.service.js';
 
 const RUN_GONE = 'This paused run was already taken or does not exist.';
 
+// A saved run from another agent or configuration version. It can be cancelled, never resumed.
+export class AgentVersionMismatchError extends ConflictException {
+  constructor() {
+    super('The saved agent or configuration version does not match.');
+  }
+}
+
 // Any agent, whatever its context or output type.
 type AnyAgent = Agent<any, any>;
 
@@ -963,10 +970,11 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
     id: string,
     options?: RunAccess & { message?: string },
   ) {
-    const row = await this.readRun(agent, id, options ?? {});
+    // A run saved by an older agent version can still be cancelled: nothing executes.
+    const row = await this.readRun(agent, id, options ?? {}, false);
     const keys = [`run:${id}`, ...(row.chatId ? [`chat:${row.chatId}`] : [])];
     return await this.prisma.withLock(keys, async () => {
-      const current = await this.readRun(agent, id, options ?? {});
+      const current = await this.readRun(agent, id, options ?? {}, false);
       if (
         current.status === 'completed' &&
         current.recoveryNote === 'cancelled'
@@ -976,21 +984,10 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
         throw new ConflictException(
           'Only a waiting approval can be cancelled. Reconcile interrupted actions first.',
         );
-      const state = await RunState.fromString(agent, current.state);
-      const result = new RunResult(state);
-      const retained = new Set(result.history.map(historyItemKey));
-      const discarded = new Map<string, number>();
-      for (const item of result.newItems) {
-        if (item.type === 'tool_approval_item') continue;
-        const key = historyItemKey(item.rawItem);
-        if (!retained.has(key))
-          discarded.set(key, (discarded.get(key) ?? 0) + 1);
-      }
-      // Hosted approvals may be retained by the SDK's ordinary continuation history.
-      for (const item of state.getInterruptions()) {
-        const key = historyItemKey(item.rawItem);
-        if (!discarded.has(key)) discarded.set(key, 1);
-      }
+      // Only a database chat needs the saved state, to remove the unanswered turn.
+      const discarded = current.chatId
+        ? await discardedHistory(agent, current.state)
+        : new Map<string, number>();
       await this.prisma.transaction(async (tx) => {
         const changed = await tx.pausedRun.updateMany({
           where: { id, version: current.version, status: 'waiting' },
@@ -1083,7 +1080,13 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private async readRun(agent: AnyAgent, id: string, access: RunAccess) {
+  // checkVersion is off only for cancelling, which never runs the saved agent.
+  private async readRun(
+    agent: AnyAgent,
+    id: string,
+    access: RunAccess,
+    checkVersion = true,
+  ) {
     if (!z.uuid().safeParse(id).success) throw new Error(RUN_GONE);
     const row = await this.prisma.connection.pausedRun.findUnique({
       where: { id },
@@ -1105,11 +1108,11 @@ export class OpenaiService implements OnModuleInit, OnModuleDestroy {
       throw new Error(RUN_GONE);
     if (
       (row.agentName && row.agentName !== agent.name) ||
-      (row.agentVersion && row.agentVersion !== access.agentVersion)
+      (checkVersion &&
+        row.agentVersion &&
+        row.agentVersion !== access.agentVersion)
     ) {
-      throw new ConflictException(
-        'The saved agent or configuration version does not match.',
-      );
+      throw new AgentVersionMismatchError();
     }
     return row;
   }
@@ -1641,6 +1644,25 @@ function serializeState(state: RunState<any, any>) {
   } finally {
     runContext.context = live;
   }
+}
+
+// History items a cancelled run added, counted by key, so exactly those are removed.
+async function discardedHistory(agent: AnyAgent, saved: string) {
+  const state = await RunState.fromString(agent, saved);
+  const result = new RunResult(state);
+  const retained = new Set(result.history.map(historyItemKey));
+  const discarded = new Map<string, number>();
+  for (const item of result.newItems) {
+    if (item.type === 'tool_approval_item') continue;
+    const key = historyItemKey(item.rawItem);
+    if (!retained.has(key)) discarded.set(key, (discarded.get(key) ?? 0) + 1);
+  }
+  // Hosted approvals may be retained by the SDK's ordinary continuation history.
+  for (const item of state.getInterruptions()) {
+    const key = historyItemKey(item.rawItem);
+    if (!discarded.has(key)) discarded.set(key, 1);
+  }
+  return discarded;
 }
 
 function isUserMessage(item: AgentInputItem) {

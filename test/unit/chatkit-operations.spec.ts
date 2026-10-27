@@ -1,6 +1,7 @@
 import { vi } from 'vitest';
 import {
   ChatKitService,
+  CHAT_PAUSED,
   CustomStreamError,
   MemoryStore,
   StreamError,
@@ -218,9 +219,16 @@ describe('ChatKit durable operations', () => {
     ).toContainEqual(
       expect.objectContaining({ type: 'error', allow_retry: false }),
     );
-    await expect(
-      send(server, 'threads.add_client_tool_output', params),
-    ).rejects.toThrow(/reconcil/i);
+    expect(
+      await send(server, 'threads.add_client_tool_output', params),
+    ).toEqual([
+      {
+        type: 'error',
+        code: 'custom',
+        message: CHAT_PAUSED,
+        allow_retry: false,
+      },
+    ]);
     expect(server.calls).toBe(1);
   });
   it('does not apply a duplicate completed result to the next browser tool', async () => {
@@ -303,12 +311,19 @@ describe('ChatKit durable operations', () => {
       },
     });
     const server = new Server(store);
-    await expect(
-      send(server, 'threads.add_user_message', {
+    expect(
+      await send(server, 'threads.add_user_message', {
         thread_id: thread.id,
         input: { content: [{ type: 'input_text', text: 'new message' }] },
       }),
-    ).rejects.toThrow(/reconcil/i);
+    ).toEqual([
+      {
+        type: 'error',
+        code: 'custom',
+        message: CHAT_PAUSED,
+        allow_retry: false,
+      },
+    ]);
     expect(
       (await store.loadThreadItems(thread.id, null, 10, 'asc')).data,
     ).toHaveLength(0);
@@ -356,9 +371,16 @@ describe('ChatKit durable operations', () => {
     ).toContainEqual(
       expect.objectContaining({ type: 'error', allow_retry: false }),
     );
-    await expect(
-      send(server, 'threads.add_client_tool_output', params),
-    ).rejects.toThrow(/reconcil/i);
+    expect(
+      await send(server, 'threads.add_client_tool_output', params),
+    ).toEqual([
+      {
+        type: 'error',
+        code: 'custom',
+        message: CHAT_PAUSED,
+        allow_retry: false,
+      },
+    ]);
     expect(await store.loadItem(thread.id, 'tool_1')).toMatchObject({
       status: 'completed',
       output: 'value',

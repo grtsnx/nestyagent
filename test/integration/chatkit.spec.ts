@@ -173,7 +173,7 @@ describe('ChatKit in Postgres', () => {
     expect(auth.verifyAttachment(image.id, alice.userId, signature)).toBe(true);
 
     await store.deleteThread(mine.id, alice);
-    await expect(store.loadAttachmentForLink(image.id)).rejects.toThrow(
+    await expect(store.loadAttachmentInfo(image.id)).rejects.toThrow(
       NotFoundError,
     );
   });

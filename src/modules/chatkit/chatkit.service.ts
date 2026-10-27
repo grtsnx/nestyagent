@@ -1,14 +1,15 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createHash } from 'node:crypto';
 import { RunState, type Agent, type StreamedRunResult } from '@openai/agents';
 import { toFile } from 'openai';
 import { z } from 'zod';
 import {
   actionConfig,
+  CHAT_PAUSED,
   AgentContext,
   ChatKitService,
   CustomStreamError,
+  NotFoundError,
   streamAgentResponse,
   ThreadItemConverter,
   type Action,
@@ -23,6 +24,7 @@ import {
   type WidgetRoot,
 } from '@/lib/chatkit/chatkit.service.js';
 import {
+  AgentVersionMismatchError,
   OpenaiService,
   type RunAgentOptions,
 } from '@/lib/openai/openai.service.js';
@@ -38,8 +40,12 @@ import {
 const HISTORY_ITEMS = 50;
 const TITLE_LENGTH = 60;
 const DEFAULT_TRANSCRIPTION_MODEL = 'gpt-4o-mini-transcribe';
-// Bump when the helper's tools or other execution policy changes.
-const AGENT_REVISION = 'mssuzie-chatkit-v1';
+//1. Bump when the helper's tools or other execution policy changes.
+//2. Editing the system prompt does not change it, so waiting approvals stay answerable.
+const AGENT_VERSION = 'mssuzie-chatkit-v1';
+const APPROVED = 'Approved.';
+const DECLINED = 'Declined.';
+const EXPIRED = 'This request expired after an update. Please ask again.';
 
 // The approval buttons send these. The client is untrusted, so the shape is checked.
 const approvalAction = z.object({
@@ -108,7 +114,7 @@ export class MsSuzieChatKitService extends ChatKitService<ChatKitContext> {
     const prompt = await this.systemPrompts.get('mssuzie');
     return {
       agent: this.agent().clone({ instructions: prompt.content }),
-      agentVersion: `${AGENT_REVISION}:${createHash('sha256').update(prompt.content).digest('hex')}`,
+      agentVersion: AGENT_VERSION,
     };
   }
 
@@ -131,6 +137,15 @@ export class MsSuzieChatKitService extends ChatKitService<ChatKitContext> {
   ): Promise<WidgetItem> {
     return this.prisma.withLock(`chatkit:${threadId}`, async () => {
       const thread = await this.store.loadThread(threadId, context);
+      const owned = await this.prisma.connection.pausedRun.findFirst({
+        where: {
+          id: runId,
+          chatkitThreadId: threadId,
+          ownerId: context.userId,
+        },
+        select: { id: true },
+      });
+      if (!owned) throw new NotFoundError('Approval not found.');
       const { agent, agentVersion } = await this.configuredAgent();
       const checkpoint = this.checkpointCard(thread, context);
       await this.openai.recoverRun(agent, runId, {
@@ -144,24 +159,26 @@ export class MsSuzieChatKitService extends ChatKitService<ChatKitContext> {
     });
   }
 
-  // Called before the protocol mutates history for a new turn or retry.
+  //1. Called before the protocol changes history for a new turn or retry.
+  //2. A new message is a "no" to a waiting approval: it is cancelled, and nothing runs.
+  //3. An interrupted action may already have happened, so the chat waits for an admin check.
   async prepareRespond(
     thread: ThreadMetadata,
     _input: UserMessageItem | undefined,
     context: ChatKitContext,
   ) {
     await this.store.loadThread(thread.id, context);
-    const pending = await this.prisma.connection.pausedRun.findMany({
+    const open = await this.prisma.connection.pausedRun.findMany({
       where: {
         chatkitThreadId: thread.id,
         status: { in: ['waiting', 'running', 'recovery_required', 'taken'] },
       },
-      take: 1,
+      select: { id: true, status: true, version: true },
     });
-    if (pending.length)
-      throw new ConflictException(
-        'Answer or reconcile the pending approval before sending another message.',
-      );
+    if (open.some((run) => run.status !== 'waiting'))
+      throw new CustomStreamError(CHAT_PAUSED);
+    for (const run of open)
+      await this.closeApproval(thread.id, run, DECLINED, context);
   }
 
   async *respond(
@@ -169,7 +186,6 @@ export class MsSuzieChatKitService extends ChatKitService<ChatKitContext> {
     input: UserMessageItem | undefined,
     context: ChatKitContext,
   ): AsyncGenerator<ThreadStreamEvent> {
-    await this.prepareRespond(thread, input, context);
     // A new thread is named after its first message. thread.updated is sent automatically.
     if (input && !thread.title) thread.title = titleOf(input);
     const recent = await this.store.loadThreadItems(
@@ -215,32 +231,50 @@ export class MsSuzieChatKitService extends ChatKitService<ChatKitContext> {
     if (!parsed.success)
       throw new CustomStreamError('This action is not supported.');
     const approved = parsed.data.type === 'approval.approve';
+    const run = {
+      id: parsed.data.payload.runId,
+      version: parsed.data.payload.version,
+    };
     const { agent, agentVersion } = await this.configuredAgent();
     let state: RunState<unknown, Agent>;
     let card: WidgetItem;
     try {
       await this.store.loadThread(thread.id, context);
-      state = await this.openai.loadRun(agent, parsed.data.payload.runId, {
-        ownerId: context.userId,
-        agentVersion,
-        chatkitThreadId: thread.id,
-        version: parsed.data.payload.version,
-      });
-      const expectedId = approvalItemId(
-        parsed.data.payload.runId,
-        parsed.data.payload.version,
-      );
+      const expectedId = approvalItemId(run.id, run.version);
       if (sender && sender.id !== expectedId)
         throw new Error('Wrong approval card.');
       const stored = await this.store.loadItem(thread.id, expectedId, context);
       if (stored.type !== 'widget') throw new Error('Wrong approval card.');
       card = stored;
-    } catch {
+      state = await this.openai.loadRun(agent, run.id, {
+        ownerId: context.userId,
+        agentVersion,
+        chatkitThreadId: thread.id,
+        version: run.version,
+      });
+    } catch (error) {
+      // Saved before an update to the helper's tools: it can never run, so it is closed.
+      // A finished old run cannot be cancelled; that reads as already answered.
+      if (error instanceof AgentVersionMismatchError) {
+        const closed = await this.closeApproval(
+          thread.id,
+          run,
+          EXPIRED,
+          context,
+        ).catch(() => undefined);
+        if (closed) {
+          yield { type: 'thread.item.replaced', item: closed };
+          return;
+        }
+      }
       throw new CustomStreamError('This request was already answered.');
     }
     if (approved) this.openai.approve({ state });
     else this.openai.reject({ state }, { message: 'The user declined.' });
-    const answered = { ...card, widget: answeredCard(approved) };
+    const answered = {
+      ...card,
+      widget: answeredCard(approved ? APPROVED : DECLINED),
+    };
     const agentContext = this.agentContext(thread, context);
     // The saved state keeps only the thread id. Give the run its live ChatKit context back.
     state._context.context = agentContext;
@@ -296,6 +330,32 @@ export class MsSuzieChatKitService extends ChatKitService<ChatKitContext> {
       store: this.store,
       requestContext: context,
     });
+  }
+
+  // Cancels a waiting approval without running it, then shows the outcome on its card.
+  private async closeApproval(
+    threadId: string,
+    run: { id: string; version: number },
+    outcome: string,
+    context: ChatKitContext,
+  ) {
+    // The card belongs to the version being closed; cancelling moves the version on.
+    const cardId = approvalItemId(run.id, run.version);
+    await this.openai.cancelRun(this.agent(), run.id, {
+      ownerId: context.userId,
+      chatkitThreadId: threadId,
+    });
+    try {
+      const card = await this.store.loadItem(threadId, cardId, context);
+      if (card.type !== 'widget') return undefined;
+      const closed = { ...card, widget: answeredCard(outcome) };
+      await this.store.saveItem(threadId, closed, context);
+      return closed;
+    } catch (error) {
+      // The card was deleted with its message; the run is still cancelled.
+      if (error instanceof NotFoundError) return undefined;
+      throw error;
+    }
   }
 
   private checkpointCard(thread: ThreadMetadata, context: ChatKitContext) {
@@ -390,14 +450,14 @@ export function approvalCard(
   } as WidgetRoot;
 }
 
-function answeredCard(approved: boolean): WidgetRoot {
+function answeredCard(outcome: string): WidgetRoot {
   return {
     type: 'Card',
     size: 'md',
     children: [
       {
         type: 'Text',
-        value: approved ? 'Approved.' : 'Declined.',
+        value: outcome,
         size: 'sm',
       },
     ],

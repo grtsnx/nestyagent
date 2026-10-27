@@ -224,6 +224,11 @@ describe('ChatKit over HTTP', () => {
       .post(`${upload.pathname}?sig=wrong`)
       .attach('file', Buffer.from('hello'), 'notes.txt')
       .expect(404);
+    // More bytes than were announced are refused, and the link still works after.
+    await http()
+      .post(upload.pathname + upload.search)
+      .attach('file', Buffer.from('hello, world'), 'notes.txt')
+      .expect(400);
     const done = await http()
       .post(upload.pathname + upload.search)
       .attach('file', Buffer.from('hello'), 'notes.txt')
@@ -240,5 +245,52 @@ describe('ChatKit over HTTP', () => {
         params: { name: 'big.bin', size: 10 ** 9, mime_type: 'text/plain' },
       })
       .expect(400);
+  });
+
+  it('lets only an admin recover a chat, and only one that needs it', async () => {
+    const userId = `guardian-${Date.now()}-recover`;
+    vi.spyOn(OpenAIProvider.prototype, 'getModel').mockResolvedValue(
+      scriptedModel([{ text: 'Hello.' }]),
+    );
+    // Fetch the token first: supertest closes the shared server after each request.
+    const token = await tokenFor(userId);
+    const created = await http()
+      .post('/v1/chatkit')
+      .set('Authorization', token)
+      .send({
+        type: 'threads.create',
+        params: {
+          input: {
+            content: [{ type: 'input_text', text: 'Hi' }],
+            attachments: [],
+            inference_options: {},
+          },
+        },
+      })
+      .expect(200);
+    const threadId = events(created.text)[0].thread.id as string;
+    const body = { userId, decision: 'cancel', note: 'Checked: nothing ran.' };
+
+    await http()
+      .post(`/v1/chatkit/threads/${threadId}/recover`)
+      .send(body)
+      .expect(401);
+    await http()
+      .post(`/v1/chatkit/threads/${threadId}/recover`)
+      .set('x-admin-key', ADMIN_KEY)
+      .send(body)
+      .expect(400);
+    await http()
+      .post(`/v1/chatkit/threads/${threadId}/recover`)
+      .set('x-admin-key', ADMIN_KEY)
+      .send({ ...body, userId: 'someone-else' })
+      .expect(404);
+    await http()
+      .post(
+        `/v1/chatkit/threads/${threadId}/approvals/0192f1e2-0000-7000-8000-000000000001/recover`,
+      )
+      .set('x-admin-key', ADMIN_KEY)
+      .send({ userId, version: 0, note: 'Checked.' })
+      .expect(404);
   });
 });

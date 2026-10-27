@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   ChatKitService,
+  CHAT_PAUSED,
   CustomStreamError,
   MemoryStore,
   type ThreadMetadata,
@@ -188,7 +189,7 @@ describe('ChatKit operation stream lifecycle', () => {
     await stream.return?.(undefined);
     expect(f.server.closed).toBe(1);
     expect(await f.status()).toBe('recovery_required');
-    await expect((await f.open()).next()).rejects.toThrow(/reconcil/i);
+    expect((await (await f.open()).next()).value).toContain(CHAT_PAUSED);
   });
 
   it('does not override an explicitly safe retry decision during iterator shutdown', async () => {

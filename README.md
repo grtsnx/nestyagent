@@ -705,13 +705,15 @@ The code is in three places:
 
 ### Routes
 
-| Route                                     | Who calls it                     | What it does                                                         |
-| ----------------------------------------- | -------------------------------- | -------------------------------------------------------------------- |
-| `POST /v1/chatkit/tokens`                 | Your backend, with the admin key | Gives one signed-in user a short-lived ChatKit token.                |
-| `POST /v1/chatkit`                        | The ChatKit window               | Every chat request: messages, history, actions, feedback, and voice. |
-| `POST /v1/chatkit/attachments`            | The ChatKit window               | Direct upload of one file.                                           |
-| `POST /v1/chatkit/attachments/:id/upload` | The ChatKit window               | Second step of a two-phase upload, through a signed link.            |
-| `GET /v1/chatkit/attachments/:id/content` | The browser                      | Shows an image, or downloads a file, through a signed link.          |
+| Route                                                         | Who calls it                     | What it does                                                            |
+| ------------------------------------------------------------- | -------------------------------- | ----------------------------------------------------------------------- |
+| `POST /v1/chatkit/tokens`                                     | Your backend, with the admin key | Gives one signed-in user a short-lived ChatKit token.                   |
+| `POST /v1/chatkit`                                            | The ChatKit window               | Every chat request: messages, history, actions, feedback, and voice.    |
+| `POST /v1/chatkit/attachments`                                | The ChatKit window               | Direct upload of one file.                                              |
+| `POST /v1/chatkit/attachments/:id/upload`                     | The ChatKit window               | Second step of a two-phase upload, through a signed link.               |
+| `GET /v1/chatkit/attachments/:id/content`                     | The browser                      | Shows an image, or downloads a file, through a signed link.             |
+| `POST /v1/chatkit/threads/:threadId/recover`                  | An admin, with the admin key     | Unpauses a chat after an interrupted browser tool or retry was checked. |
+| `POST /v1/chatkit/threads/:threadId/approvals/:runId/recover` | An admin, with the admin key     | Shows an interrupted approval's card again, after it was checked.       |
 
 ### Give each user a token
 
@@ -858,10 +860,10 @@ Only one answer runs per chat at a time, across all servers. The first turn acqu
 
 Two ways to upload. Pick one with `uploadStrategy`:
 
-| Strategy                                                    | How it works                                                                                                                                                        |
-| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `{ type: 'direct', uploadUrl: '…/v1/chatkit/attachments' }` | The window sends the file in one request, with the user's token.                                                                                                    |
-| `{ type: 'two_phase' }`                                     | The window first asks for an upload link, then sends the file there. The upload permission expires after 15 minutes and is consumed once; it needs no bearer token. |
+| Strategy                                                    | How it works                                                                                                                                                                                                    |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `{ type: 'direct', uploadUrl: '…/v1/chatkit/attachments' }` | The window sends the file in one request, with the user's token.                                                                                                                                                |
+| `{ type: 'two_phase' }`                                     | The window first asks for an upload link, then sends the file there. The upload permission expires after 15 minutes, works once, and refuses a file larger than the window announced; it needs no bearer token. |
 
 - The file and its bytes are saved atomically in `chatkit_attachments`. An attachment binds to one thread and cannot move to another; upload it again to reuse it elsewhere. Deleting the chat deletes its files.
 - Images get a `preview_url`. It is a signed link that only works for that file and its owner, so the image shows in the chat without a token.
@@ -967,8 +969,12 @@ widgets: {
 When MsSuzie calls a tool that needs a yes, like `cancelOrder`, the run pauses and saves itself (see Decide later). The chat shows a card with the tool and its inputs, and **Approve** and **Decline** buttons.
 
 - Only the user who owns the run can answer it. Anyone else gets "This request was already answered."
-- A checkpoint and its approval card commit together. Each action binds to the user, original thread, card, and checkpoint version. Newly saved runs also pin the prompt text hash and `AGENT_REVISION`; increment that constant when tool behavior changes incompatibly. A stale card cannot approve a later pause.
-- The card changes to "Approved." or "Declined." only after the saved run is claimed. Waiting or interrupted approvals block new turns before chat history changes.
+- A checkpoint and its approval card commit together. Each action binds to the user, original thread, card, and checkpoint version. A stale card cannot approve a later pause.
+- Editing MsSuzie's system prompt does not touch waiting cards: they can still be answered, and the next step uses the new prompt.
+- Runs also save `AGENT_VERSION` from `src/modules/chatkit/chatkit.service.ts`. Change it when MsSuzie's tools change in a way an old run cannot handle. A card saved before that change closes as "This request expired after an update. Please ask again." when clicked, and nothing runs.
+- The card changes to "Approved." or "Declined." only after the saved run is claimed.
+- **A new message means no.** If the customer types instead of clicking, the waiting request is cancelled without running, its card shows "Declined.", and MsSuzie answers the new message.
+- **An interrupted action pauses the chat.** If a server stops while an approved action runs, nobody knows whether it happened. The chat shows "This chat is paused while the team checks an earlier action. Please try again later." until an admin checks it (see below).
 - Deleting the thread deletes its live approval checkpoints. Another thread cannot resume them. A second click cannot execute a completed checkpoint again.
 
 ### Tools the browser runs (client tools)
@@ -1006,34 +1012,25 @@ Accepted results and continuation markers commit together. An explicitly retryab
 
 For custom clients, set `metadata.client_tool_call_id` on every tool-result request to the pending item's `call_id`. The first call accepts the stock request shape; later new calls require this identity so a delayed earlier result cannot be assigned to the wrong tool. An identical retry of the currently completed result does nothing. Custom clients that use multiple browser tools must supply this field through their request adapter. Set `metadata.operation_id` to a new id for each deliberate retry, preserving it on network retries. Without that id, repeating a successful retry for the same message does nothing. These fields resolve ambiguities in the stock request shape.
 
-A trusted operator can reconcile an interrupted continuation through `MsSuzieChatKitService` after inspecting any external effects:
+**Unpause a chat.** An admin first checks the real system, for example whether order 42 was really cancelled, then calls one of these with the admin key. Both take the same thread lock as chat requests and check the owner. Neither undoes an action, so check first.
 
-```typescript
-await chatkitService.recoverOperation(
-  threadId,
-  {
-    decision: 'retry',
-    note: 'Verified that the remote action did not execute.',
-  },
-  { userId: ownerId, baseUrl: publicApiUrl },
-);
+When a browser tool or a retry was interrupted, run it again (`retry`) or close it (`cancel`):
+
+```bash
+curl -X POST https://api.sunnybakery.example/v1/chatkit/threads/thr_…/recover \
+  -H "x-admin-key: $ADMIN_API_KEY" -H "content-type: application/json" \
+  -d '{"userId": "customer-42", "decision": "cancel", "note": "Checked: the basket was not changed."}'
 ```
 
-Use `decision: 'cancel'` to keep existing history and release the blocked turn. Recovery takes the same thread lock as requests and requires the correct owner. It does not undo an external action or prove that repeating one is safe. After authorizing retry, resend the original request. For an interrupted tool approval, recover its checkpoint and publish a fresh versioned card together:
+When an approved action was interrupted, show its card again so the customer can answer it. Take `version` from `GET /v1/admin/approvals`:
 
-```typescript
-const refreshedCard = await chatkitService.recoverApproval(
-  threadId,
-  runId,
-  {
-    version: interruptedVersion,
-    note: 'Reconciled the remote action before another approval.',
-  },
-  { userId: ownerId, baseUrl: publicApiUrl },
-);
+```bash
+curl -X POST https://api.sunnybakery.example/v1/chatkit/threads/thr_…/approvals/<runId>/recover \
+  -H "x-admin-key: $ADMIN_API_KEY" -H "content-type: application/json" \
+  -d '{"userId": "customer-42", "version": 1, "note": "Checked: order 42 was not cancelled."}'
 ```
 
-Use the current checkpoint `version` from the admin approvals response. The returned card is already persisted; reloading the thread shows it. Older cards remain invalid. Recovery refuses a live lease and a changed prompt revision. The migration upgrades the latest legacy waiting card so existing threads can still answer their approvals. Older checkpoints have no recorded prompt revision, so that check applies only to newly saved runs. Historical usage rows without thread identity cannot be linked retrospectively.
+The new card is saved with a new version, and the customer sees it when the chat reloads. Older cards stay invalid. A chat with nothing to recover answers 400, and another user's chat or run answers 404. The migration upgrades the latest legacy waiting card so existing threads can still answer their approvals. Historical usage rows without thread identity cannot be linked retrospectively.
 
 ### @-mentions (entities)
 

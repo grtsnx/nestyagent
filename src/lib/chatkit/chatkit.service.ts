@@ -593,6 +593,8 @@ export type ThreadOperation = {
 
 const key = '_chatkit_operation';
 const receiptsKey = '_chatkit_retry_receipts';
+// Enough to answer a delayed duplicate retry; older receipts are dropped so the thread stays small.
+const MAX_RECEIPTS = 50;
 const clientResultsKey = '_chatkit_has_client_result';
 const retryKey = (itemId: string, requestId?: string) =>
   requestId ? `request:${requestId}` : `item:${itemId}`;
@@ -619,11 +621,14 @@ export function setOperation(
   if (operation.kind === 'client_output')
     thread.metadata[clientResultsKey] = true;
   if (operation.requestKey) {
-    thread.metadata[receiptsKey] = {
-      ...(thread.metadata[receiptsKey] as
-        Record<string, ThreadOperation> | undefined),
-      [operation.requestKey]: { ...operation },
-    };
+    const receipts = Object.entries(
+      (thread.metadata[receiptsKey] as
+        Record<string, ThreadOperation> | undefined) ?? {},
+    ).filter(([requestKey]) => requestKey !== operation.requestKey);
+    receipts.push([operation.requestKey, { ...operation }]);
+    thread.metadata[receiptsKey] = Object.fromEntries(
+      receipts.slice(-MAX_RECEIPTS),
+    );
   }
 }
 export function clearOperation(thread: ThreadMetadata) {
@@ -1150,6 +1155,10 @@ export class InvalidRequestError extends Error {
   }
 }
 
+// Shown while an interrupted action waits for an admin check.
+export const CHAT_PAUSED =
+  'This chat is paused while the team checks an earlier action. Please try again later.';
+
 //1. The ChatKit protocol on the server, ported from openai/chatkit-python (server.py).
 //2. Subclass it and implement respond. Override action, syncAction, addFeedback, and transcribe as needed.
 //3. TContext carries the signed-in user, so stores can scope every read and write.
@@ -1231,9 +1240,7 @@ export abstract class ChatKitService<TContext> {
       current.status !== 'completed' &&
       (current.id !== operation?.id || current.status !== 'pending')
     ) {
-      throw new InvalidRequestError(
-        'This thread has an unfinished operation requiring reconciliation before another turn.',
-      );
+      throw new CustomStreamError(CHAT_PAUSED);
     }
   }
 
@@ -1319,7 +1326,15 @@ export abstract class ChatKitService<TContext> {
     context: TContext,
     signal?: AbortSignal,
   ): Promise<ChatKitResult> {
-    const request = parseRequest(body);
+    return this.processRequest(parseRequest(body), context, signal);
+  }
+
+  // For callers that already parsed the body, such as to lock its thread first.
+  async processRequest(
+    request: ChatKitReq,
+    context: TContext,
+    signal?: AbortSignal,
+  ): Promise<ChatKitResult> {
     if (isStreamingReq(request))
       return { streaming: true, stream: this.sse(request, context, signal) };
     return {
@@ -1433,8 +1448,20 @@ export abstract class ChatKitService<TContext> {
     context: TContext,
     signal?: AbortSignal,
   ): AsyncGenerator<string> {
-    for await (const event of this.processStreaming(request, context, signal))
+    try {
+      for await (const event of this.processStreaming(request, context, signal))
+        yield `data: ${serialize(event)}\n\n`;
+    } catch (error) {
+      // A refusal before the reply starts, such as a paused chat, is shown to the user too.
+      if (!(error instanceof CustomStreamError)) throw error;
+      const event: ThreadStreamEvent = {
+        type: 'error',
+        code: 'custom',
+        message: error.message,
+        allow_retry: error.allowRetry,
+      };
       yield `data: ${serialize(event)}\n\n`;
+    }
   }
 
   private async *processStreaming(

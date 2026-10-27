@@ -1,7 +1,6 @@
 import {
   Injectable,
   NotFoundException,
-  UnauthorizedException,
   type CanActivate,
   type ExecutionContext,
   type NestInterceptor,
@@ -16,7 +15,7 @@ import { ChatKitStore } from './chatkit.store.js';
 import { chatkitUploadLimitSchema } from '../environment.js';
 
 export type ChatKitUploadRequest = ChatKitRequest & {
-  upload?: { attachment: Attachment; userId: string };
+  upload?: { attachment: Attachment; userId: string; size: number };
 };
 
 // Guards run before multipart parsing, so an invalid capability never buffers a file.
@@ -28,23 +27,20 @@ export class ChatKitUploadGuard implements CanActivate {
   ) {}
 
   async canActivate(context: ExecutionContext) {
-    if (!this.auth.enabled)
-      throw new UnauthorizedException(
-        'ChatKit is off. Set CHATKIT_SECRET to turn it on.',
-      );
+    this.auth.assertEnabled();
     const request = context.switchToHttp().getRequest<ChatKitUploadRequest>();
     const id = request.params.id;
     const signature = request.query.sig;
-    const userId =
+    const link =
       typeof id === 'string' && typeof signature === 'string'
         ? this.auth.verifyUpload(id, signature)
         : undefined;
-    if (!userId || typeof id !== 'string')
+    if (!link || typeof id !== 'string')
       throw new NotFoundException('Attachment not found.');
     try {
       request.upload = {
-        userId,
-        attachment: await this.store.loadPendingAttachment(id, userId),
+        ...link,
+        attachment: await this.store.loadPendingAttachment(id, link.userId),
       };
     } catch (error) {
       if (error instanceof NotFoundError)
@@ -64,7 +60,8 @@ export class ChatKitUploadInterceptor implements NestInterceptor {
       config.get<unknown>('CHATKIT_MAX_UPLOAD_BYTES'),
     );
     const Interceptor = FileInterceptor('file', {
-      limits: { fileSize: maxBytes, files: 1, fields: 0 },
+      // Extra text fields are allowed, so a client that sends one does not break uploads.
+      limits: { fileSize: maxBytes, files: 1, fields: 10 },
     });
     this.delegate = new Interceptor();
   }

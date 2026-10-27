@@ -37,6 +37,11 @@ export type ChatKitRequest = Request & { chatkit?: ChatKitContext };
 export class ChatKitAuth {
   constructor(private readonly config: ConfigService) {}
 
+  // Every ChatKit route answers 403 the same way while CHATKIT_SECRET is unset.
+  assertEnabled() {
+    if (!this.enabled) throw chatkitOff();
+  }
+
   get enabled() {
     return Boolean(this.config.get<string>('CHATKIT_SECRET'));
   }
@@ -93,17 +98,22 @@ export class ChatKitAuth {
     return safeEqual(signature, this.signAttachment(attachmentId, userId));
   }
 
-  issueUpload(attachmentId: string, userId: string) {
+  // A one-file upload link for 15 minutes. It carries the announced size, so a bigger file is refused.
+  issueUpload(attachmentId: string, userId: string, size: number) {
     const payload = encode({
       purpose: 'attachment-upload',
       id: attachmentId,
       userId,
+      size,
       exp: Math.floor(Date.now() / 1000) + 15 * 60,
     });
     return `${payload}.${this.sign(`upload:${payload}`)}`;
   }
 
-  verifyUpload(attachmentId: string, token: string): string | undefined {
+  verifyUpload(
+    attachmentId: string,
+    token: string,
+  ): { userId: string; size: number } | undefined {
     const [payload, signature, ...extra] = token.split('.');
     if (
       !payload ||
@@ -117,10 +127,13 @@ export class ChatKitAuth {
         purpose?: unknown;
         id?: unknown;
         userId?: unknown;
+        size?: unknown;
         exp?: unknown;
       };
       if (
         claims.purpose !== 'attachment-upload' ||
+        typeof claims.size !== 'number' ||
+        !Number.isSafeInteger(claims.size) ||
         claims.id !== attachmentId ||
         typeof claims.userId !== 'string' ||
         !claims.userId ||
@@ -129,7 +142,7 @@ export class ChatKitAuth {
         claims.exp * 1000 <= Date.now()
       )
         return undefined;
-      return claims.userId;
+      return { userId: claims.userId, size: claims.size };
     } catch {
       return undefined;
     }
@@ -137,10 +150,7 @@ export class ChatKitAuth {
 
   private sign(value: string) {
     const secret = this.config.get<string>('CHATKIT_SECRET');
-    if (!secret)
-      throw new ForbiddenException(
-        'ChatKit is off. Set CHATKIT_SECRET to turn it on.',
-      );
+    if (!secret) throw chatkitOff();
     return createHmac('sha256', secret).update(value).digest('base64url');
   }
 }
@@ -152,10 +162,7 @@ export class ChatKitAuthGuard implements CanActivate {
   constructor(private readonly auth: ChatKitAuth) {}
 
   canActivate(context: ExecutionContext) {
-    if (!this.auth.enabled)
-      throw new ForbiddenException(
-        'ChatKit is off. Set CHATKIT_SECRET to turn it on.',
-      );
+    this.auth.assertEnabled();
     const request = context.switchToHttp().getRequest<ChatKitRequest>();
     const header = request.get('authorization') ?? '';
     const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
@@ -169,6 +176,12 @@ export class ChatKitAuthGuard implements CanActivate {
     };
     return true;
   }
+}
+
+function chatkitOff() {
+  return new ForbiddenException(
+    'ChatKit is off. Set CHATKIT_SECRET to turn it on.',
+  );
 }
 
 function requestLocale(request: Request) {

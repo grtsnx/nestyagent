@@ -3,6 +3,7 @@ import {
   Body,
   Controller,
   Get,
+  HttpCode,
   HttpStatus,
   Logger,
   NotFoundException,
@@ -11,7 +12,6 @@ import {
   Query,
   Req,
   Res,
-  UnauthorizedException,
   UploadedFile,
   UseGuards,
   UseInterceptors,
@@ -37,7 +37,12 @@ import {
   type ChatKitRequest,
   type ChatKitUploadRequest,
 } from '@/config/chatkit/index.js';
-import { ChatKitRequestDto, ChatKitTokenDto } from '@/dto/index.js';
+import {
+  ChatKitApprovalRecoveryDto,
+  ChatKitRequestDto,
+  ChatKitThreadRecoveryDto,
+  ChatKitTokenDto,
+} from '@/dto/index.js';
 import {
   InvalidRequestError,
   NotFoundError,
@@ -140,7 +145,7 @@ export class ChatKitController {
         ...(createdThreadId && { createdThreadId }),
       };
       const result = await this.server
-        .process(body, context, signal)
+        .processRequest(parsed, context, signal)
         .catch(rethrow);
       if (!result.streaming) {
         response.status(200).type('application/json').send(result.json);
@@ -250,15 +255,11 @@ export class ChatKitController {
     @UploadedFile() file: UploadedPart | undefined,
     @Res() response: Response,
   ) {
-    const found = request.upload;
-    if (
-      !found ||
-      found.attachment.id !== id ||
-      typeof signature !== 'string' ||
-      this.auth.verifyUpload(id, signature) !== found.userId
-    )
-      throw new NotFoundException('Attachment not found.');
+    // ChatKitUploadGuard checked the signed link and loaded the waiting attachment.
+    const found = request.upload!;
     const part = this.checkPart(file);
+    if (part.size > found.size)
+      throw new BadRequestException('The file is larger than announced.');
     const context: ChatKitContext = {
       userId: found.userId,
       baseUrl: baseUrl(request),
@@ -336,6 +337,88 @@ export class ChatKitController {
     return this.auth.issueToken(body.userId, body.ttlSeconds);
   }
 
+  @ApiOperation({
+    summary: 'Recover a paused chat',
+    description:
+      'An admin calls this after checking an interrupted browser tool or retry, to run it again or close it.',
+  })
+  @ApiSecurity('admin')
+  @ApiSuccess('The chat can take new messages again.', {
+    threadId: 'thr_0123456789abcdef0123456789abcdef',
+    decision: 'cancel',
+  })
+  @ApiFailure(
+    HttpStatus.BAD_REQUEST,
+    'The chat has no interrupted step that needs checking.',
+    'No interrupted operation needs reconciliation.',
+    '/v1/chatkit/threads/thr_1/recover',
+  )
+  @ApiFailure(
+    HttpStatus.NOT_FOUND,
+    'The chat does not exist for this user.',
+    'Thread not found.',
+    '/v1/chatkit/threads/thr_1/recover',
+  )
+  @UseGuards(AdminKeyGuard)
+  @HttpCode(HttpStatus.OK)
+  @Post('threads/:threadId/recover')
+  async recoverThread(
+    @Param('threadId') threadId: string,
+    @Body() body: ChatKitThreadRecoveryDto,
+    @Req() request: ChatKitRequest,
+  ) {
+    await this.server
+      .recoverOperation(
+        threadId,
+        { decision: body.decision, note: body.note },
+        { userId: body.userId, baseUrl: baseUrl(request) },
+      )
+      .catch(rethrow);
+    return { threadId, decision: body.decision };
+  }
+
+  @ApiOperation({
+    summary: 'Recover an approval',
+    description:
+      'An admin calls this after checking whether an interrupted approved action already happened, so the user can answer its card again.',
+  })
+  @ApiSecurity('admin')
+  @ApiSuccess('The approval card is shown again with a new version.', {
+    type: 'widget',
+    id: 'msg_approval_0192f1e2000070008000000000000001_2',
+    thread_id: 'thr_0123456789abcdef0123456789abcdef',
+  })
+  @ApiFailure(
+    HttpStatus.NOT_FOUND,
+    'The chat or the approval does not exist for this user.',
+    'Approval not found.',
+    '/v1/chatkit/threads/thr_1/approvals/0192f1e2-0000-7000-8000-000000000001/recover',
+  )
+  @ApiFailure(
+    HttpStatus.CONFLICT,
+    'The approval is not interrupted, or it changed since the admin checked it.',
+    'Only an interrupted run can be recovered.',
+    '/v1/chatkit/threads/thr_1/approvals/0192f1e2-0000-7000-8000-000000000001/recover',
+  )
+  @UseGuards(AdminKeyGuard)
+  @HttpCode(HttpStatus.OK)
+  @Post('threads/:threadId/approvals/:runId/recover')
+  async recoverApproval(
+    @Param('threadId') threadId: string,
+    @Param('runId') runId: string,
+    @Body() body: ChatKitApprovalRecoveryDto,
+    @Req() request: ChatKitRequest,
+  ) {
+    return await this.server
+      .recoverApproval(
+        threadId,
+        runId,
+        { version: body.version, note: body.note },
+        { userId: body.userId, baseUrl: baseUrl(request) },
+      )
+      .catch(rethrow);
+  }
+
   //1. Waits for the first event before sending headers, so a missing thread is a clean 404.
   //2. After that, errors arrive as ChatKit error events inside the stream.
   //3. A browser that leaves keeps the loop draining, so the cancel path saves what arrived.
@@ -401,10 +484,7 @@ export class ChatKitController {
   }
 
   private async signedAttachment(id: string, signature: string | undefined) {
-    if (!this.auth.enabled)
-      throw new UnauthorizedException(
-        'ChatKit is off. Set CHATKIT_SECRET to turn it on.',
-      );
+    this.auth.assertEnabled();
     try {
       const found = await this.server.chatkitStore.loadAttachmentInfo(id);
       if (

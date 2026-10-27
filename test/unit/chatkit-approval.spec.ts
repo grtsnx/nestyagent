@@ -8,6 +8,7 @@ import {
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import {
+  CHAT_PAUSED,
   MemoryStore,
   type ThreadMetadata,
   type WidgetItem,
@@ -134,17 +135,47 @@ async function fixture(
 }
 
 describe('ChatKit approval binding', () => {
-  it.each(['waiting', 'running', 'recovery_required', 'taken'])(
-    'blocks new model turns while the thread checkpoint is %s',
+  it('treats a new message as declining the waiting approval', async () => {
+    const f = await fixture([
+      { call: { name: 'effect' } },
+      { text: 'Sure, what else?' },
+    ]);
+    const events = await f.send({
+      type: 'threads.add_user_message',
+      params: { thread_id: f.threadId, input },
+    });
+    expect(events.at(-1)?.type).not.toBe('error');
+    expect(f.model.calls).toBe(2);
+    expect(f.effect).not.toHaveBeenCalled();
+    expect(f.db.pausedRun.rows[0]).toMatchObject({
+      status: 'completed',
+      recoveryNote: 'cancelled',
+    });
+    expect(
+      JSON.stringify(await f.store.loadItem(f.threadId, f.card.id)),
+    ).toContain('Declined.');
+    // The old card's button now finds nothing to run.
+    await f.answer();
+    expect(f.effect).not.toHaveBeenCalled();
+  });
+
+  it.each(['running', 'recovery_required', 'taken'])(
+    'shows a paused message while the thread checkpoint is %s',
     async (status) => {
       const f = await fixture();
       f.db.pausedRun.rows[0].status = status;
-      await expect(
-        f.send({
-          type: 'threads.add_user_message',
-          params: { thread_id: f.threadId, input },
-        }),
-      ).rejects.toThrow(/pending approval/);
+      const events = await f.send({
+        type: 'threads.add_user_message',
+        params: { thread_id: f.threadId, input },
+      });
+      expect(events).toEqual([
+        {
+          type: 'error',
+          code: 'custom',
+          message: CHAT_PAUSED,
+          allow_retry: false,
+        },
+      ]);
       expect(f.model.calls).toBe(1);
       const history = await f.store.loadThreadItems(
         f.threadId,
@@ -218,14 +249,36 @@ describe('ChatKit approval binding', () => {
     });
   });
 
-  it('refuses approval after the configured instructions change', async () => {
+  it('keeps a waiting approval answerable after the system prompt changes', async () => {
     const f = await fixture();
     await f.db.systemPrompt.create({
       data: { name: 'mssuzie', content: 'Different instructions.' },
     });
     await f.answer();
+    expect(f.effect).toHaveBeenCalledOnce();
+  });
+
+  it('closes a card saved before an update to the helper’s tools', async () => {
+    const f = await fixture();
+    f.db.pausedRun.rows[0].agentVersion = 'mssuzie-chatkit-v0';
+    const events = await f.answer();
     expect(f.effect).not.toHaveBeenCalled();
-    expect(f.db.pausedRun.rows[0].status).toBe('waiting');
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'thread.item.replaced' }),
+    );
+    expect(f.db.pausedRun.rows[0]).toMatchObject({
+      status: 'completed',
+      recoveryNote: 'cancelled',
+    });
+    expect(
+      JSON.stringify(await f.store.loadItem(f.threadId, f.card.id)),
+    ).toContain('This request expired after an update.');
+    // With the old run closed, the chat takes new messages again.
+    const next = await f.send({
+      type: 'threads.add_user_message',
+      params: { thread_id: f.threadId, input },
+    });
+    expect(next.at(-1)?.type).not.toBe('error');
   });
 
   it('issues a fresh card after explicit recovery and rejects the stale card', async () => {

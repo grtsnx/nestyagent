@@ -292,11 +292,6 @@ export class ChatKitStore extends Store<ChatKitContext> {
     return attachment;
   }
 
-  // Compatibility for callers checking link existence; bytes require an owner.
-  loadAttachmentForLink(attachmentId: string) {
-    return this.loadAttachmentInfo(attachmentId);
-  }
-
   // Saves uploaded bytes, and clears the upload instructions once the file is there.
   async saveAttachmentContent(
     attachment: Attachment,
@@ -382,7 +377,7 @@ export class ChatKitAttachmentStore extends AttachmentStore<ChatKitContext> {
   createAttachment(input: AttachmentCreateParams, context: ChatKitContext) {
     checkUpload(input.name, input.mime_type, input.size, this.maxBytes);
     const id = this.generateAttachmentId(input.mime_type, context);
-    const signature = this.auth.issueUpload(id, context.userId);
+    const signature = this.auth.issueUpload(id, context.userId, input.size);
     return Promise.resolve({
       ...this.describe(id, input.name, input.mime_type, context),
       upload_descriptor: {

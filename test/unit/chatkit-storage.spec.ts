@@ -225,8 +225,11 @@ describe('ChatKit storage boundaries', () => {
 
   it('expires upload tokens and binds them to the attachment and owner', () => {
     const { auth } = fixture();
-    const token = auth.issueUpload('file', context.userId);
-    expect(auth.verifyUpload('file', token)).toBe(context.userId);
+    const token = auth.issueUpload('file', context.userId, 5);
+    expect(auth.verifyUpload('file', token)).toEqual({
+      userId: context.userId,
+      size: 5,
+    });
     expect(auth.verifyUpload('other', token)).toBeUndefined();
     expect(
       auth.verifyUpload('file', auth.signAttachment('file', context.userId)),
@@ -299,7 +302,10 @@ describe('ChatKit storage boundaries', () => {
       }
     }
     const server = {
-      process: async (_body: string, context: { signal: AbortSignal }) => {
+      processRequest: async (
+        _request: unknown,
+        context: { signal: AbortSignal },
+      ) => {
         signal = context.signal;
         return { streaming: true, stream: events() };
       },
