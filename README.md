@@ -18,7 +18,8 @@ bun run start:dev
 
 Swagger UI runs at `http://localhost:3000/api`, and Scalar runs at `http://localhost:3000/docs`. Both use the version-specific OpenAPI documents at `/api/v1-json` and `/api/v2-json`. The application prints every enabled documentation URL when it starts.
 
-## Configuration
+<details>
+<summary><h2>Configuration</h2></summary>
 
 The application validates configuration before it starts. Invalid ports, booleans, and CORS origins stop startup.
 
@@ -33,6 +34,8 @@ The application validates configuration before it starts. Invalid ports, boolean
 | `OPENAI_API_KEY`  | empty                 | Authenticates every OpenAI agent. Blank leaves the shared key unset.        |
 
 Never use `*` in `CORS_ORIGINS`. The server accepts only complete HTTP or HTTPS origins without paths.
+
+</details>
 
 <details>
 <summary><h2>OpenAI agents</h2></summary>
@@ -292,6 +295,70 @@ const agent = this.sandbox.createSandboxAgent(
 );
 ```
 
+### Create a manifest
+
+`createManifest` builds the starting contents of a workspace. Call it with no argument for an empty computer. Pass `files` for text files, `repo` for a GitHub boilerplate to clone, `entries` for a mount, and `environment` for values the workspace needs at startup. Give the result to `openSandbox`.
+
+An empty computer, for browsing:
+
+```typescript
+import { createManifest } from '@/config/workspace';
+
+const workspace = await this.sandbox.openSandbox(createManifest());
+```
+
+A website:
+
+```typescript
+const workspace = await this.sandbox.openSandbox(
+  createManifest({
+    files: {
+      'site/index.html': '<h1>Bakery</h1>',
+      'site/styles.css': 'body { font-family: sans-serif; }',
+    },
+  }),
+);
+```
+
+A folder of notes:
+
+```typescript
+const workspace = await this.sandbox.openSandbox(
+  createManifest({
+    files: {
+      'notes/brief.md': '# Account brief\n\nRenewal date: 2026-04-15.',
+      'notes/risks.md': '# Risks\n\nSecurity questionnaire is not complete.',
+    },
+  }),
+);
+```
+
+A GitHub boilerplate to clone:
+
+```typescript
+const workspace = await this.sandbox.openSandbox(
+  createManifest({
+    repo: 'https://github.com/owner/next-starter',
+  }),
+);
+```
+
+`repo` can be an `owner/name` slug, a `https://github.com/...` link, or a `git@github.com:...` clone URL. Add `path` and `ref` when the folder name or branch should differ:
+
+```typescript
+const workspace = await this.sandbox.openSandbox(
+  createManifest({
+    repo: {
+      url: 'https://github.com/owner/next-starter/tree/main',
+      path: 'app',
+    },
+    files: {
+      'task.md': 'Turn this starter into a bakery homepage.',
+    },
+  }),
+);
+```
+
 ### Open a workspace and run
 
 `openSandbox` starts the computer. Pass the same workspace on the next run to keep the same files and browser. `chat` is optional and comes from `this.openai.createSession()`.
@@ -327,18 +394,118 @@ await this.sandbox.runSandbox('Reply that I will call tomorrow.', agent, {
 });
 ```
 
-### Add skills or memory
+### Add skills
+
+A skill is a folder with a `SKILL.md` file. Pass exactly one source: `skills` for text you write here, `from` for a folder the workspace loads up front, or `lazyFrom` for a folder the agent opens only when it needs that skill.
+
+Write one skill in the call:
+
+```typescript
+const agent = this.sandbox.createSandboxAgent(
+  'Workspace agent',
+  'Follow the review skill before you edit the site.',
+  {
+    model: 'gpt-6-astra',
+    skills: {
+      skills: [
+        {
+          name: 'review',
+          description: 'Review a page before publishing it.',
+          content: '# Review\n\nCheck the heading, then the links.',
+        },
+      ],
+    },
+  },
+);
+```
+
+Load a GitHub repo whose top-level folders each contain a `SKILL.md`:
 
 ```typescript
 import { gitRepo } from '@openai/agents/sandbox';
 
 const agent = this.sandbox.createSandboxAgent(
   'Workspace agent',
-  'Use the skill, then keep useful lessons for the next run.',
+  'Use a skill from the repo when the task matches it.',
   {
     model: 'gpt-6-astra',
-    skills: { from: gitRepo({ repo: 'owner/workspace-skills', ref: 'main' }) },
+    skills: {
+      from: gitRepo({
+        repo: 'https://github.com/owner/agent-skills',
+        ref: 'main',
+      }),
+    },
+  },
+);
+```
+
+A skills.sh page is a catalog. The SDK does not fetch skills.sh or install an npm package. Copy the GitHub link that page shows and pass it to `gitRepo`. If the skill files sit in a subfolder, set `subpath`.
+
+Load one skill from that repo only when the agent asks for it:
+
+```typescript
+const agent = this.sandbox.createSandboxAgent(
+  'Workspace agent',
+  'Load the review skill before you edit the site.',
+  {
+    model: 'gpt-6-astra',
+    skills: {
+      lazyFrom: {
+        source: gitRepo({ repo: 'https://github.com/owner/agent-skills' }),
+        index: [
+          {
+            name: 'review',
+            description: 'Review a page before publishing it.',
+            path: 'review',
+          },
+        ],
+      },
+    },
+  },
+);
+```
+
+### Add memory
+
+`memory: true` lets a later run read lessons from earlier workspace work, and it writes new lessons after a run.
+
+```typescript
+const agent = this.sandbox.createSandboxAgent(
+  'Workspace agent',
+  'Remember account names and open questions. Skip passwords.',
+  {
+    model: 'gpt-6-astra',
     memory: true,
+  },
+);
+```
+
+Read old lessons without writing new ones:
+
+```typescript
+const agent = this.sandbox.createSandboxAgent(
+  'Workspace agent',
+  'Use what you already learned. Do not store new notes.',
+  {
+    model: 'gpt-6-astra',
+    memory: { read: true, generate: false },
+  },
+);
+```
+
+Tell the memory writer what to keep:
+
+```typescript
+const agent = this.sandbox.createSandboxAgent(
+  'Workspace agent',
+  'Keep useful lessons for the next run.',
+  {
+    model: 'gpt-6-astra',
+    memory: {
+      generate: {
+        extraPrompt: 'Remember account names and open questions. Skip passwords.',
+      },
+    },
   },
 );
 ```
@@ -347,14 +514,18 @@ const agent = this.sandbox.createSandboxAgent(
 
 </details>
 
-## Health checks
+<details>
+<summary><h2>Health checks</h2></summary>
 
 - `GET /v1/health/live` proves that the process can answer requests.
 - `GET /v1/health/ready` checks the process's memory limits.
 
 Both routes also support API version 2. The checks do not depend on external websites, databases, or Redis.
 
-## Verification
+</details>
+
+<details>
+<summary><h2>Verification</h2></summary>
 
 All tests live under `test/`.
 
@@ -368,7 +539,10 @@ bun run test:cov
 bun run build
 ```
 
-## Container deployment
+</details>
+
+<details>
+<summary><h2>Container deployment</h2></summary>
 
 Build and run the same OCI image on Docker, Kubernetes, Nomad, ECS, Cloud Run, Fly.io, Railway, Render, or any compatible platform:
 
@@ -379,7 +553,10 @@ docker run --rm --read-only --tmpfs /tmp --publish 3000:3000 agentic:local
 
 The image uses pinned Bun and Node digests, contains production dependencies only, and runs as the unprivileged `node` user.
 
-## CI/CD
+</details>
+
+<details>
+<summary><h2>CI/CD</h2></summary>
 
 `.github/workflows/ci.yml` installs the lockfile exactly, checks formatting and types, runs all tests, audits dependencies, builds the application and container, and scans the runtime image. Every external action is pinned to a full commit SHA.
 
@@ -393,6 +570,8 @@ git push origin v1.0.0
 ```
 
 The workflow delivers a portable image. Each hosting platform can deploy that immutable image digest with its own native rollout and rollback controls.
+
+</details>
 
 ## Reliability and state
 
